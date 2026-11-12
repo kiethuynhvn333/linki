@@ -1,6 +1,7 @@
 // Link tracker: create short links, redirect, count clicks.
 // One Cloudflare Worker + one D1 database. No framework.
 
+const GA_ID = 'G-MEBVJJ00K8'; // set to '' to disable Google Analytics on Linki's pages
 const ALPHABET = 'abcdefghjkmnpqrstuvwxyz23456789'; // no i, l, o, 0, 1
 const CODE_LENGTH = 6;
 const RESERVED = new Set(['links', 'create', 'api', 'admin', 'static']);
@@ -192,6 +193,15 @@ async function homePage(request, env, url, state = {}) {
     }
   }
   const error = state.error ? `<p class="error" role="alert">${esc(state.error)}</p>` : '';
+  const preview = `
+      <div class="rc pv" aria-hidden="true">
+        <p class="cap">Your short link</p>
+        <p class="ex">linki/hello</p>
+        <div class="foot">
+          <div class="bars"><span style="height:34%"></span><span style="height:55%"></span><span style="height:42%"></span><span style="height:70%"></span><span style="height:48%"></span><span style="height:84%"></span><span style="height:100%"></span></div>
+          <p class="n">128 <small>clicks</small></p>
+        </div>
+      </div>`;
   const body = `
     <div class="hero${created ? ' has' : ''}">
       <section>
@@ -208,7 +218,7 @@ async function homePage(request, env, url, state = {}) {
         </form>
         ${error}
       </section>
-      ${created}
+      ${created || preview}
     </div>
     ${
       links.length
@@ -218,7 +228,12 @@ async function homePage(request, env, url, state = {}) {
           </section>`
         : ''
     }`;
-  return page('Linki', body, { owner, url, status: state.status || 200 });
+  return page('Linki', body, {
+    owner,
+    url,
+    status: state.status || 200,
+    linkCreated: Boolean(created),
+  });
 }
 
 async function linksPage(request, env, url) {
@@ -369,7 +384,20 @@ function messagePage(status, title, text) {
   return page(title, body, { status });
 }
 
-function page(title, body, { owner, url, status = 200, mcpToken } = {}) {
+function gaHead(linkCreated) {
+  if (!GA_ID) return '';
+  const event = linkCreated ? "\n  gtag('event', 'link_created');" : '';
+  return `<script async src="https://www.googletagmanager.com/gtag/js?id=${GA_ID}"></script>
+<script>
+  window.dataLayer = window.dataLayer || [];
+  function gtag(){dataLayer.push(arguments);}
+  gtag('js', new Date());
+  gtag('config', '${GA_ID}');${event}
+</script>
+`;
+}
+
+function page(title, body, { owner, url, status = 200, linkCreated = false, mcpToken } = {}) {
   const html = `<!doctype html>
 <html lang="en">
 <head>
@@ -377,7 +405,7 @@ function page(title, body, { owner, url, status = 200, mcpToken } = {}) {
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <meta name="robots" content="noindex">
 <title>${esc(title)}</title>
-<link rel="preconnect" href="https://fonts.googleapis.com">
+${gaHead(linkCreated)}<link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
 <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Bricolage+Grotesque:opsz,wght@12..96,700;12..96,800&family=Inter:wght@400;500;600;700&family=Space+Mono:wght@400;700&display=swap">
 <style>${CSS}</style>
@@ -385,7 +413,7 @@ function page(title, body, { owner, url, status = 200, mcpToken } = {}) {
 <body>
 <header><a class="brand" href="/">Linki</a><nav><a class="pill" href="/links"${url && url.pathname.startsWith('/links') ? ' aria-current="page"' : ''}>Your links</a></nav></header>
 <main class="panel">${body}</main>
-<footer><p>Links are tied to this browser. No sign-up, no tracking cookies for visitors.</p></footer>
+<footer><p>Links are tied to this browser. No sign-up. Short-link visitors are never tracked with cookies; Linki's own pages use Google Analytics.</p></footer>
 <script>${JS}</script>
 </body>
 </html>`;
@@ -893,8 +921,7 @@ header{display:flex;justify-content:space-between;align-items:center;gap:16px;wi
 footer{padding:18px 16px 24px;text-align:center;font-size:13px;color:var(--muted)}
 
 /* hero + form */
-.hero{display:grid;grid-template-columns:minmax(0,640px);gap:28px}
-.hero.has{grid-template-columns:minmax(0,1.15fr) minmax(0,1fr)}
+.hero{display:grid;grid-template-columns:minmax(0,1.15fr) minmax(0,1fr);gap:28px}
 .hero h1{font-size:48px;line-height:1.08;text-wrap:balance}
 .hl{color:var(--accent-text)}
 .lede{margin-top:14px;color:var(--muted)}
@@ -924,6 +951,14 @@ button.copied{background:var(--accent);color:var(--on-accent);border-color:var(-
 .go{max-width:70%;margin-top:12px;font-size:13px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
 .cl{align-self:flex-start;height:44px;margin-top:auto;padding:0 22px;border:0;background:#FFFFFF;color:#1E2330;font-weight:700}
 .rc .copied{background:var(--pink);color:var(--on-pink)}
+.pv{min-width:0}
+.pv .ex{align-self:flex-start;max-width:100%;min-width:0;margin-top:14px;padding:12px 16px;border-radius:999px;background:#fff;color:#1E2330;font:700 22px/1.2 var(--mono);overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.pv .foot{display:flex;flex-wrap:wrap;align-items:flex-end;gap:10px 16px;margin-top:auto;align-self:flex-start;max-width:100%;min-width:0}
+.pv .bars{display:flex;align-items:flex-end;gap:5px;width:116px;max-width:100%;height:72px}
+.pv .bars span{flex:1;min-width:0;border-radius:999px;background:#fff}
+.pv .bars span:last-child{background:var(--mustard)}
+.pv .n{font:800 28px/1 var(--display);letter-spacing:-.03em}
+.pv .n small{margin-left:2px;font:600 13px/1 var(--ui);letter-spacing:0}
 
 /* section heads + list */
 .sectionhead{display:flex;justify-content:space-between;align-items:center;gap:16px;margin:38px 0 8px}
@@ -993,9 +1028,17 @@ button.copied{background:var(--accent);color:var(--on-accent);border-color:var(-
   button:active,.button:active{transform:translateY(0) scale(.98)}
   .links li{transition:background-color 120ms ease-out}
   .rc{animation:pop 180ms ease-out}
-  .bar span{transform-origin:bottom;animation:grow 400ms ease-out}
+  .bar span,.pv .bars span{transform-origin:bottom;animation:grow 400ms ease-out}
   @keyframes pop{from{opacity:0;transform:scale(.96)}to{opacity:1;transform:none}}
   @keyframes grow{from{transform:scaleY(0)}to{transform:none}}
+}
+
+@media (max-width:860px){
+  .pv::after{width:86px;height:86px;border-radius:22px;right:-26px;top:-26px;bottom:auto}
+  .pv::before{display:none}
+  .pv .ex{font-size:15px;padding:8px 12px}
+  .pv .bars{width:100px;height:56px}
+  .pv .n{font-size:22px}
 }
 
 @media (max-width:520px){
@@ -1003,6 +1046,9 @@ button.copied{background:var(--accent);color:var(--on-accent);border-color:var(-
   .pill{height:44px}
   .panel{width:calc(100% - 20px);padding:22px 18px;border-radius:22px}
   .hero,.hero.has{grid-template-columns:minmax(0,1fr);gap:18px}
+  .pv .ex{font-size:18px;padding:10px 14px}
+  .pv .bars{width:96px;height:48px}
+  .pv .n{font-size:22px}
   .hero h1{font-size:38px}
   h1{font-size:30px}
   .lede{font-size:15px}
