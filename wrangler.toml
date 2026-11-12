@@ -1,0 +1,8 @@
+name = "linki"
+main = "src/index.js"
+compatibility_date = "2025-01-01"
+
+[[d1_databases]]
+binding = "DB"
+database_name = "linki"
+database_id = "c4f2bde0-7b17-44f2-88c1-ecf69d5557b3"
