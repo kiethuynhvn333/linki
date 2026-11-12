@@ -18,3 +18,9 @@ CREATE TABLE IF NOT EXISTS clicks (
   visitor_hash TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_clicks_code_ts ON clicks (code, ts);
+
+CREATE TABLE IF NOT EXISTS mcp_tokens (
+  token_hash TEXT PRIMARY KEY,
+  owner_id   TEXT NOT NULL UNIQUE,
+  created_at INTEGER NOT NULL
+);

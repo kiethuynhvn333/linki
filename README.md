@@ -12,6 +12,18 @@ Built on Cloudflare Workers and D1, in plain JavaScript with no runtime dependen
 - "Your links" lists your links with their click counts; each link has a 30-day click chart.
 - Visitors aren't tracked with cookies. Unique visits are counted with a daily salted hash.
 
+## Connect an agent
+
+On **Your links**, copy your connector URL (`https://<host>/mcp/<token>`). In Claude: Settings → Connectors → Add custom connector → paste this URL. Cursor and other MCP clients use the same URL.
+
+The connector is read-only and only sees this browser's links. It can list links, show daily clicks for one link, and summarize a date range. Reset on that page rotates the URL, and the old one stops working.
+
+Linki stores a SHA-256 hash of the token. This browser keeps the raw token in a cookie so the page can show the URL again. A deployed database needs the new `mcp_tokens` table:
+
+```
+npx wrangler d1 execute linki --remote --file=schema.sql
+```
+
 ## Run locally
 ```
 npm install
@@ -29,7 +41,7 @@ npx wrangler deploy
 ```
 
 ## Files
-- `src/index.js`: the whole app (routes, HTML, CSS).
+- `src/index.js`: the whole app (routes, HTML, CSS, read-only MCP).
 - `schema.sql`: the D1 tables.
 - `wrangler.toml`: Worker and database config.
 - `CHANGES.md`: notes on the current design.
