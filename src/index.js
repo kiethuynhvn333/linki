@@ -13,6 +13,9 @@ const BOT_RE =
   /bot|crawl|spider|slurp|facebookexternalhit|whatsapp\/|preview|curl|wget|python|headless|pingdom|uptime/i;
 const BLOCKED_SCHEME_RE = /^(javascript|data|vbscript|file|mailto|tel|blob|about):/i;
 
+// Same cursor shape and colours as the .brand logo.
+const FAVICON_SVG = '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><defs><linearGradient id="g" x1="0" y1="0" x2="1" y2="1"><stop offset="0" stop-color="#2665D6"/><stop offset=".55" stop-color="#E9C0E9"/><stop offset="1" stop-color="#D2A72A"/></linearGradient></defs><polygon fill="url(#g)" points="4,0 4,20.16 8.8,15.36 12.2,24 15.8,22.08 12.6,13.92 20,13.92"/></svg>';
+
 export default {
   async fetch(request, env, ctx) {
     const url = new URL(request.url);
@@ -24,6 +27,7 @@ export default {
       if (path === '/links' && method === 'GET') return linksPage(request, env, url);
       if (path === '/mcp/reset') return resetMcp(request, env, url);
       if (path.startsWith('/mcp/')) return mcpEndpoint(request, env, url);
+      if (path === '/favicon.svg' || path === '/favicon.ico') return new Response(FAVICON_SVG, { headers: { 'Content-Type': 'image/svg+xml', 'Cache-Control': 'public, max-age=86400' } });
       if (path === '/robots.txt') return new Response('User-agent: *\nDisallow: /\n');
       const detail = path.match(/^\/links\/([a-z0-9]{4,12})$/);
       if (detail && method === 'GET') return detailPage(request, env, url, detail[1]);
@@ -405,6 +409,7 @@ function page(title, body, { owner, url, status = 200, linkCreated = false, mcpT
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <meta name="robots" content="noindex">
 <title>${esc(title)}</title>
+<link rel="icon" href="/favicon.svg" type="image/svg+xml">
 ${gaHead(linkCreated)}<link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
 <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Bricolage+Grotesque:opsz,wght@12..96,700;12..96,800&family=Inter:wght@400;500;600;700&family=Space+Mono:wght@400;700&display=swap">
