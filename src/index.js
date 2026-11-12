@@ -22,6 +22,8 @@ export default {
       if (path === '/' && method === 'GET') return homePage(request, env, url);
       if (path === '/create' && method === 'POST') return createLink(request, env, url);
       if (path === '/links' && method === 'GET') return linksPage(request, env, url);
+      if (path === '/mcp/reset') return resetMcp(request, env, url);
+      if (path.startsWith('/mcp/')) return mcpEndpoint(request, env, url);
       if (path === '/robots.txt') return new Response('User-agent: *\nDisallow: /\n');
       const detail = path.match(/^\/links\/([a-z0-9]{4,12})$/);
       if (detail && method === 'GET') return detailPage(request, env, url, detail[1]);
@@ -236,15 +238,41 @@ async function homePage(request, env, url, state = {}) {
 
 async function linksPage(request, env, url) {
   const owner = getOwner(request);
-  const links = await listLinks(env, owner.id, 200);
+  const [links, mcp] = await Promise.all([
+    listLinks(env, owner.id, 200),
+    connectorForOwner(request, env, owner.id),
+  ]);
   const body = `
     <div class="sectionhead top"><h1>Your links</h1><a class="button secondary" href="/">New link</a></div>
     ${
       links.length
         ? linkList(links, url.origin)
         : '<div class="empty"><p>No links yet</p><a class="button primary" href="/">Create your first link</a></div>'
-    }`;
-  return page('Your links', body, { owner, url });
+    }
+    ${agentSection(mcp, url)}`;
+  return page('Your links', body, { owner, url, mcpToken: mcp.token || undefined });
+}
+
+function agentSection(mcp, url) {
+  const connectorUrl = mcp.token ? `${url.origin}/mcp/${mcp.token}` : '';
+  const hint = mcp.token
+    ? 'In Claude: Settings → Connectors → Add custom connector → paste this URL.'
+    : 'Reset to issue a new connector URL. The old URL stops working.';
+  const urlRow = connectorUrl
+    ? `<div class="up">
+        <input class="short" type="text" readonly spellcheck="false" aria-label="Connector URL" title="${esc(connectorUrl)}" value="${esc(connectorUrl)}">
+        <button type="button" class="primary" data-copy="${esc(connectorUrl)}">Copy</button>
+      </div>`
+    : '';
+  return `
+    <section class="agent" aria-labelledby="agent-h">
+      <div class="agenthead">
+        <h2 id="agent-h">Connect an agent</h2>
+        <form method="post" action="/mcp/reset"><button class="secondary" type="submit">Reset</button></form>
+      </div>
+      <p class="hint">${esc(hint)}</p>
+      ${urlRow}
+    </section>`;
 }
 
 async function detailPage(request, env, url, code) {
@@ -369,7 +397,7 @@ function gaHead(linkCreated) {
 `;
 }
 
-function page(title, body, { owner, url, status = 200, linkCreated = false } = {}) {
+function page(title, body, { owner, url, status = 200, linkCreated = false, mcpToken } = {}) {
   const html = `<!doctype html>
 <html lang="en">
 <head>
@@ -396,6 +424,7 @@ ${gaHead(linkCreated)}<link rel="preconnect" href="https://fonts.googleapis.com"
     'Referrer-Policy': 'same-origin',
   });
   if (owner && url) setOwnerCookie(headers, owner, url);
+  if (mcpToken && url) setMcpCookie(headers, mcpToken, url);
   return new Response(html, { status, headers });
 }
 
@@ -417,6 +446,388 @@ function setOwnerCookie(headers, owner, url) {
     'Set-Cookie',
     `owner=${owner.id}; Path=/; Max-Age=31536000; HttpOnly; SameSite=Lax${secure}`
   );
+}
+
+function setMcpCookie(headers, token, url) {
+  const secure = url.protocol === 'https:' ? '; Secure' : '';
+  headers.append(
+    'Set-Cookie',
+    `mcp=${token}; Path=/; Max-Age=31536000; HttpOnly; SameSite=Lax${secure}`
+  );
+}
+
+function cookieValue(request, name) {
+  const cookie = request.headers.get('Cookie') || '';
+  for (const part of cookie.split(';')) {
+    const trimmed = part.trim();
+    const eq = trimmed.indexOf('=');
+    if (eq > 0 && trimmed.slice(0, eq) === name) return trimmed.slice(eq + 1);
+  }
+  return '';
+}
+
+// ---------- mcp ----------
+
+const MCP_TOOLS = [
+  {
+    name: 'list_links',
+    description:
+      "List this connector's short links: slug, short URL, destination, label, created date, total clicks, and unique visitors. Unique visitors are counted once per link per day.",
+    inputSchema: { type: 'object', properties: {} },
+    annotations: { readOnlyHint: true, destructiveHint: false, openWorldHint: false },
+  },
+  {
+    name: 'link_report',
+    description:
+      'Clicks and unique visitors per UTC day for one link. days defaults to 30 (max 365). Referrers and countries are not stored.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        slug: { type: 'string', description: 'Short link code, for example abc123.' },
+        days: {
+          type: 'integer',
+          minimum: 1,
+          maximum: 365,
+          description: 'UTC days to include, ending today. Default 30.',
+        },
+      },
+      required: ['slug'],
+    },
+    annotations: { readOnlyHint: true, destructiveHint: false, openWorldHint: false },
+  },
+  {
+    name: 'clicks_summary',
+    description:
+      "Click and unique-visitor totals for all of this connector's links over a UTC range, plus a per-link breakdown. days defaults to 7 (max 365).",
+    inputSchema: {
+      type: 'object',
+      properties: {
+        days: {
+          type: 'integer',
+          minimum: 1,
+          maximum: 365,
+          description: 'UTC days to include, ending today. Default 7.',
+        },
+      },
+    },
+    annotations: { readOnlyHint: true, destructiveHint: false, openWorldHint: false },
+  },
+];
+
+async function connectorForOwner(request, env, ownerId) {
+  const presented = cookieValue(request, 'mcp');
+  if (/^[A-Za-z0-9_-]{20,200}$/.test(presented)) {
+    const row = await env.DB.prepare('SELECT owner_id FROM mcp_tokens WHERE token_hash = ?')
+      .bind(await sha256(presented))
+      .first();
+    if (row && row.owner_id === ownerId) return { token: presented, isNew: false };
+  }
+  const existing = await env.DB.prepare('SELECT 1 AS ok FROM mcp_tokens WHERE owner_id = ?')
+    .bind(ownerId)
+    .first();
+  if (existing) return { token: null, isNew: false };
+  return { token: await issueMcpToken(env, ownerId), isNew: true };
+}
+
+async function issueMcpToken(env, ownerId) {
+  const token = base64url(crypto.getRandomValues(new Uint8Array(32)));
+  const now = Math.floor(Date.now() / 1000);
+  await env.DB.batch([
+    env.DB.prepare('DELETE FROM mcp_tokens WHERE owner_id = ?').bind(ownerId),
+    env.DB.prepare(
+      'INSERT INTO mcp_tokens (token_hash, owner_id, created_at) VALUES (?, ?, ?)'
+    ).bind(await sha256(token), ownerId, now),
+  ]);
+  return token;
+}
+
+async function resetMcp(request, env, url) {
+  if (request.method !== 'POST') {
+    return new Response(null, {
+      status: 405,
+      headers: { Allow: 'POST', 'Cache-Control': 'no-store' },
+    });
+  }
+  const owner = getOwner(request);
+  if (owner.isNew) {
+    return messagePage(
+      401,
+      'Reset unavailable',
+      'Open Your links in this browser, then reset the connector.'
+    );
+  }
+  const token = await issueMcpToken(env, owner.id);
+  const headers = new Headers({ Location: '/links', 'Cache-Control': 'no-store' });
+  setMcpCookie(headers, token, url);
+  return new Response(null, { status: 303, headers });
+}
+
+async function mcpEndpoint(request, env, url) {
+  const cors = mcpCors(request);
+  if (request.method === 'OPTIONS') return new Response(null, { status: 204, headers: cors });
+  let token = '';
+  try {
+    token = decodeURIComponent(url.pathname.slice('/mcp/'.length));
+  } catch {
+    return mcpJson({ error: 'Unauthorized' }, 401, cors);
+  }
+  try {
+    const ownerId = await ownerForMcpToken(env, token);
+    if (!ownerId) return mcpJson({ error: 'Unauthorized' }, 401, cors);
+    if (request.method !== 'POST') {
+      return mcpJson({ error: 'Method not allowed' }, 405, cors, { Allow: 'POST' });
+    }
+    return await mcpPost(request, env, url, ownerId, cors);
+  } catch (err) {
+    console.error(err);
+    return rpcError(null, -32603, 'Internal error', cors, 500);
+  }
+}
+
+async function ownerForMcpToken(env, token) {
+  if (!/^[A-Za-z0-9_-]{20,200}$/.test(token)) return null;
+  const row = await env.DB.prepare('SELECT owner_id FROM mcp_tokens WHERE token_hash = ?')
+    .bind(await sha256(token))
+    .first();
+  return row ? row.owner_id : null;
+}
+
+async function mcpPost(request, env, url, ownerId, cors) {
+  const declared = Number(request.headers.get('Content-Length') || 0);
+  if (declared > 65536) return rpcError(null, -32700, 'Parse error', cors, 400);
+  const raw = await request.text();
+  if (raw.length > 65536) return rpcError(null, -32700, 'Parse error', cors, 400);
+  let msg;
+  try {
+    msg = JSON.parse(raw);
+  } catch {
+    return rpcError(null, -32700, 'Parse error', cors, 400);
+  }
+  if (!msg || typeof msg !== 'object' || Array.isArray(msg)) {
+    return rpcError(null, -32600, 'Invalid Request', cors, 400);
+  }
+  const hasId = Object.prototype.hasOwnProperty.call(msg, 'id');
+  const id = hasId ? msg.id : null;
+  if (msg.jsonrpc !== '2.0' || typeof msg.method !== 'string') {
+    return rpcError(id, -32600, 'Invalid Request', cors, 400);
+  }
+  if (hasId && id !== null && typeof id !== 'string' && typeof id !== 'number') {
+    return rpcError(null, -32600, 'Invalid Request', cors, 400);
+  }
+  if (!hasId) {
+    if (msg.method.startsWith('notifications/')) {
+      return new Response(null, { status: 202, headers: cors });
+    }
+    return rpcError(null, -32600, 'Invalid Request', cors, 400);
+  }
+  if (msg.method === 'initialize') return rpcResult(id, initializeResult(msg.params), cors);
+  if (msg.method === 'ping') return rpcResult(id, {}, cors);
+  if (msg.method === 'tools/list') return rpcResult(id, { tools: MCP_TOOLS }, cors);
+  if (msg.method === 'tools/call') {
+    const result = await callTool(env, url.origin, ownerId, msg.params);
+    if (result.rpcError) return rpcError(id, result.rpcError.code, result.rpcError.message, cors);
+    return rpcResult(id, result, cors);
+  }
+  return rpcError(id, -32601, 'Method not found', cors);
+}
+
+function initializeResult(params) {
+  const requested = params && typeof params.protocolVersion === 'string' ? params.protocolVersion : '';
+  const protocolVersion = /^\d{4}-\d{2}-\d{2}$/.test(requested) ? requested : '2025-03-26';
+  return {
+    protocolVersion,
+    capabilities: { tools: {} },
+    serverInfo: { name: 'Linki', version: '0.1.0' },
+    instructions:
+      "Read-only click reports for the Linki links that belong to this connector. Unique visitors are counted once per link per day. Referrers and countries are not stored.",
+  };
+}
+
+async function callTool(env, origin, ownerId, params) {
+  if (!params || typeof params.name !== 'string') {
+    return { rpcError: { code: -32602, message: 'Invalid params' } };
+  }
+  let args = {};
+  if (params.arguments !== undefined) {
+    if (!params.arguments || typeof params.arguments !== 'object' || Array.isArray(params.arguments)) {
+      return { rpcError: { code: -32602, message: 'Invalid params' } };
+    }
+    args = params.arguments;
+  }
+  if (params.name === 'list_links') return toolText(await reportLinks(env, origin, ownerId));
+  if (params.name === 'link_report') return reportLink(env, origin, ownerId, args);
+  if (params.name === 'clicks_summary') return reportSummary(env, origin, ownerId, args);
+  return { rpcError: { code: -32602, message: 'Unknown tool' } };
+}
+
+async function reportLinks(env, origin, ownerId) {
+  const { results } = await env.DB.prepare(
+    `SELECT code, destination, label, click_count, created_at,
+            (SELECT COUNT(DISTINCT visitor_hash) FROM clicks WHERE code = links.code) AS uniques
+     FROM links
+     WHERE owner_id = ?
+     ORDER BY created_at DESC, rowid DESC
+     LIMIT 201`
+  )
+    .bind(ownerId)
+    .all();
+  const truncated = results.length > 200;
+  return {
+    ...(truncated ? { truncated: true } : {}),
+    links: (truncated ? results.slice(0, 200) : results).map((row) => linkSummary(row, origin, true)),
+  };
+}
+
+async function reportLink(env, origin, ownerId, args) {
+  const daysResult = readDays(args.days, 30);
+  if (daysResult.error) return toolError(daysResult.error);
+  const slug = typeof args.slug === 'string' ? args.slug.toLowerCase() : '';
+  if (!/^[a-z0-9]{4,12}$/.test(slug)) return toolError('Link not found.');
+  const link = await env.DB.prepare(
+    'SELECT code, destination, label FROM links WHERE code = ? AND owner_id = ?'
+  )
+    .bind(slug, ownerId)
+    .first();
+  if (!link) return toolError('Link not found.');
+  const range = dayRange(daysResult.days);
+  const { results } = await env.DB.prepare(
+    `SELECT ts / 86400 AS day, COUNT(*) AS clicks, COUNT(DISTINCT visitor_hash) AS uniques
+     FROM clicks WHERE code = ? AND ts >= ? GROUP BY day`
+  )
+    .bind(slug, range.since)
+    .all();
+  const byDay = new Map(results.map((row) => [Number(row.day), row]));
+  const daily = [];
+  for (let day = range.start; day <= range.today; day++) {
+    const row = byDay.get(day);
+    daily.push({
+      date: isoFromDay(day),
+      clicks: row ? Number(row.clicks) : 0,
+      unique_visitors: row ? Number(row.uniques) : 0,
+    });
+  }
+  return toolText({
+    slug: link.code,
+    short_url: `${origin}/${link.code}`,
+    destination: link.destination,
+    label: link.label || null,
+    days: daysResult.days,
+    from: isoFromDay(range.start),
+    to: isoFromDay(range.today),
+    clicks: daily.reduce((sum, day) => sum + day.clicks, 0),
+    unique_visitors: daily.reduce((sum, day) => sum + day.unique_visitors, 0),
+    daily,
+    note: 'Unique visitors are counted once per day. Referrers and countries are not stored.',
+  });
+}
+
+async function reportSummary(env, origin, ownerId, args) {
+  const daysResult = readDays(args.days, 7);
+  if (daysResult.error) return toolError(daysResult.error);
+  const range = dayRange(daysResult.days);
+  const { results } = await env.DB.prepare(
+    `SELECT l.code, l.destination, l.label, l.created_at,
+            COUNT(c.id) AS clicks,
+            COUNT(DISTINCT c.visitor_hash) AS uniques
+     FROM links l
+     LEFT JOIN clicks c ON c.code = l.code AND c.ts >= ?
+     WHERE l.owner_id = ?
+     GROUP BY l.code
+     ORDER BY clicks DESC, l.created_at DESC`
+  )
+    .bind(range.since, ownerId)
+    .all();
+  const links = results.map((row) => linkSummary(row, origin, false));
+  return toolText({
+    days: daysResult.days,
+    from: isoFromDay(range.start),
+    to: isoFromDay(range.today),
+    clicks: links.reduce((sum, link) => sum + link.clicks, 0),
+    unique_visitors: links.reduce((sum, link) => sum + link.unique_visitors, 0),
+    links,
+    note: 'Unique visitors are counted once per link per day, so one person who opens two links counts twice. Referrers and countries are not stored.',
+  });
+}
+
+function linkSummary(row, origin, allTime) {
+  return {
+    slug: row.code,
+    short_url: `${origin}/${row.code}`,
+    destination: row.destination,
+    label: row.label || null,
+    ...(allTime ? { created: isoFromUnix(row.created_at) } : {}),
+    clicks: Number(allTime ? row.click_count : row.clicks),
+    unique_visitors: Number(row.uniques),
+  };
+}
+
+function readDays(value, fallback) {
+  if (value === undefined) return { days: fallback };
+  const n =
+    typeof value === 'number' ? value : typeof value === 'string' && /^\d+$/.test(value) ? Number(value) : NaN;
+  if (!Number.isInteger(n) || n < 1 || n > 365) {
+    return { error: 'days must be an integer from 1 to 365.' };
+  }
+  return { days: n };
+}
+
+function dayRange(days) {
+  const today = Math.floor(Date.now() / 86400000);
+  const start = today - (days - 1);
+  return { today, start, since: start * 86400 };
+}
+
+function isoFromDay(dayNumber) {
+  return new Date(dayNumber * 86400000).toISOString().slice(0, 10);
+}
+
+function isoFromUnix(seconds) {
+  return new Date(seconds * 1000).toISOString().slice(0, 10);
+}
+
+function toolText(data) {
+  return { content: [{ type: 'text', text: JSON.stringify(data, null, 2) }] };
+}
+
+function toolError(text) {
+  return { content: [{ type: 'text', text }], isError: true };
+}
+
+function mcpCors(request) {
+  const origin = request.headers.get('Origin');
+  return {
+    'Access-Control-Allow-Origin': origin || '*',
+    'Access-Control-Allow-Methods': 'POST, GET, OPTIONS',
+    'Access-Control-Allow-Headers':
+      'Content-Type, Accept, Authorization, MCP-Protocol-Version, Mcp-Session-Id, Mcp-Method, Mcp-Name, Last-Event-ID',
+    'Access-Control-Expose-Headers': 'Mcp-Session-Id',
+    'Access-Control-Max-Age': '86400',
+    Vary: 'Origin',
+  };
+}
+
+function mcpJson(body, status, cors, extra) {
+  const headers = new Headers(cors);
+  headers.set('Content-Type', 'application/json');
+  headers.set('Cache-Control', 'no-store');
+  if (extra) {
+    for (const [key, value] of Object.entries(extra)) headers.set(key, value);
+  }
+  return new Response(JSON.stringify(body), { status, headers });
+}
+
+function rpcResult(id, result, cors) {
+  return mcpJson({ jsonrpc: '2.0', id, result }, 200, cors);
+}
+
+function rpcError(id, code, message, cors, status = 200) {
+  return mcpJson({ jsonrpc: '2.0', id, error: { code, message } }, status, cors);
+}
+
+function base64url(bytes) {
+  let binary = '';
+  for (const byte of bytes) binary += String.fromCharCode(byte);
+  return btoa(binary).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/g, '');
 }
 
 // ---------- helpers ----------
@@ -666,5 +1077,18 @@ button.copied{background:var(--accent);color:var(--on-accent);border-color:var(-
   .chh h2{font-size:18px}
   .chart{height:140px;gap:3px}
   .status{font-size:72px}
+}
+.agent{margin-top:32px;padding:20px 22px 18px;border-radius:22px;background:var(--paper)}
+.agenthead{display:flex;justify-content:space-between;align-items:center;gap:12px}
+.agenthead h2{font-size:22px;letter-spacing:0}
+.agenthead form{margin:0;flex:none}
+.agent .hint{margin-top:6px;max-width:68ch;font-size:14px;color:var(--muted)}
+.agent .up{flex:1 1 auto;width:100%;max-width:none;margin-top:14px}
+.agent .up input.short{min-width:0}
+@media (max-width:520px){
+  .agent{padding:16px}
+  .agent .up{flex-wrap:wrap;height:auto;padding:8px 8px 8px 14px;border-radius:18px}
+  .agent .up input.short{flex:1 1 100%;height:40px;font-size:12px}
+  .agent .up .primary{flex:1 1 auto;height:44px}
 }
 `;
