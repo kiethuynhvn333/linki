@@ -6,11 +6,13 @@ Live: https://linki.linki-app.workers.dev
 
 Built on Cloudflare Workers and D1, in plain JavaScript with no runtime dependencies.
 
+Google Analytics loads on Linki's own pages from `GA_ID` at the top of `src/index.js`. Set `GA_ID` to `''` to remove it; short-link redirects are never tracked.
+
 ## What it does
 - Paste a long URL (and an optional label) to get a short link.
 - Short links redirect with a 302. Bots and link previewers are filtered out of the click count.
 - "Your links" lists your links with their click counts; each link has a 30-day click chart.
-- Visitors aren't tracked with cookies. Unique visits are counted with a daily salted hash.
+- Short-link visitors aren't tracked with cookies. Unique visits are counted with a daily salted hash.
 
 ## Run locally
 ```

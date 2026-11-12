@@ -1,6 +1,7 @@
 // Link tracker: create short links, redirect, count clicks.
 // One Cloudflare Worker + one D1 database. No framework.
 
+const GA_ID = 'G-MEBVJJ00K8'; // set to '' to disable Google Analytics on Linki's pages
 const ALPHABET = 'abcdefghjkmnpqrstuvwxyz23456789'; // no i, l, o, 0, 1
 const CODE_LENGTH = 6;
 const RESERVED = new Set(['links', 'create', 'api', 'admin', 'static']);
@@ -225,7 +226,12 @@ async function homePage(request, env, url, state = {}) {
           </section>`
         : ''
     }`;
-  return page('Linki', body, { owner, url, status: state.status || 200 });
+  return page('Linki', body, {
+    owner,
+    url,
+    status: state.status || 200,
+    linkCreated: Boolean(created),
+  });
 }
 
 async function linksPage(request, env, url) {
@@ -350,7 +356,20 @@ function messagePage(status, title, text) {
   return page(title, body, { status });
 }
 
-function page(title, body, { owner, url, status = 200 } = {}) {
+function gaHead(linkCreated) {
+  if (!GA_ID) return '';
+  const event = linkCreated ? "\n  gtag('event', 'link_created');" : '';
+  return `<script async src="https://www.googletagmanager.com/gtag/js?id=${GA_ID}"></script>
+<script>
+  window.dataLayer = window.dataLayer || [];
+  function gtag(){dataLayer.push(arguments);}
+  gtag('js', new Date());
+  gtag('config', '${GA_ID}');${event}
+</script>
+`;
+}
+
+function page(title, body, { owner, url, status = 200, linkCreated = false } = {}) {
   const html = `<!doctype html>
 <html lang="en">
 <head>
@@ -358,7 +377,7 @@ function page(title, body, { owner, url, status = 200 } = {}) {
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <meta name="robots" content="noindex">
 <title>${esc(title)}</title>
-<link rel="preconnect" href="https://fonts.googleapis.com">
+${gaHead(linkCreated)}<link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
 <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Bricolage+Grotesque:opsz,wght@12..96,700;12..96,800&family=Inter:wght@400;500;600;700&family=Space+Mono:wght@400;700&display=swap">
 <style>${CSS}</style>
@@ -366,7 +385,7 @@ function page(title, body, { owner, url, status = 200 } = {}) {
 <body>
 <header><a class="brand" href="/">Linki</a><nav><a class="pill" href="/links"${url && url.pathname.startsWith('/links') ? ' aria-current="page"' : ''}>Your links</a></nav></header>
 <main class="panel">${body}</main>
-<footer><p>Links are tied to this browser. No sign-up, no tracking cookies for visitors.</p></footer>
+<footer><p>Links are tied to this browser. No sign-up. Short-link visitors are never tracked with cookies; Linki's own pages use Google Analytics.</p></footer>
 <script>${JS}</script>
 </body>
 </html>`;
