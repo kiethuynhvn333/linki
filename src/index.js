@@ -9,39 +9,107 @@ const MAX_URL_LENGTH = 2048;
 const MAX_LABEL_LENGTH = 80;
 const CREATE_LIMIT_PER_HOUR = 20;
 const CHART_DAYS = 30;
+const OWNER_COOKIE_MAX_AGE = 31536000; // one year, renewed on every visit
+const CLICK_RETENTION_DAYS = 400; // raw click rows; totals live on the links row
+const PRUNE_BATCH = 10000;
 const BOT_RE =
-  /bot|crawl|spider|slurp|facebookexternalhit|whatsapp\/|preview|curl|wget|python|headless|pingdom|uptime/i;
+  /bot|crawl|spider|slurp|facebookexternalhit|meta-externalagent|whatsapp\/|preview|curl|wget|python|headless|pingdom|uptime|monitor|go-http-client|okhttp|axios|node-fetch|undici|java\/|dalvik|libwww|httpclient|scrapy|postman|insomnia|google-inspectiontool|googleother|lighthouse|embedly|vkshare|validator|feedfetcher|mediapartners/i;
+const HOME_TITLE = 'Linki: short links with click counts, no sign-up';
+const HOME_DESCRIPTION =
+  'Paste a long URL, get a short link, and see how many people click it. Free, with no sign-up.';
 const BLOCKED_SCHEME_RE = /^(javascript|data|vbscript|file|mailto|tel|blob|about):/i;
 
 // Same cursor shape and colours as the .brand logo.
 const FAVICON_SVG = '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><defs><linearGradient id="g" x1="0" y1="0" x2="1" y2="1"><stop offset="0" stop-color="#2665D6"/><stop offset=".55" stop-color="#E9C0E9"/><stop offset="1" stop-color="#D2A72A"/></linearGradient></defs><polygon fill="url(#g)" points="4,0 4,20.16 8.8,15.36 12.2,24 15.8,22.08 12.6,13.92 20,13.92"/></svg>';
 
-export default {
+const worker = {
   async fetch(request, env, ctx) {
     const url = new URL(request.url);
     const path = url.pathname;
-    const method = request.method;
+    // HEAD is routed like GET (the runtime drops the body), so uptime checks see the real status.
+    const method = request.method === 'HEAD' ? 'GET' : request.method;
     try {
+      const moved = canonicalRedirect(url);
+      if (moved) return moved;
+      if (method === 'POST' && !isMcpApi(path) && !sameOrigin(request, url)) {
+        return messagePage(403, 'Request blocked', 'This form was sent from another site.');
+      }
       if (path === '/' && method === 'GET') return homePage(request, env, url);
       if (path === '/create' && method === 'POST') return createLink(request, env, url);
       if (path === '/links' && method === 'GET') return linksPage(request, env, url);
       if (path === '/mcp/reset') return resetMcp(request, env, url);
       if (path.startsWith('/mcp/')) return mcpEndpoint(request, env, url);
       if (path === '/favicon.svg' || path === '/favicon.ico') return new Response(FAVICON_SVG, { headers: { 'Content-Type': 'image/svg+xml', 'Cache-Control': 'public, max-age=86400' } });
-      if (path === '/robots.txt') return new Response('User-agent: *\nDisallow: /\n');
+      // Only the homepage is open to search engines. Short links and account pages are not.
+      if (path === '/robots.txt') return new Response('User-agent: *\nAllow: /$\nDisallow: /\n');
       const detail = path.match(/^\/links\/([a-z0-9]{4,12})$/);
       if (detail && method === 'GET') return detailPage(request, env, url, detail[1]);
+      const del = path.match(/^\/links\/([a-z0-9]{4,12})\/delete$/);
+      if (del && method === 'POST') return deleteLink(request, env, del[1]);
       const short = path.match(/^\/([a-z0-9]{4,12})$/);
-      if (short && (method === 'GET' || method === 'HEAD')) {
-        return redirect(request, env, ctx, short[1]);
-      }
+      if (short && method === 'GET') return redirect(request, env, ctx, short[1]);
       return messagePage(404, 'Page not found', 'There is nothing at this address.');
     } catch (err) {
       console.error(err);
       return messagePage(500, 'Something went wrong', 'Please try again in a moment.');
     }
   },
+
+  // Daily cron (see wrangler.toml): drop raw click rows past the retention window.
+  async scheduled(controller, env, ctx) {
+    ctx.waitUntil(pruneClicks(env));
+  },
 };
+
+export default {
+  async fetch(request, env, ctx) {
+    const response = await worker.fetch(request, env, ctx);
+    // Staging sets NOINDEX so a test copy of the site never reaches search results.
+    if (env.NOINDEX) response.headers.set('X-Robots-Tag', 'noindex, nofollow');
+    return response;
+  },
+  scheduled: worker.scheduled,
+};
+
+// ---------- request guards ----------
+
+function isLocalHost(hostname) {
+  return (
+    hostname === 'localhost' ||
+    hostname === '127.0.0.1' ||
+    hostname === '[::1]' ||
+    hostname.endsWith('.localhost')
+  );
+}
+
+// Send http:// and www. visitors to the https:// bare domain.
+function canonicalRedirect(url) {
+  if (isLocalHost(url.hostname)) return null;
+  const host = url.hostname.startsWith('www.') ? url.hostname.slice(4) : url.hostname;
+  if (url.protocol === 'https:' && host === url.hostname) return null;
+  return new Response(null, {
+    status: 301,
+    headers: {
+      Location: `https://${host}${url.pathname}${url.search}`,
+      'Cache-Control': 'public, max-age=3600',
+    },
+  });
+}
+
+function isMcpApi(path) {
+  return path.startsWith('/mcp/') && path !== '/mcp/reset';
+}
+
+// Browsers send Origin on every form POST. A POST from another site is refused.
+function sameOrigin(request, url) {
+  const origin = request.headers.get('Origin');
+  if (!origin) return true;
+  try {
+    return new URL(origin).host === url.host;
+  } catch {
+    return false;
+  }
+}
 
 // ---------- redirect ----------
 
@@ -83,21 +151,44 @@ async function recordClick(request, env, code) {
   // The raw IP is never stored. The hash changes every day, so a visitor
   // cannot be followed across days.
   const visitor = (await sha256(`${secret(env)}|${day}|${code}|${ip}|${ua}`)).slice(0, 32);
+  // The hash already includes the day, so "not seen before" means "first click today".
+  // The counter update must run before the insert.
   await env.DB.batch([
-    env.DB.prepare('INSERT INTO clicks (code, ts, visitor_hash) VALUES (?, ?, ?)').bind(
-      code,
-      now,
-      visitor
-    ),
-    env.DB.prepare('UPDATE links SET click_count = click_count + 1 WHERE code = ?').bind(code),
+    env.DB.prepare(
+      `UPDATE links SET click_count = click_count + 1,
+         unique_count = unique_count + (NOT EXISTS (SELECT 1 FROM clicks WHERE code = ? AND visitor_hash = ?))
+       WHERE code = ?`
+    ).bind(code, visitor, code),
+    env.DB.prepare(
+      'INSERT INTO clicks (code, ts, visitor_hash) SELECT ?, ?, ? WHERE EXISTS (SELECT 1 FROM links WHERE code = ?)'
+    ).bind(code, now, visitor, code),
   ]);
+}
+
+// Click ids grow with time, so the oldest rows have the lowest ids. This reads at
+// most PRUNE_BATCH rows per run and never scans the whole table.
+async function pruneClicks(env) {
+  const cutoff = Math.floor(Date.now() / 1000) - CLICK_RETENTION_DAYS * 86400;
+  await env.DB.prepare(
+    'DELETE FROM clicks WHERE ts < ? AND id IN (SELECT id FROM clicks ORDER BY id LIMIT ?)'
+  )
+    .bind(cutoff, PRUNE_BATCH)
+    .run();
 }
 
 // ---------- create ----------
 
 async function createLink(request, env, url) {
   const owner = getOwner(request);
-  const form = await request.formData();
+  let form;
+  try {
+    form = await request.formData();
+  } catch {
+    return homePage(request, env, url, {
+      error: 'That request could not be read. Please try again.',
+      status: 400,
+    });
+  }
   const rawUrl = String(form.get('url') || '').trim();
   const label = String(form.get('label') || '').trim().slice(0, MAX_LABEL_LENGTH);
 
@@ -140,9 +231,28 @@ async function createLink(request, env, url) {
   }
   if (!code) throw new Error('Could not generate a unique code');
 
-  const headers = new Headers({ Location: `/?new=${code}` });
+  const headers = new Headers({ Location: `/?new=${code}`, 'Cache-Control': 'no-store' });
   setOwnerCookie(headers, owner, url);
   return new Response(null, { status: 303, headers });
+}
+
+async function deleteLink(request, env, code) {
+  const owner = getOwner(request);
+  const results = owner.isNew
+    ? null
+    : await env.DB.batch([
+        env.DB.prepare(
+          'DELETE FROM clicks WHERE code = ? AND EXISTS (SELECT 1 FROM links WHERE code = ? AND owner_id = ?)'
+        ).bind(code, code, owner.id),
+        env.DB.prepare('DELETE FROM links WHERE code = ? AND owner_id = ?').bind(code, owner.id),
+      ]);
+  if (!results || !results[1].meta.changes) {
+    return messagePage(404, 'Link not found', 'This link is not in your list.');
+  }
+  return new Response(null, {
+    status: 303,
+    headers: { Location: '/links?deleted=1', 'Cache-Control': 'no-store' },
+  });
 }
 
 function checkDestination(raw, ownHost) {
@@ -158,6 +268,10 @@ function checkDestination(raw, ownHost) {
   }
   if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') {
     return { error: 'Only http and https links are supported.' };
+  }
+  // "https://bank.com@evil.example" opens evil.example. Refuse the disguise.
+  if (parsed.username || parsed.password) {
+    return { error: 'Links with a username or password in them are not supported.' };
   }
   if (!parsed.hostname.includes('.')) {
     return { error: 'That does not look like a valid URL.' };
@@ -180,7 +294,8 @@ function randomCode() {
 
 async function homePage(request, env, url, state = {}) {
   const owner = getOwner(request);
-  const links = await listLinks(env, owner.id, 5);
+  const offset = tzOffset(request);
+  const links = owner.isNew ? [] : await listLinks(env, owner.id, 5);
   let created = '';
   const newCode = url.searchParams.get('new');
   if (!state.error && newCode && /^[a-z0-9]{4,12}$/.test(newCode)) {
@@ -228,29 +343,34 @@ async function homePage(request, env, url, state = {}) {
       links.length
         ? `<section>
             <div class="sectionhead"><h2>Recent links</h2><a href="/links">See all</a></div>
-            ${linkList(links, url.origin)}
+            ${linkList(links, url.origin, offset)}
           </section>`
         : ''
     }`;
-  return page('Linki', body, {
+  const status = state.status || 200;
+  return page(HOME_TITLE, body, {
     owner,
     url,
-    status: state.status || 200,
+    status,
     linkCreated: Boolean(created),
+    index: status === 200 && !url.search,
   });
 }
 
 async function linksPage(request, env, url) {
   const owner = getOwner(request);
-  const [links, mcp] = await Promise.all([
-    listLinks(env, owner.id, 200),
-    connectorForOwner(request, env, owner.id),
-  ]);
+  const links = owner.isNew ? [] : await listLinks(env, owner.id, 200);
+  const mcp = await connectorForOwner(request, env, owner, links.length > 0);
+  const notice =
+    url.searchParams.get('deleted') === '1'
+      ? '<p class="notice" role="status">Link deleted. Its short link no longer works.</p>'
+      : '';
   const body = `
     <div class="sectionhead top"><h1>Your links</h1><a class="button secondary" href="/">New link</a></div>
+    ${notice}
     ${
       links.length
-        ? linkList(links, url.origin)
+        ? linkList(links, url.origin, tzOffset(request))
         : '<div class="empty"><p>No links yet</p><a class="button primary" href="/">Create your first link</a></div>'
     }
     ${agentSection(mcp, url)}`;
@@ -261,7 +381,12 @@ function agentSection(mcp, url) {
   const connectorUrl = mcp.token ? `${url.origin}/mcp/${mcp.token}` : '';
   const hint = mcp.token
     ? 'In Claude: Settings → Connectors → Add custom connector → paste this URL.'
-    : 'Reset to issue a new connector URL. The old URL stops working.';
+    : mcp.exists
+      ? 'Reset to issue a new connector URL. The old URL stops working.'
+      : 'Create a link first. Your connector URL will show up here.';
+  const reset = mcp.exists
+    ? '<form method="post" action="/mcp/reset"><button class="secondary" type="submit">Reset</button></form>'
+    : '';
   const urlRow = connectorUrl
     ? `<div class="up">
         <input class="short" type="text" readonly spellcheck="false" aria-label="Connector URL" title="${esc(connectorUrl)}" value="${esc(connectorUrl)}">
@@ -272,7 +397,7 @@ function agentSection(mcp, url) {
     <section class="agent" aria-labelledby="agent-h">
       <div class="agenthead">
         <h2 id="agent-h">Connect an agent</h2>
-        <form method="post" action="/mcp/reset"><button class="secondary" type="submit">Reset</button></form>
+        ${reset}
       </div>
       <p class="hint">${esc(hint)}</p>
       ${urlRow}
@@ -281,28 +406,28 @@ function agentSection(mcp, url) {
 
 async function detailPage(request, env, url, code) {
   const owner = getOwner(request);
-  const link = await env.DB.prepare(
-    'SELECT code, destination, label, status, click_count, created_at FROM links WHERE code = ? AND owner_id = ?'
-  )
-    .bind(code, owner.id)
-    .first();
+  const link = owner.isNew
+    ? null
+    : await env.DB.prepare(
+        'SELECT code, destination, label, status, click_count, unique_count, created_at FROM links WHERE code = ? AND owner_id = ?'
+      )
+        .bind(code, owner.id)
+        .first();
   if (!link) {
     return messagePage(404, 'Link not found', 'This link is not in your list.');
   }
 
-  const today = Math.floor(Date.now() / 86400000); // days since epoch, UTC
-  const since = (today - (CHART_DAYS - 1)) * 86400;
-  const [uniqueRow, daily] = await Promise.all([
-    env.DB.prepare('SELECT COUNT(DISTINCT visitor_hash) AS n FROM clicks WHERE code = ?')
-      .bind(code)
-      .first(),
-    env.DB.prepare(
-      `SELECT ts / 86400 AS day, COUNT(*) AS clicks, COUNT(DISTINCT visitor_hash) AS uniques
-       FROM clicks WHERE code = ? AND ts >= ? GROUP BY day`
-    )
-      .bind(code, since)
-      .all(),
-  ]);
+  // Days are counted in the visitor's time zone (see tzOffset). The query only
+  // reads the chart window, and the all-time totals come from the links row.
+  const offset = tzOffset(request);
+  const today = localDay(Math.floor(Date.now() / 1000), offset);
+  const since = (today - (CHART_DAYS - 1)) * 86400 - offset;
+  const daily = await env.DB.prepare(
+    `SELECT CAST((ts + ?) / 86400 AS INTEGER) AS day, COUNT(*) AS clicks, COUNT(DISTINCT visitor_hash) AS uniques
+     FROM clicks WHERE code = ? AND ts >= ? GROUP BY day`
+  )
+    .bind(offset, code, since)
+    .all();
   const byDay = new Map(daily.results.map((r) => [r.day, r]));
   const days = [];
   for (let d = today - (CHART_DAYS - 1); d <= today; d++) {
@@ -327,7 +452,7 @@ async function detailPage(request, env, url, code) {
     <div class="dtop">
       <div>
         <h1>${esc(link.label || link.code)}</h1>
-        <p class="meta dest">Goes to <a href="${esc(link.destination)}" rel="noopener noreferrer nofollow" target="_blank">${esc(truncate(link.destination, 90))}</a> · Created ${formatDate(link.created_at)}</p>
+        <p class="meta dest">Goes to <a href="${esc(link.destination)}" rel="noopener noreferrer nofollow" target="_blank">${esc(truncate(link.destination, 90))}</a> · Created ${formatDate(link.created_at + offset)}</p>
       </div>
       <div class="up">
         <input class="short" type="text" readonly value="${esc(shortUrl.replace(/^https?:\/\//, ''))}" aria-label="Short link">
@@ -337,7 +462,7 @@ async function detailPage(request, env, url, code) {
 
     <div class="stats">
       <div class="stat t1"><span class="label">Total clicks</span><span class="num">${link.click_count.toLocaleString('en-US')}</span></div>
-      <div class="stat t2"><span class="label">Unique clicks</span><span class="num">${uniqueRow.n.toLocaleString('en-US')}</span></div>
+      <div class="stat t2"><span class="label">Unique clicks</span><span class="num">${link.unique_count.toLocaleString('en-US')}</span></div>
       <div class="stat t3"><span class="label">Last ${CHART_DAYS} days</span><span class="num">${last30.toLocaleString('en-US')}</span></div>
     </div>
 
@@ -346,7 +471,11 @@ async function detailPage(request, env, url, code) {
       <div class="chart" role="img" aria-label="Clicks per day for the last ${CHART_DAYS} days, ${last30} in total">${bars}</div>
       <div class="axis"><span>${formatDay(days[0].day)}</span><span>Today · ${days[days.length - 1].clicks}</span></div>
     </section>
-    <p class="note">Days are in UTC. Unique clicks count each visitor once per day; link previews and known bots are not counted.</p>`;
+    <p class="note">${offset ? `Days follow your time zone (${utcLabel(offset)}).` : 'Days are in UTC.'} Unique clicks count each visitor once per day; link previews and known bots are not counted.</p>
+    <form class="dz" method="post" action="/links/${link.code}/delete" data-confirm="Delete this link? The short link will stop working and its click history will be removed. This cannot be undone.">
+      <p>Deleting stops the short link and removes its click history.</p>
+      <button class="secondary danger" type="submit">Delete link</button>
+    </form>`;
   return page(link.label || link.code, body, { owner, url });
 }
 
@@ -359,15 +488,15 @@ async function listLinks(env, ownerId, limit) {
   return results;
 }
 
-function linkList(links, origin) {
+function linkList(links, origin, offset = 0) {
   const host = origin.replace(/^https?:\/\//, '');
-  const todayNum = Math.floor(Date.now() / 86400000);
+  const todayNum = localDay(Math.floor(Date.now() / 1000), offset);
   return `<ul class="links">${links
     .map((l, i) => {
       const shortUrl = `${origin}/${l.code}`;
       const name = l.label || l.destination.replace(/^https?:\/\/(www\.)?/i, '');
       const letter = (Array.from(name)[0] || '#').toUpperCase();
-      const dayNum = Math.floor(l.created_at / 86400);
+      const dayNum = localDay(l.created_at, offset);
       return `
       <li>
         <a class="rowmain" href="/links/${l.code}">
@@ -388,11 +517,11 @@ function messagePage(status, title, text) {
   return page(title, body, { status });
 }
 
-function gaHead(linkCreated) {
+function gaHead(linkCreated, nonce) {
   if (!GA_ID) return '';
   const event = linkCreated ? "\n  gtag('event', 'link_created');" : '';
-  return `<script async src="https://www.googletagmanager.com/gtag/js?id=${GA_ID}"></script>
-<script>
+  return `<script async nonce="${nonce}" src="https://www.googletagmanager.com/gtag/js?id=${GA_ID}"></script>
+<script nonce="${nonce}">
   window.dataLayer = window.dataLayer || [];
   function gtag(){dataLayer.push(arguments);}
   gtag('js', new Date());
@@ -401,16 +530,45 @@ function gaHead(linkCreated) {
 `;
 }
 
-function page(title, body, { owner, url, status = 200, linkCreated = false, mcpToken } = {}) {
+// Only the plain homepage is indexable. Everything else stays out of search engines.
+function seoHead(index, url) {
+  if (!index || !url) return '<meta name="robots" content="noindex">';
+  const home = `${url.origin}/`;
+  return `<meta name="description" content="${esc(HOME_DESCRIPTION)}">
+<link rel="canonical" href="${esc(home)}">
+<meta property="og:type" content="website">
+<meta property="og:site_name" content="Linki">
+<meta property="og:title" content="${esc(HOME_TITLE)}">
+<meta property="og:description" content="${esc(HOME_DESCRIPTION)}">
+<meta property="og:url" content="${esc(home)}">
+<meta name="twitter:card" content="summary">`;
+}
+
+function contentSecurityPolicy(nonce) {
+  return [
+    "default-src 'none'",
+    `script-src 'nonce-${nonce}' https://*.googletagmanager.com`,
+    "style-src 'unsafe-inline' https://fonts.googleapis.com",
+    'font-src https://fonts.gstatic.com',
+    "img-src 'self' data: https://*.google-analytics.com https://*.googletagmanager.com",
+    'connect-src https://*.google-analytics.com https://*.analytics.google.com https://*.googletagmanager.com',
+    "form-action 'self'",
+    "base-uri 'none'",
+    "frame-ancestors 'none'",
+  ].join('; ');
+}
+
+function page(title, body, { owner, url, status = 200, linkCreated = false, mcpToken, index = false } = {}) {
+  const nonce = base64url(crypto.getRandomValues(new Uint8Array(16)));
   const html = `<!doctype html>
 <html lang="en">
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<meta name="robots" content="noindex">
+${seoHead(index, url)}
 <title>${esc(title)}</title>
 <link rel="icon" href="/favicon.svg" type="image/svg+xml">
-${gaHead(linkCreated)}<link rel="preconnect" href="https://fonts.googleapis.com">
+${gaHead(linkCreated, nonce)}<link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
 <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Bricolage+Grotesque:opsz,wght@12..96,700;12..96,800&family=Inter:wght@400;500;600;700&family=Space+Mono:wght@400;700&display=swap">
 <style>${CSS}</style>
@@ -419,16 +577,23 @@ ${gaHead(linkCreated)}<link rel="preconnect" href="https://fonts.googleapis.com"
 <header><a class="brand" href="/">Linki</a><nav><a class="pill" href="/links"${url && url.pathname.startsWith('/links') ? ' aria-current="page"' : ''}>Your links</a></nav></header>
 <main class="panel">${body}</main>
 <footer><p>Links are tied to this browser. No sign-up. Short-link visitors are never tracked with cookies; Linki's own pages use Google Analytics.</p></footer>
-<script>${JS}</script>
+<script nonce="${nonce}">${JS}</script>
 </body>
 </html>`;
   const headers = new Headers({
     'Content-Type': 'text/html; charset=utf-8',
     'Cache-Control': 'no-store',
     'X-Content-Type-Options': 'nosniff',
+    'X-Frame-Options': 'DENY',
     'Referrer-Policy': 'same-origin',
+    'Content-Security-Policy': contentSecurityPolicy(nonce),
   });
-  if (owner && url) setOwnerCookie(headers, owner, url);
+  if (url && url.protocol === 'https:') {
+    headers.set('Strict-Transport-Security', 'max-age=31536000');
+  }
+  // Returning owners get their cookie renewed. A first-time visitor gets one only
+  // when they create a link (see createLink), so plain visits set no cookie.
+  if (owner && !owner.isNew && url) setOwnerCookie(headers, owner, url);
   if (mcpToken && url) setMcpCookie(headers, mcpToken, url);
   return new Response(html, { status, headers });
 }
@@ -445,11 +610,10 @@ function getOwner(request) {
 }
 
 function setOwnerCookie(headers, owner, url) {
-  if (!owner.isNew) return;
   const secure = url.protocol === 'https:' ? '; Secure' : '';
   headers.append(
     'Set-Cookie',
-    `owner=${owner.id}; Path=/; Max-Age=31536000; HttpOnly; SameSite=Lax${secure}`
+    `owner=${owner.id}; Path=/; Max-Age=${OWNER_COOKIE_MAX_AGE}; HttpOnly; SameSite=Lax${secure}`
   );
 }
 
@@ -457,7 +621,7 @@ function setMcpCookie(headers, token, url) {
   const secure = url.protocol === 'https:' ? '; Secure' : '';
   headers.append(
     'Set-Cookie',
-    `mcp=${token}; Path=/; Max-Age=31536000; HttpOnly; SameSite=Lax${secure}`
+    `mcp=${token}; Path=/; Max-Age=${OWNER_COOKIE_MAX_AGE}; HttpOnly; SameSite=Lax${secure}`
   );
 }
 
@@ -469,6 +633,27 @@ function cookieValue(request, name) {
     if (eq > 0 && trimmed.slice(0, eq) === name) return trimmed.slice(eq + 1);
   }
   return '';
+}
+
+// ---------- time zone ----------
+
+// The page script stores the browser's UTC offset in minutes in a "tz" cookie.
+// Returns that offset in seconds, or 0 (UTC) when it is missing or out of range.
+function tzOffset(request) {
+  const raw = cookieValue(request, 'tz');
+  if (!/^-?\d{1,3}$/.test(raw)) return 0;
+  const minutes = Number(raw);
+  return minutes >= -720 && minutes <= 840 ? minutes * 60 : 0;
+}
+
+function localDay(unixSeconds, offset) {
+  return Math.floor((unixSeconds + offset) / 86400);
+}
+
+function utcLabel(offset) {
+  const minutes = Math.abs(offset) / 60;
+  const rest = minutes % 60;
+  return `UTC${offset < 0 ? '-' : '+'}${Math.floor(minutes / 60)}${rest ? `:${String(rest).padStart(2, '0')}` : ''}`;
 }
 
 // ---------- mcp ----------
@@ -519,19 +704,24 @@ const MCP_TOOLS = [
   },
 ];
 
-async function connectorForOwner(request, env, ownerId) {
+// Returns { token, exists }. token is the raw connector token when this browser
+// still holds it. A connector is issued on the first visit after the owner has
+// a link, so a visit with no cookie or no links never writes to the database.
+async function connectorForOwner(request, env, owner, hasLinks) {
+  if (owner.isNew) return { token: null, exists: false };
   const presented = cookieValue(request, 'mcp');
   if (/^[A-Za-z0-9_-]{20,200}$/.test(presented)) {
     const row = await env.DB.prepare('SELECT owner_id FROM mcp_tokens WHERE token_hash = ?')
       .bind(await sha256(presented))
       .first();
-    if (row && row.owner_id === ownerId) return { token: presented, isNew: false };
+    if (row && row.owner_id === owner.id) return { token: presented, exists: true };
   }
   const existing = await env.DB.prepare('SELECT 1 AS ok FROM mcp_tokens WHERE owner_id = ?')
-    .bind(ownerId)
+    .bind(owner.id)
     .first();
-  if (existing) return { token: null, isNew: false };
-  return { token: await issueMcpToken(env, ownerId), isNew: true };
+  if (existing) return { token: null, exists: true };
+  if (!hasLinks) return { token: null, exists: false };
+  return { token: await issueMcpToken(env, owner.id), exists: true };
 }
 
 async function issueMcpToken(env, ownerId) {
@@ -667,8 +857,7 @@ async function callTool(env, origin, ownerId, params) {
 
 async function reportLinks(env, origin, ownerId) {
   const { results } = await env.DB.prepare(
-    `SELECT code, destination, label, click_count, created_at,
-            (SELECT COUNT(DISTINCT visitor_hash) FROM clicks WHERE code = links.code) AS uniques
+    `SELECT code, destination, label, click_count, created_at, unique_count AS uniques
      FROM links
      WHERE owner_id = ?
      ORDER BY created_at DESC, rowid DESC
@@ -837,8 +1026,17 @@ function base64url(bytes) {
 
 // ---------- helpers ----------
 
+let warnedAboutSecret = false;
+
 function secret(env) {
-  return env.HASH_SECRET || 'local-dev-secret';
+  if (env.HASH_SECRET) return env.HASH_SECRET;
+  if (!warnedAboutSecret) {
+    warnedAboutSecret = true;
+    console.error(
+      'HASH_SECRET is not set, so visitor hashes use a public fallback. Set it with: wrangler secret put HASH_SECRET'
+    );
+  }
+  return 'local-dev-secret';
 }
 
 async function sha256(text) {
@@ -898,6 +1096,15 @@ document.addEventListener('click', async function (e) {
 document.querySelectorAll('input.short').forEach(function (el) {
   el.addEventListener('focus', function () { el.select(); });
 });
+document.addEventListener('submit', function (e) {
+  var msg = e.target.getAttribute('data-confirm');
+  if (msg && !window.confirm(msg)) e.preventDefault();
+});
+// Tell the server this browser's UTC offset so "Today" and the chart use local days.
+try {
+  document.cookie = 'tz=' + (-new Date().getTimezoneOffset()) + '; Path=/; Max-Age=31536000; SameSite=Lax' +
+    (location.protocol === 'https:' ? '; Secure' : '');
+} catch (e) {}
 `;
 
 const CSS = `
@@ -1090,6 +1297,9 @@ button.copied{background:var(--accent);color:var(--on-accent);border-color:var(-
 .agent .hint{margin-top:6px;max-width:68ch;font-size:14px;color:var(--muted)}
 .agent .up{flex:1 1 auto;width:100%;max-width:none;margin-top:14px}
 .agent .up input.short{min-width:0}
+.notice{margin:-6px 0 18px;padding:12px 16px;border-radius:14px;background:var(--paper);font-size:14px;font-weight:500}
+.dz{display:flex;justify-content:space-between;align-items:center;gap:16px;margin-top:28px;padding-top:20px;border-top:1px solid var(--line-soft);font-size:14px;color:var(--muted)}
+.danger{color:var(--danger);border-color:currentColor}
 @media (max-width:520px){
   .agent{padding:16px}
   .agent .up{flex-wrap:wrap;height:auto;padding:8px 8px 8px 14px;border-radius:18px}

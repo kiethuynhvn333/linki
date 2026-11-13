@@ -1,3 +1,29 @@
+# Back-end hardening (13 Nov 2026)
+
+Fixes from a code audit. Each one has a test in `test/app.test.js`.
+
+## Fixed
+- **Database writes on plain visits.** Opening Your links without a cookie created a connector row every time. A connector is now created only for an owner who has a link.
+- **Owner cookie expiry.** The cookie was set once and expired after a year. It is now renewed on every visit. First-time visitors get it when they create a link, not on page load.
+- **HTTPS.** `http://` and `www.` requests get a 301 to the `https://` bare domain. Pages send `Strict-Transport-Security`, a `Content-Security-Policy` (scripts need a per-response nonce), and `X-Frame-Options: DENY`.
+- **Missing `HASH_SECRET`.** The fallback is no longer silent: the Worker logs an error. Logs are kept (`[observability]` in `wrangler.toml`).
+- **Stats cost.** All-time unique clicks are stored on the link (`links.unique_count`), so pages no longer re-count every click. Raw click rows older than 400 days are deleted by a daily cron.
+- `HEAD` requests get the same status as `GET` (the homepage used to answer 404).
+- A request body that is not a form gets a 400 instead of a 500.
+- Destinations with a username or password (`https://bank.com@evil.example`) are refused.
+- Form posts from another site are refused (Origin check).
+- The bot filter also catches common HTTP libraries and more crawlers.
+
+## Added
+- **Delete link** on the link's page (`POST /links/:code/delete`). It removes the link and its clicks.
+- **Local days.** The page script stores the browser's UTC offset in a `tz` cookie. "Today" and the chart use it. Connector (MCP) reports stay in UTC.
+- **Search engines.** The homepage is indexable, with a description, canonical URL and Open Graph tags. `robots.txt` allows only `/`.
+- `www.linki.ing` as a second custom domain. It redirects to `linki.ing`.
+- Database migrations in `migrations/` (replaces `schema.sql`), tests, and a CI workflow.
+
+## Releasing this change
+Run `npm run release`, or by hand: `npx wrangler d1 migrations apply linki --remote`, then `npx wrangler deploy`. The migration adds `links.unique_count` and fills it from existing clicks. The old code keeps working after the migration, so apply it first.
+
 # Custom domain and favicon (12 Nov 2026)
 
 ## Custom domain

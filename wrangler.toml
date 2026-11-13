@@ -3,10 +3,37 @@ main = "src/index.js"
 compatibility_date = "2025-01-01"
 workers_dev = true
 routes = [
-  { pattern = "linki.ing", custom_domain = true }
+  { pattern = "linki.ing", custom_domain = true },
+  { pattern = "www.linki.ing", custom_domain = true }
 ]
+
+# Daily at 03:17 UTC: delete raw click rows past the retention window.
+[triggers]
+crons = ["17 3 * * *"]
+
+# Keep Worker logs (errors and console output) in the Cloudflare dashboard.
+[observability]
+enabled = true
 
 [[d1_databases]]
 binding = "DB"
 database_name = "linki"
 database_id = "c4f2bde0-7b17-44f2-88c1-ecf69d5557b3"
+migrations_dir = "migrations"
+
+# Staging: a separate Worker and database for testing a change before release.
+# `npm run release:staging` deploys it to linki-staging.<subdomain>.workers.dev.
+# It has no custom domain, and NOINDEX keeps it out of search engines.
+[env.staging]
+name = "linki-staging"
+workers_dev = true
+routes = []
+
+[env.staging.vars]
+NOINDEX = "1"
+
+[[env.staging.d1_databases]]
+binding = "DB"
+database_name = "linki-staging"
+database_id = "f284bd1a-8290-4f7b-bbb0-501b382d43d6"
+migrations_dir = "migrations"
