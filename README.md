@@ -1,6 +1,6 @@
 # Linki
 
-A very good alternative of bitly. Shorten a link, share it, and see how many people clicked. No sign-up: your links are tied to your browser.
+A very good alternative to bitly. Shorten a link, share it, and see how many people clicked. No sign-up: your links are tied to your browser.
 
 Live: https://linki.ing
 
@@ -19,8 +19,9 @@ Google Analytics loads on Linki's own pages from `GA_ID` at the top of `src/inde
 - Only the homepage is open to search engines. Short links and "Your links" pages are not indexed.
 - `http://` and `www.` addresses redirect to the `https://` bare domain.
 - Raw click rows are deleted after 400 days by a daily cron. Total and unique counts are kept on the link.
-- Every page uses an SVG favicon of the header cursor, at `/favicon.svg`. `/favicon.ico` serves the same SVG.
-- The home hero is animated: the click count ticks up, the shapes float and follow the mouse, background shapes drift behind the panel, and example chips scroll under it. All of it stops under `prefers-reduced-motion`.
+- The header logo and the favicon are the same SVG (`LOGO_SVG` in `src/index.js`), served at `/favicon.svg` and `/favicon.ico`.
+- The home hero is animated: the click count ticks up, the shapes in the blue card float and follow the mouse, and example chips scroll under it. All of it stops under `prefers-reduced-motion`.
+- Under the hero, the homepage lists what Linki offers in four short points (`USPS` in `src/index.js`).
 
 ## Connect an agent
 

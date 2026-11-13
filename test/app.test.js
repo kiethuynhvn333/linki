@@ -168,6 +168,28 @@ test('http and www visitors are sent to the https bare domain', async () => {
   assert.equal((await request('/', { origin: 'http://localhost:8787' })).status, 200);
 });
 
+test('the homepage shows the headline, the four selling points and no footer statement', async () => {
+  const html = await (await request('/')).text();
+  assert.match(html, /<h1>a very good alternative to <span class="hl">bitly<\/span><\/h1>/);
+  assert.equal(html.match(/<section class="usp"/g).length, 1);
+  assert.equal(html.match(/<li><span class="ic t\d"/g).length, 4);
+  for (const title of ['Paste and go', 'No sign-up', 'See every click', 'Agent-ready']) {
+    assert.ok(html.includes(`<h3>${title}</h3>`), title);
+  }
+  assert.doesNotMatch(html, /<footer|tied to this browser/);
+  assert.doesNotMatch(await (await request('/links')).text(), /class="usp"/);
+});
+
+test('the header logo and the favicon are the same drawing', async () => {
+  const html = await (await request('/')).text();
+  const logo = html.match(/<a class="brand" href="\/">(<svg.*?<\/svg>)Linki<\/a>/)[1];
+  for (const path of ['/favicon.svg', '/favicon.ico']) {
+    const res = await request(path);
+    assert.equal(res.headers.get('Content-Type'), 'image/svg+xml');
+    assert.equal(await res.text(), logo.replace(' aria-hidden="true"', ''), path);
+  }
+});
+
 // ---------- creating links ----------
 
 test('creating a link gives the browser its owner cookie and shows the result', async () => {
