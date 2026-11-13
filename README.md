@@ -15,6 +15,7 @@ Google Analytics loads on Linki's own pages from `GA_ID` at the top of `src/inde
 - "Your links" lists your links with their click counts; each link has a 30-day click chart.
 - Short-link visitors aren't tracked with cookies. Unique visits are counted with a daily salted hash.
 - Every page uses an SVG favicon of the header cursor, at `/favicon.svg`. `/favicon.ico` serves the same SVG.
+- The home hero is animated: the click count ticks up, the shapes float and follow the mouse, background shapes drift behind the panel, and example chips scroll under it. All of it stops under `prefers-reduced-motion`.
 
 ## Connect an agent
 

@@ -178,6 +178,17 @@ function randomCode() {
 
 // ---------- pages ----------
 
+// Example chips for the home marquee: [slug, click count]. Decorative, not real links.
+const MARQUEE_LINKS = [
+  ['launch', 342],
+  ['promo', 87],
+  ['newsletter', 1204],
+  ['demo', 56],
+  ['hello', 128],
+  ['podcast', 419],
+  ['waitlist', 733],
+];
+
 async function homePage(request, env, url, state = {}) {
   const owner = getOwner(request);
   const links = await listLinks(env, owner.id, 5);
@@ -203,10 +214,18 @@ async function homePage(request, env, url, state = {}) {
         <p class="ex">linki/hello</p>
         <div class="foot">
           <div class="bars"><span style="height:34%"></span><span style="height:55%"></span><span style="height:42%"></span><span style="height:70%"></span><span style="height:48%"></span><span style="height:84%"></span><span style="height:100%"></span></div>
-          <p class="n">128 <small>clicks</small></p>
+          <p class="n"><span class="cnt">128</span> <small>clicks</small></p>
         </div>
       </div>`;
+  // Decorative only: example chips that scroll under the hero. The list is
+  // printed twice so the CSS loop (translateX 0 to -50%) has no seam.
+  const chips = MARQUEE_LINKS.map(
+    ([slug, clicks]) => `<span class="mchip">linki/${slug}<small>${clicks}</small></span>`
+  ).join('');
+  const marquee = `
+    <div class="mq" aria-hidden="true"><div class="mqt"><div class="mqg">${chips}</div><div class="mqg">${chips}</div></div></div>`;
   const body = `
+    <div class="bgs" aria-hidden="true"><i class="s1"></i><i class="s2"></i><i class="s3"></i><i class="s4"></i><i class="s5"></i></div>
     <div class="hero${created ? ' has' : ''}">
       <section>
         <h1>a very good alternative of <span class="hl">bitly</span></h1>
@@ -224,6 +243,7 @@ async function homePage(request, env, url, state = {}) {
       </section>
       ${created || preview}
     </div>
+    ${created ? '' : marquee}
     ${
       links.length
         ? `<section>
@@ -874,6 +894,61 @@ function formatDay(dayNumber) {
 }
 
 const JS = `
+// Home hero motion. All of it is decorative and is skipped under prefers-reduced-motion.
+(function () {
+  if (window.matchMedia('(prefers-reduced-motion: reduce)').matches) return;
+
+  // Counter: count up to the number in the markup, then tick +1 every few seconds.
+  var num = document.querySelector('.pv .cnt');
+  if (num) {
+    var target = parseInt(num.textContent, 10) || 0;
+    var value = target;
+    var lastBar = document.querySelector('.pv .bars span:last-child');
+    var began = null;
+    var show = function (n) { num.textContent = n.toLocaleString('en-US'); };
+    var pulse = function (el, frames) {
+      if (el && el.animate) el.animate(frames, { duration: 520, easing: 'ease-out' });
+    };
+    var tick = function () {
+      if (!document.hidden) {
+        value += 1;
+        show(value);
+        pulse(lastBar, [{ transform: 'scaleY(1)' }, { transform: 'scaleY(1.14)' }, { transform: 'scaleY(1)' }]);
+        pulse(num, [{ transform: 'translateY(0)' }, { transform: 'translateY(-3px)' }, { transform: 'translateY(0)' }]);
+      }
+      setTimeout(tick, 2600 + Math.random() * 2600);
+    };
+    var step = function (now) {
+      if (began === null) began = now;
+      var p = Math.min((now - began) / 1200, 1);
+      show(Math.round(target * (1 - Math.pow(1 - p, 3))));
+      if (p < 1) requestAnimationFrame(step);
+      else setTimeout(tick, 2600);
+    };
+    show(0);
+    requestAnimationFrame(step);
+  }
+
+  // Parallax: shapes shift a few px against the cursor. Mouse only, one write per frame.
+  var layers = document.querySelectorAll('.rc, .bgs');
+  if (!layers.length || !window.matchMedia('(hover: hover) and (pointer: fine)').matches) return;
+  var mx = 0, my = 0, queued = false;
+  window.addEventListener('pointermove', function (e) {
+    if (e.pointerType && e.pointerType !== 'mouse') return;
+    mx = e.clientX / window.innerWidth - 0.5;
+    my = e.clientY / window.innerHeight - 0.5;
+    if (queued) return;
+    queued = true;
+    requestAnimationFrame(function () {
+      queued = false;
+      for (var i = 0; i < layers.length; i++) {
+        layers[i].style.setProperty('--mx', mx.toFixed(3));
+        layers[i].style.setProperty('--my', my.toFixed(3));
+      }
+    });
+  }, { passive: true });
+})();
+
 document.addEventListener('click', async function (e) {
   var btn = e.target.closest('[data-copy]');
   if (!btn) return;
@@ -908,7 +983,7 @@ const CSS = `
 @media (prefers-color-scheme:dark){:root{--paper:#111318;--surface:#1A1D24;--pressed:#2A2D36;--ink:#F2F2EE;--on-ink:#111318;--muted:#A3A7B2;
   --line:#2E323C;--line-soft:#242730;--zero:#3A3E48;--accent-text:#8AB0FF;--maroon:#9E1B32;--danger:#FF8A7A;color-scheme:dark}}
 *{box-sizing:border-box}
-body{margin:0;min-height:100vh;display:flex;flex-direction:column;background:var(--paper);color:var(--ink);font:400 16px/1.5 var(--ui);-webkit-font-smoothing:antialiased;-webkit-text-size-adjust:100%}
+body{margin:0;min-height:100vh;display:flex;flex-direction:column;overflow-x:hidden;overflow-x:clip;background:var(--paper);color:var(--ink);font:400 16px/1.5 var(--ui);-webkit-font-smoothing:antialiased;-webkit-text-size-adjust:100%}
 a{color:var(--ink);text-underline-offset:3px}
 :focus-visible{outline:3px solid var(--ink);outline-offset:2px}
 p{margin:0}
@@ -922,7 +997,7 @@ header{display:flex;justify-content:space-between;align-items:center;gap:16px;wi
 .brand::before{content:"";width:20px;height:24px;clip-path:polygon(4% 0,4% 84%,28% 64%,45% 100%,63% 92%,47% 58%,84% 58%);background:conic-gradient(var(--accent),var(--pink),var(--mustard),var(--accent))}
 .pill{display:inline-flex;align-items:center;height:38px;padding:0 16px;border:1px solid var(--line);border-radius:999px;background:var(--surface);font-weight:600;font-size:14px;text-decoration:none}
 .pill[aria-current]{background:var(--pressed)}
-.panel{flex:1 0 auto;width:calc(100% - 40px);max-width:1040px;margin:0 auto;padding:34px 36px;background:var(--surface);border-radius:26px}
+.panel{position:relative;flex:1 0 auto;width:calc(100% - 40px);max-width:1040px;margin:0 auto;padding:34px 36px;background:var(--surface);border-radius:26px}
 footer{padding:18px 16px 24px;text-align:center;font-size:13px;color:var(--muted)}
 
 /* hero + form */
@@ -964,6 +1039,23 @@ button.copied{background:var(--accent);color:var(--on-accent);border-color:var(-
 .pv .bars span:last-child{background:var(--mustard)}
 .pv .n{font:800 28px/1 var(--display);letter-spacing:-.03em}
 .pv .n small{margin-left:2px;font:600 13px/1 var(--ui);letter-spacing:0}
+.pv .cnt{display:inline-block;font-variant-numeric:tabular-nums}
+
+/* hero motion: shapes behind the panel, parallax offsets, marquee. --mx/--my are set by the page script. */
+.rc::after{translate:calc(var(--mx,0)*-16px) calc(var(--my,0)*-16px)}
+.rc::before{translate:calc(var(--mx,0)*-9px) calc(var(--my,0)*-9px)}
+.bgs{position:absolute;inset:0;z-index:-1;pointer-events:none}
+.bgs i{position:absolute;display:block;opacity:.6;translate:calc(var(--mx,0)*var(--d,-12px)) calc(var(--my,0)*var(--d,-12px))}
+.bgs .s1{--d:-14px;top:-24px;left:23%;width:68px;height:68px;border-radius:18px;background:var(--pink);transform:rotate(-14deg)}
+.bgs .s2{--d:-22px;top:-18px;right:19%;width:52px;height:52px;border-radius:50%;background:var(--mustard)}
+.bgs .s3{--d:-18px;bottom:-16px;left:8%;width:92px;height:38px;border-radius:999px;background:var(--maroon);opacity:.5;transform:rotate(-10deg)}
+.bgs .s4{--d:-26px;top:38%;right:-30px;width:60px;height:60px;border-radius:50%;background:#fff;opacity:.9}
+.bgs .s5{--d:-10px;top:66%;left:-26px;width:54px;height:54px;border-radius:15px;background:var(--pink);transform:rotate(12deg)}
+.mq{overflow:hidden;margin-top:30px;padding:2px 0;-webkit-mask-image:linear-gradient(90deg,transparent,#000 9%,#000 91%,transparent);mask-image:linear-gradient(90deg,transparent,#000 9%,#000 91%,transparent)}
+.mqt{display:flex;width:max-content}
+.mqg{display:flex;gap:10px;padding-right:10px}
+.mchip{display:inline-flex;align-items:center;gap:8px;padding:7px 8px 7px 14px;border-radius:999px;background:var(--paper);font:700 13px/1.4 var(--mono);white-space:nowrap}
+.mchip small{padding:2px 8px;border-radius:999px;background:var(--surface);font:600 11px/1.5 var(--ui);color:var(--muted);font-variant-numeric:tabular-nums}
 
 /* section heads + list */
 .sectionhead{display:flex;justify-content:space-between;align-items:center;gap:16px;margin:38px 0 8px}
@@ -1036,6 +1128,37 @@ button.copied{background:var(--accent);color:var(--on-accent);border-color:var(-
   .bar span,.pv .bars span{transform-origin:bottom;animation:grow 400ms ease-out}
   @keyframes pop{from{opacity:0;transform:scale(.96)}to{opacity:1;transform:none}}
   @keyframes grow{from{transform:scaleY(0)}to{transform:none}}
+
+  /* hero motion: slow floats (7-10s, offset), staggered bars, marquee loop */
+  .pv .bars span{animation:grow 560ms cubic-bezier(.2,.8,.2,1) backwards}
+  .pv .bars span:nth-child(1){animation-delay:120ms}
+  .pv .bars span:nth-child(2){animation-delay:190ms}
+  .pv .bars span:nth-child(3){animation-delay:260ms}
+  .pv .bars span:nth-child(4){animation-delay:330ms}
+  .pv .bars span:nth-child(5){animation-delay:400ms}
+  .pv .bars span:nth-child(6){animation-delay:470ms}
+  .pv .bars span:nth-child(7){animation-delay:540ms}
+  .rc::after{animation:float-sq 9s ease-in-out infinite}
+  .rc::before{animation:float-dot 7s ease-in-out -2s infinite}
+  .rc::after,.rc::before,.bgs i{transition:translate 600ms cubic-bezier(.2,.7,.2,1)}
+  .bgs .s1{animation:drift-a 10s ease-in-out infinite}
+  .bgs .s2{animation:drift-b 8s ease-in-out -3s infinite}
+  .bgs .s3{animation:drift-c 9s ease-in-out -5s infinite}
+  .bgs .s4{animation:drift-b 7s ease-in-out -1s infinite}
+  .bgs .s5{animation:drift-d 10s ease-in-out -6s infinite}
+  .mqt{animation:marquee 38s linear infinite}
+  .mq:hover .mqt{animation-play-state:paused}
+  @keyframes float-sq{0%,100%{transform:rotate(18deg)}50%{transform:translate(-7px,-11px) rotate(24deg)}}
+  @keyframes float-dot{0%,100%{transform:none}50%{transform:translate(9px,-9px)}}
+  @keyframes drift-a{0%,100%{transform:rotate(-14deg)}50%{transform:translate(10px,-8px) rotate(-6deg)}}
+  @keyframes drift-b{0%,100%{transform:none}50%{transform:translate(-8px,-10px)}}
+  @keyframes drift-c{0%,100%{transform:rotate(-10deg)}50%{transform:translate(12px,6px) rotate(-16deg)}}
+  @keyframes drift-d{0%,100%{transform:rotate(12deg)}50%{transform:translate(6px,-12px) rotate(22deg)}}
+  @keyframes marquee{from{transform:translateX(0)}to{transform:translateX(-50%)}}
+}
+
+@media (max-width:1180px){
+  .bgs .s4,.bgs .s5{display:none}
 }
 
 @media (max-width:860px){
@@ -1082,6 +1205,13 @@ button.copied{background:var(--accent);color:var(--on-accent);border-color:var(-
   .chh h2{font-size:18px}
   .chart{height:140px;gap:3px}
   .status{font-size:72px}
+  .bgs .s2{display:none}
+  .bgs .s1{left:auto;right:30%;width:52px;height:52px;border-radius:14px}
+  .bgs .s3{width:72px;height:30px}
+  .mq{margin-top:22px}
+  @media (prefers-reduced-motion:no-preference){
+    @keyframes float-sq{0%,100%{transform:rotate(18deg)}50%{transform:translate(-3px,-5px) rotate(21deg)}}
+  }
 }
 .agent{margin-top:32px;padding:20px 22px 18px;border-radius:22px;background:var(--paper)}
 .agenthead{display:flex;justify-content:space-between;align-items:center;gap:12px}
