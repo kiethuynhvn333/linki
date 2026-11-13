@@ -22,7 +22,7 @@ const BLOCKED_SCHEME_RE = /^(javascript|data|vbscript|file|mailto|tel|blob|about
 // Same cursor shape and colours as the .brand logo.
 const FAVICON_SVG = '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><defs><linearGradient id="g" x1="0" y1="0" x2="1" y2="1"><stop offset="0" stop-color="#2665D6"/><stop offset=".55" stop-color="#E9C0E9"/><stop offset="1" stop-color="#D2A72A"/></linearGradient></defs><polygon fill="url(#g)" points="4,0 4,20.16 8.8,15.36 12.2,24 15.8,22.08 12.6,13.92 20,13.92"/></svg>';
 
-export default {
+const worker = {
   async fetch(request, env, ctx) {
     const url = new URL(request.url);
     const path = url.pathname;
@@ -59,6 +59,16 @@ export default {
   async scheduled(controller, env, ctx) {
     ctx.waitUntil(pruneClicks(env));
   },
+};
+
+export default {
+  async fetch(request, env, ctx) {
+    const response = await worker.fetch(request, env, ctx);
+    // Staging sets NOINDEX so a test copy of the site never reaches search results.
+    if (env.NOINDEX) response.headers.set('X-Robots-Tag', 'noindex, nofollow');
+    return response;
+  },
+  scheduled: worker.scheduled,
 };
 
 // ---------- request guards ----------
