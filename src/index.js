@@ -23,7 +23,7 @@ const BLOCKED_SCHEME_RE = /^(javascript|data|vbscript|file|mailto|tel|blob|about
 // shapes of the hero card. The header logo and the favicon are this one SVG.
 const LOGO_SVG = '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 32 32"><defs><clipPath id="lt"><rect width="32" height="32" rx="9"/></clipPath></defs><g clip-path="url(#lt)"><rect width="32" height="32" fill="#2665D6"/><circle cx="9" cy="32.5" r="6.5" fill="#D2A72A"/><rect x="20" y="21" width="18" height="18" rx="5" fill="#E9C0E9" transform="rotate(18 29 30)"/></g><path d="M9 7.5 23.5 14l-6.8 2.4-2.5 6.8z" fill="#fff" stroke="#fff" stroke-width="2.6" stroke-linejoin="round"/></svg>';
 
-export default {
+const worker = {
   async fetch(request, env, ctx) {
     const url = new URL(request.url);
     const path = url.pathname;
@@ -60,6 +60,16 @@ export default {
   async scheduled(controller, env, ctx) {
     ctx.waitUntil(pruneClicks(env));
   },
+};
+
+export default {
+  async fetch(request, env, ctx) {
+    const response = await worker.fetch(request, env, ctx);
+    // Staging sets NOINDEX so a test copy of the site never reaches search results.
+    if (env.NOINDEX) response.headers.set('X-Robots-Tag', 'noindex, nofollow');
+    return response;
+  },
+  scheduled: worker.scheduled,
 };
 
 // ---------- request guards ----------

@@ -190,6 +190,26 @@ test('the header logo and the favicon are the same drawing', async () => {
   }
 });
 
+test('a staging copy (NOINDEX set) tells search engines to stay away', async () => {
+  assert.equal((await request('/')).headers.get('X-Robots-Tag'), null);
+  const staging = new Miniflare({
+    modules: true,
+    scriptPath: `${ROOT}src/index.js`,
+    compatibilityDate: '2025-01-01',
+    d1Databases: { DB: 'linki-staging-test' },
+    bindings: { HASH_SECRET: 'test-secret', NOINDEX: '1' },
+  });
+  try {
+    for (const path of ['/robots.txt', '/favicon.svg', '/nothing-here-at-all']) {
+      const res = await staging.dispatchFetch(`${ORIGIN}${path}`);
+      assert.equal(res.headers.get('X-Robots-Tag'), 'noindex, nofollow', path);
+      await res.arrayBuffer();
+    }
+  } finally {
+    await staging.dispose();
+  }
+});
+
 // ---------- creating links ----------
 
 test('creating a link gives the browser its owner cookie and shows the result', async () => {

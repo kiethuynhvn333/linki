@@ -9,7 +9,8 @@
     "db:local": "wrangler d1 migrations apply linki --local",
     "db:remote": "wrangler d1 migrations apply linki --remote",
     "deploy": "wrangler deploy",
-    "release": "npm test && npm run db:remote && npm run deploy"
+    "release": "npm test && npm run db:remote && npm run deploy",
+    "release:staging": "npm test && wrangler d1 migrations apply linki-staging --env staging --remote && wrangler deploy --env staging"
   },
   "devDependencies": {
     "miniflare": "^4.20260730.0",

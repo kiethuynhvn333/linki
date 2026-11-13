@@ -63,6 +63,15 @@ Self-hosters get their own `<name>.<subdomain>.workers.dev` URL from that deploy
 routes = [{ pattern = "example.com", custom_domain = true }]
 ```
 
+## Staging
+`wrangler.toml` has a `staging` environment: a separate Worker (`linki-staging`) with its own database, no custom domain, and `NOINDEX` set so it stays out of search engines. Use it to try a change on a real URL before releasing.
+
+```
+npm run release:staging   # tests, staging migrations, deploy to linki-staging.<subdomain>.workers.dev
+```
+
+Set its secret once: `openssl rand -hex 32 | npx wrangler secret put HASH_SECRET --env staging`.
+
 ## Files
 - `src/index.js`: the whole app (routes, HTML, CSS, favicon, read-only MCP).
 - `migrations/`: the D1 tables, applied in order by `wrangler d1 migrations apply`.

@@ -20,3 +20,20 @@ binding = "DB"
 database_name = "linki"
 database_id = "c4f2bde0-7b17-44f2-88c1-ecf69d5557b3"
 migrations_dir = "migrations"
+
+# Staging: a separate Worker and database for testing a change before release.
+# `npm run release:staging` deploys it to linki-staging.<subdomain>.workers.dev.
+# It has no custom domain, and NOINDEX keeps it out of search engines.
+[env.staging]
+name = "linki-staging"
+workers_dev = true
+routes = []
+
+[env.staging.vars]
+NOINDEX = "1"
+
+[[env.staging.d1_databases]]
+binding = "DB"
+database_name = "linki-staging"
+database_id = "f284bd1a-8290-4f7b-bbb0-501b382d43d6"
+migrations_dir = "migrations"
