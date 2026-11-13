@@ -19,8 +19,9 @@ const HOME_DESCRIPTION =
   'Paste a long URL, get a short link, and see how many people click it. Free, with no sign-up.';
 const BLOCKED_SCHEME_RE = /^(javascript|data|vbscript|file|mailto|tel|blob|about):/i;
 
-// Same cursor shape and colours as the .brand logo.
-const FAVICON_SVG = '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><defs><linearGradient id="g" x1="0" y1="0" x2="1" y2="1"><stop offset="0" stop-color="#2665D6"/><stop offset=".55" stop-color="#E9C0E9"/><stop offset="1" stop-color="#D2A72A"/></linearGradient></defs><polygon fill="url(#g)" points="4,0 4,20.16 8.8,15.36 12.2,24 15.8,22.08 12.6,13.92 20,13.92"/></svg>';
+// The Linki mark: a white cursor on a cobalt tile, with the pink and mustard
+// shapes of the hero card. The header logo and the favicon are this one SVG.
+const LOGO_SVG = '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 32 32"><defs><clipPath id="lt"><rect width="32" height="32" rx="9"/></clipPath></defs><g clip-path="url(#lt)"><rect width="32" height="32" fill="#2665D6"/><circle cx="9" cy="32.5" r="6.5" fill="#D2A72A"/><rect x="20" y="21" width="18" height="18" rx="5" fill="#E9C0E9" transform="rotate(18 29 30)"/></g><path d="M9 7.5 23.5 14l-6.8 2.4-2.5 6.8z" fill="#fff" stroke="#fff" stroke-width="2.6" stroke-linejoin="round"/></svg>';
 
 const worker = {
   async fetch(request, env, ctx) {
@@ -39,7 +40,7 @@ const worker = {
       if (path === '/links' && method === 'GET') return linksPage(request, env, url);
       if (path === '/mcp/reset') return resetMcp(request, env, url);
       if (path.startsWith('/mcp/')) return mcpEndpoint(request, env, url);
-      if (path === '/favicon.svg' || path === '/favicon.ico') return new Response(FAVICON_SVG, { headers: { 'Content-Type': 'image/svg+xml', 'Cache-Control': 'public, max-age=86400' } });
+      if (path === '/favicon.svg' || path === '/favicon.ico') return new Response(LOGO_SVG, { headers: { 'Content-Type': 'image/svg+xml', 'Cache-Control': 'public, max-age=86400' } });
       // Only the homepage is open to search engines. Short links and account pages are not.
       if (path === '/robots.txt') return new Response('User-agent: *\nAllow: /$\nDisallow: /\n');
       const detail = path.match(/^\/links\/([a-z0-9]{4,12})$/);
@@ -292,6 +293,29 @@ function randomCode() {
 
 // ---------- pages ----------
 
+// What Linki offers, in four short points under the hero: [tile colour, icon, title, text].
+const USPS = [
+  ['t1', '<path d="M8.5 11.5a3.5 3.5 0 0 0 5 0L16 9a3.5 3.5 0 0 0-5-5l-1 1M11.5 8.5a3.5 3.5 0 0 0-5 0L4 11a3.5 3.5 0 0 0 5 5l1-1"/>',
+    'Paste and go', 'Drop in a long URL, add a label if you like, and get a short link in one click.'],
+  ['t2', '<circle cx="8.5" cy="7" r="3"/><path d="M3 17a5.5 5.5 0 0 1 11 0M14.5 4.5l3.5 3.5M18 4.5 14.5 8"/>',
+    'No sign-up', 'No account and no email. Your links are saved in this browser.'],
+  ['t3', '<path d="M4 16v-5M10 16V4M16 16V8"/>',
+    'See every click', 'Total and unique clicks with a 30-day chart. Bots and link previews are left out.'],
+  ['t4', '<path d="M10 2.5l1.8 4.7 4.7 1.8-4.7 1.8L10 15.5l-1.8-4.7L3.5 9l4.7-1.8z"/>',
+    'Agent-ready', 'Connect Claude, Cursor or any MCP client and ask how your links are doing.'],
+];
+
+// Example chips for the home marquee: [slug, click count]. Decorative, not real links.
+const MARQUEE_LINKS = [
+  ['launch', 342],
+  ['promo', 87],
+  ['newsletter', 1204],
+  ['demo', 56],
+  ['hello', 128],
+  ['podcast', 419],
+  ['waitlist', 733],
+];
+
 async function homePage(request, env, url, state = {}) {
   const owner = getOwner(request);
   const offset = tzOffset(request);
@@ -318,13 +342,28 @@ async function homePage(request, env, url, state = {}) {
         <p class="ex">linki/hello</p>
         <div class="foot">
           <div class="bars"><span style="height:34%"></span><span style="height:55%"></span><span style="height:42%"></span><span style="height:70%"></span><span style="height:48%"></span><span style="height:84%"></span><span style="height:100%"></span></div>
-          <p class="n">128 <small>clicks</small></p>
+          <p class="n"><span class="cnt">128</span> <small>clicks</small></p>
         </div>
       </div>`;
+  // Decorative only: example chips that scroll under the hero. The list is
+  // printed twice so the CSS loop (translateX 0 to -50%) has no seam.
+  const chips = MARQUEE_LINKS.map(
+    ([slug, clicks]) => `<span class="mchip">linki/${slug}<small>${clicks}</small></span>`
+  ).join('');
+  const marquee = `
+    <div class="mq" aria-hidden="true"><div class="mqt"><div class="mqg">${chips}</div><div class="mqg">${chips}</div></div></div>`;
+  const usps = `
+    <section class="usp" aria-labelledby="usp-h">
+      <h2 id="usp-h" class="sr">Why Linki</h2>
+      <ul>${USPS.map(
+        ([tile, icon, title, text]) =>
+          `<li><span class="ic ${tile}" aria-hidden="true"><svg viewBox="0 0 20 20">${icon}</svg></span><h3>${title}</h3><p>${text}</p></li>`
+      ).join('')}</ul>
+    </section>`;
   const body = `
     <div class="hero${created ? ' has' : ''}">
       <section>
-        <h1>a very good alternative of <span class="hl">bitly</span></h1>
+        <h1>a very good alternative to <span class="hl">bitly</span></h1>
         <p class="lede">Paste a URL, get a short link, see who clicks. No sign-up.</p>
         <form method="post" action="/create" class="create">
           <label class="sr" for="url">Destination URL</label>
@@ -339,6 +378,7 @@ async function homePage(request, env, url, state = {}) {
       </section>
       ${created || preview}
     </div>
+    ${created ? '' : marquee}
     ${
       links.length
         ? `<section>
@@ -346,7 +386,8 @@ async function homePage(request, env, url, state = {}) {
             ${linkList(links, url.origin, offset)}
           </section>`
         : ''
-    }`;
+    }
+    ${usps}`;
   const status = state.status || 200;
   return page(HOME_TITLE, body, {
     owner,
@@ -574,9 +615,8 @@ ${gaHead(linkCreated, nonce)}<link rel="preconnect" href="https://fonts.googleap
 <style>${CSS}</style>
 </head>
 <body>
-<header><a class="brand" href="/">Linki</a><nav><a class="pill" href="/links"${url && url.pathname.startsWith('/links') ? ' aria-current="page"' : ''}>Your links</a></nav></header>
+<header><a class="brand" href="/">${LOGO_SVG.replace('<svg ', '<svg aria-hidden="true" ')}Linki</a><nav><a class="pill" href="/links"${url && url.pathname.startsWith('/links') ? ' aria-current="page"' : ''}>Your links</a></nav></header>
 <main class="panel">${body}</main>
-<footer><p>Links are tied to this browser. No sign-up. Short-link visitors are never tracked with cookies; Linki's own pages use Google Analytics.</p></footer>
 <script nonce="${nonce}">${JS}</script>
 </body>
 </html>`;
@@ -1072,6 +1112,61 @@ function formatDay(dayNumber) {
 }
 
 const JS = `
+// Home hero motion. All of it is decorative and is skipped under prefers-reduced-motion.
+(function () {
+  if (window.matchMedia('(prefers-reduced-motion: reduce)').matches) return;
+
+  // Counter: count up to the number in the markup, then tick +1 every few seconds.
+  var num = document.querySelector('.pv .cnt');
+  if (num) {
+    var target = parseInt(num.textContent, 10) || 0;
+    var value = target;
+    var lastBar = document.querySelector('.pv .bars span:last-child');
+    var began = null;
+    var show = function (n) { num.textContent = n.toLocaleString('en-US'); };
+    var pulse = function (el, frames) {
+      if (el && el.animate) el.animate(frames, { duration: 520, easing: 'ease-out' });
+    };
+    var tick = function () {
+      if (!document.hidden) {
+        value += 1;
+        show(value);
+        pulse(lastBar, [{ transform: 'scaleY(1)' }, { transform: 'scaleY(1.14)' }, { transform: 'scaleY(1)' }]);
+        pulse(num, [{ transform: 'translateY(0)' }, { transform: 'translateY(-3px)' }, { transform: 'translateY(0)' }]);
+      }
+      setTimeout(tick, 2600 + Math.random() * 2600);
+    };
+    var step = function (now) {
+      if (began === null) began = now;
+      var p = Math.min((now - began) / 1200, 1);
+      show(Math.round(target * (1 - Math.pow(1 - p, 3))));
+      if (p < 1) requestAnimationFrame(step);
+      else setTimeout(tick, 2600);
+    };
+    show(0);
+    requestAnimationFrame(step);
+  }
+
+  // Parallax: shapes shift a few px against the cursor. Mouse only, one write per frame.
+  var layers = document.querySelectorAll('.rc');
+  if (!layers.length || !window.matchMedia('(hover: hover) and (pointer: fine)').matches) return;
+  var mx = 0, my = 0, queued = false;
+  window.addEventListener('pointermove', function (e) {
+    if (e.pointerType && e.pointerType !== 'mouse') return;
+    mx = e.clientX / window.innerWidth - 0.5;
+    my = e.clientY / window.innerHeight - 0.5;
+    if (queued) return;
+    queued = true;
+    requestAnimationFrame(function () {
+      queued = false;
+      for (var i = 0; i < layers.length; i++) {
+        layers[i].style.setProperty('--mx', mx.toFixed(3));
+        layers[i].style.setProperty('--my', my.toFixed(3));
+      }
+    });
+  }, { passive: true });
+})();
+
 document.addEventListener('click', async function (e) {
   var btn = e.target.closest('[data-copy]');
   if (!btn) return;
@@ -1126,11 +1221,10 @@ h2{margin:0;font:700 24px/1.2 var(--display);letter-spacing:-.02em}
 /* header, panel, footer */
 header{display:flex;justify-content:space-between;align-items:center;gap:16px;width:100%;max-width:1080px;height:64px;margin:0 auto;padding:0 20px}
 .brand{display:inline-flex;align-items:center;gap:8px;min-height:44px;font:700 22px/1.2 var(--display);letter-spacing:-.01em;text-decoration:none}
-.brand::before{content:"";width:20px;height:24px;clip-path:polygon(4% 0,4% 84%,28% 64%,45% 100%,63% 92%,47% 58%,84% 58%);background:conic-gradient(var(--accent),var(--pink),var(--mustard),var(--accent))}
+.brand svg{flex:none;width:28px;height:28px}
 .pill{display:inline-flex;align-items:center;height:38px;padding:0 16px;border:1px solid var(--line);border-radius:999px;background:var(--surface);font-weight:600;font-size:14px;text-decoration:none}
 .pill[aria-current]{background:var(--pressed)}
-.panel{flex:1 0 auto;width:calc(100% - 40px);max-width:1040px;margin:0 auto;padding:34px 36px;background:var(--surface);border-radius:26px}
-footer{padding:18px 16px 24px;text-align:center;font-size:13px;color:var(--muted)}
+.panel{flex:1 0 auto;width:calc(100% - 40px);max-width:1040px;margin:0 auto 28px;padding:34px 36px;background:var(--surface);border-radius:26px}
 
 /* hero + form */
 .hero{display:grid;grid-template-columns:minmax(0,1.15fr) minmax(0,1fr);gap:28px}
@@ -1171,6 +1265,22 @@ button.copied{background:var(--accent);color:var(--on-accent);border-color:var(-
 .pv .bars span:last-child{background:var(--mustard)}
 .pv .n{font:800 28px/1 var(--display);letter-spacing:-.03em}
 .pv .n small{margin-left:2px;font:600 13px/1 var(--ui);letter-spacing:0}
+.pv .cnt{display:inline-block;font-variant-numeric:tabular-nums}
+
+/* hero motion: parallax offsets and marquee. --mx/--my are set by the page script. */
+.rc::after{translate:calc(var(--mx,0)*-16px) calc(var(--my,0)*-16px)}
+.rc::before{translate:calc(var(--mx,0)*-9px) calc(var(--my,0)*-9px)}
+.mq{overflow:hidden;margin-top:30px;padding:2px 0;-webkit-mask-image:linear-gradient(90deg,transparent,#000 9%,#000 91%,transparent);mask-image:linear-gradient(90deg,transparent,#000 9%,#000 91%,transparent)}
+.mqt{display:flex;width:max-content}
+.mqg{display:flex;gap:10px;padding-right:10px}
+.mchip{display:inline-flex;align-items:center;gap:8px;padding:7px 8px 7px 14px;border-radius:999px;background:var(--paper);font:700 13px/1.4 var(--mono);white-space:nowrap}
+.usp{margin-top:44px;padding-top:30px;border-top:1px solid var(--line-soft)}
+.usp ul{list-style:none;margin:0;padding:0;display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:24px}
+.usp .ic{display:grid;place-items:center;width:40px;height:40px;border-radius:12px}
+.usp .ic svg{width:20px;height:20px;fill:none;stroke:currentColor;stroke-width:2;stroke-linecap:round;stroke-linejoin:round}
+.usp h3{margin:14px 0 4px;font:700 18px/1.2 var(--display);letter-spacing:-.01em}
+.usp p{font-size:14px;line-height:1.45;color:var(--muted)}
+.mchip small{padding:2px 8px;border-radius:999px;background:var(--surface);font:600 11px/1.5 var(--ui);color:var(--muted);font-variant-numeric:tabular-nums}
 
 /* section heads + list */
 .sectionhead{display:flex;justify-content:space-between;align-items:center;gap:16px;margin:38px 0 8px}
@@ -1239,13 +1349,34 @@ button.copied{background:var(--accent);color:var(--on-accent);border-color:var(-
   button:hover,.button:hover{transform:translateY(-1px)}
   button:active,.button:active{transform:translateY(0) scale(.98)}
   .links li{transition:background-color 120ms ease-out}
+  .brand svg{transition:transform 180ms ease-out}
+  .brand:hover svg{transform:rotate(-8deg) scale(1.08)}
   .rc{animation:pop 180ms ease-out}
   .bar span,.pv .bars span{transform-origin:bottom;animation:grow 400ms ease-out}
   @keyframes pop{from{opacity:0;transform:scale(.96)}to{opacity:1;transform:none}}
   @keyframes grow{from{transform:scaleY(0)}to{transform:none}}
+
+  /* hero motion: slow floats (7-10s, offset), staggered bars, marquee loop */
+  .pv .bars span{animation:grow 560ms cubic-bezier(.2,.8,.2,1) backwards}
+  .pv .bars span:nth-child(1){animation-delay:120ms}
+  .pv .bars span:nth-child(2){animation-delay:190ms}
+  .pv .bars span:nth-child(3){animation-delay:260ms}
+  .pv .bars span:nth-child(4){animation-delay:330ms}
+  .pv .bars span:nth-child(5){animation-delay:400ms}
+  .pv .bars span:nth-child(6){animation-delay:470ms}
+  .pv .bars span:nth-child(7){animation-delay:540ms}
+  .rc::after{animation:float-sq 9s ease-in-out infinite}
+  .rc::before{animation:float-dot 7s ease-in-out -2s infinite}
+  .rc::after,.rc::before{transition:translate 600ms cubic-bezier(.2,.7,.2,1)}
+  .mqt{animation:marquee 38s linear infinite}
+  .mq:hover .mqt{animation-play-state:paused}
+  @keyframes float-sq{0%,100%{transform:rotate(18deg)}50%{transform:translate(-7px,-11px) rotate(24deg)}}
+  @keyframes float-dot{0%,100%{transform:none}50%{transform:translate(9px,-9px)}}
+  @keyframes marquee{from{transform:translateX(0)}to{transform:translateX(-50%)}}
 }
 
 @media (max-width:860px){
+  .usp ul{grid-template-columns:repeat(2,minmax(0,1fr))}
   .pv::after{width:86px;height:86px;border-radius:22px;right:-26px;top:-26px;bottom:auto}
   .pv::before{display:none}
   .pv .ex{font-size:15px;padding:8px 12px}
@@ -1289,6 +1420,15 @@ button.copied{background:var(--accent);color:var(--on-accent);border-color:var(-
   .chh h2{font-size:18px}
   .chart{height:140px;gap:3px}
   .status{font-size:72px}
+  .mq{margin-top:22px}
+  .usp{margin-top:32px;padding-top:24px}
+  .usp ul{grid-template-columns:minmax(0,1fr);gap:18px}
+  .usp li{display:grid;grid-template-columns:40px minmax(0,1fr);column-gap:14px}
+  .usp .ic{grid-row:span 2}
+  .usp h3{margin:0 0 2px}
+  @media (prefers-reduced-motion:no-preference){
+    @keyframes float-sq{0%,100%{transform:rotate(18deg)}50%{transform:translate(-3px,-5px) rotate(21deg)}}
+  }
 }
 .agent{margin-top:32px;padding:20px 22px 18px;border-radius:22px;background:var(--paper)}
 .agenthead{display:flex;justify-content:space-between;align-items:center;gap:12px}

@@ -1,3 +1,10 @@
+# Home page refresh (14 Nov 2026)
+
+- **Headline:** "a very good alternative to bitly".
+- **Logo:** a white cursor on a cobalt tile with the pink and mustard shapes of the hero card. The header and the favicon use the same SVG (`LOGO_SVG`), so they cannot drift apart.
+- **Hero motion:** the click count ticks up, the bars grow in, the shapes inside the blue card float and follow the mouse, and example chips scroll under the hero. Nothing moves under `prefers-reduced-motion`.
+- **Selling points:** four short points under the hero (`USPS`): Paste and go, No sign-up, See every click, Agent-ready. They replace the footer statement, which is removed from every page. Google Analytics is still documented in the README.
+
 # Back-end hardening (13 Nov 2026)
 
 Fixes from a code audit. Each one has a test in `test/app.test.js`.
