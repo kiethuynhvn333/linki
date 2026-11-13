@@ -1,3 +1,20 @@
+# Custom domain and favicon (12 Nov 2026)
+
+## Custom domain
+`wrangler.toml` serves the Worker at `linki.ing`:
+
+```
+workers_dev = true
+routes = [
+  { pattern = "linki.ing", custom_domain = true }
+]
+```
+
+`workers_dev` stays on, so the workers.dev hostname remains a fallback. The public URL is https://linki.ing.
+
+## Favicon
+`src/index.js` serves an SVG of the header cursor (blue `#2665D6`, pink `#E9C0E9`, mustard `#D2A72A`) at `/favicon.svg` and `/favicon.ico`. Every HTML page links `/favicon.svg`.
+
 # v3: style 5 "Playful blocks" (12 Nov 2026)
 
 Implements ../SPEC-style5-playful-blocks.md. Built from v2. Only the presentation layer of src/index.js changed: CSS, and the HTML strings in homePage, linksPage, detailPage, linkList, messagePage and page. JS is unchanged from v2. Routes, field names, redirect, bot filtering, validation, cookie, SQL and schema are untouched. Evidence is in ../evidence-v3/function-check.txt (every logic function and constant is identical to original/) and in index-vs-original.diff.
