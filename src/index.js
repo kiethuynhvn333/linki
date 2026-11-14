@@ -165,9 +165,21 @@ function sameOrigin(request, url) {
 // ---------- redirect ----------
 
 async function redirect(request, env, ctx, code) {
-  const link = await env.DB.prepare('SELECT destination, status FROM links WHERE code = ?')
+  let link = await env.DB.prepare('SELECT code, destination, status FROM links WHERE code = ?')
     .bind(code)
     .first();
+  if (!link) {
+    // A renamed name forwards to the link's current code. A deleted name does not.
+    // This read is the only extra work: a plain visit writes nothing but the click below.
+    const retired = await env.DB.prepare('SELECT link_code FROM retired_names WHERE code = ?')
+      .bind(code)
+      .first();
+    if (retired && retired.link_code) {
+      link = await env.DB.prepare('SELECT code, destination, status FROM links WHERE code = ?')
+        .bind(retired.link_code)
+        .first();
+    }
+  }
   if (!link) {
     return await messagePage(request, env, 404, 'Link not found', 'This short link does not exist.');
   }
@@ -175,7 +187,7 @@ async function redirect(request, env, ctx, code) {
     return await messagePage(request, env, 410, 'Link unavailable', 'This short link has been turned off.');
   }
   if (shouldCount(request)) {
-    ctx.waitUntil(recordClick(request, env, code));
+    ctx.waitUntil(recordClick(request, env, link.code));
   }
   // 302 + no-store so browsers never cache the redirect and every click is counted.
   return new Response(null, {
@@ -285,18 +297,22 @@ async function makeLink(env, { ownerId, rawUrl, rawName, ownHost, creatorHash, l
   }
 
   // A link address can only lead to one place, so a name is first come, first
-  // served. When the name is taken (or reserved), nobody is turned away: the
-  // link gets the name plus a short random ending.
+  // served. A renamed or deleted name stays taken. When the name is taken (or
+  // reserved), nobody is turned away: the link gets the name plus a short
+  // random ending. Random codes skip retired names the same way.
   const name = named.name;
   for (let attempt = 0; attempt < 6; attempt++) {
     const candidate = !name ? randomCode() : attempt === 0 ? name : withEnding(name, attempt < 3 ? 2 : 4);
     if (RESERVED.has(candidate)) continue;
     try {
-      await env.DB.prepare(
-        'INSERT INTO links (code, owner_id, destination, created_at, creator_hash) VALUES (?, ?, ?, ?, ?)'
+      const inserted = await env.DB.prepare(
+        `INSERT INTO links (code, owner_id, destination, created_at, creator_hash)
+         SELECT ?, ?, ?, ?, ?
+         WHERE NOT EXISTS (SELECT 1 FROM retired_names WHERE code = ?)`
       )
-        .bind(candidate, ownerId, checked.destination, now, creatorHash)
+        .bind(candidate, ownerId, checked.destination, now, creatorHash, candidate)
         .run();
+      if (!inserted.meta.changes) continue;
       return { code: candidate, destination: checked.destination, taken: name && candidate !== name ? name : '' };
     } catch (err) {
       if (!/UNIQUE|constraint/i.test(String(err && err.message))) throw err;
@@ -334,7 +350,7 @@ function withEnding(name, length) {
 }
 
 // Changes a link's name. Nothing is added to a taken name here: the owner is
-// told and picks another one. The old address stops working.
+// told and picks another one. The old address keeps working and forwards here.
 async function renameLink(request, env, code) {
   const owner = getOwner(request);
   const json = (request.headers.get('Accept') || '').includes('application/json');
@@ -360,14 +376,50 @@ async function renameLink(request, env, code) {
   if (name !== code) {
     if (link.click_count > RENAME_MAX_CLICKS) return fail(409, RENAME_LOCKED);
     if (RESERVED.has(name)) return fail(409, `“${name}” is not available. Try another name.`);
+    const retired = await env.DB.prepare('SELECT link_code, owner_id FROM retired_names WHERE code = ?')
+      .bind(name)
+      .first();
+    // The owner may take back a name this same link used before. Anyone else, and
+    // any name whose link was deleted, gets the same answer as a name in use.
+    const reclaim = retired && retired.owner_id === owner.id && retired.link_code === code;
+    if (retired && !reclaim) return fail(409, `“${name}” is already taken. Try another name.`);
+    const now = Math.floor(Date.now() / 1000);
+    const statements = [];
+    if (reclaim) {
+      statements.push(
+        env.DB.prepare(
+          `DELETE FROM retired_names
+           WHERE code = ? AND owner_id = ? AND link_code = ?
+             AND EXISTS (SELECT 1 FROM links WHERE code = ? AND owner_id = ?)`
+        ).bind(name, owner.id, code, code, owner.id)
+      );
+    }
     try {
-      // One transaction: if the name is taken, the links update fails and the clicks stay put.
-      await env.DB.batch([
+      // One transaction: if the name is taken, the links update fails and nothing is retired.
+      // The last insert copies the row onto itself when the rename did not land, which
+      // rolls the batch back (a retired name is not a primary-key clash by itself).
+      statements.push(
+        env.DB.prepare(
+          `UPDATE retired_names SET link_code = ?
+           WHERE link_code = ? AND EXISTS (SELECT 1 FROM links WHERE code = ? AND owner_id = ?)`
+        ).bind(name, code, code, owner.id),
+        env.DB.prepare(
+          `INSERT INTO retired_names (code, link_code, owner_id, retired_at)
+           SELECT code, ?, owner_id, ? FROM links WHERE code = ? AND owner_id = ?`
+        ).bind(name, now, code, owner.id),
         env.DB.prepare(
           'UPDATE clicks SET code = ? WHERE code = ? AND EXISTS (SELECT 1 FROM links WHERE code = ? AND owner_id = ?)'
         ).bind(name, code, code, owner.id),
-        env.DB.prepare('UPDATE links SET code = ? WHERE code = ? AND owner_id = ?').bind(name, code, owner.id),
-      ]);
+        env.DB.prepare(
+          `UPDATE links SET code = ?
+           WHERE code = ? AND owner_id = ? AND NOT EXISTS (SELECT 1 FROM retired_names WHERE code = ?)`
+        ).bind(name, code, owner.id, name),
+        env.DB.prepare(
+          `INSERT INTO links (code, owner_id, destination, created_at)
+           SELECT code, owner_id, destination, created_at FROM links WHERE code = ? AND owner_id = ?`
+        ).bind(code, owner.id)
+      );
+      await env.DB.batch(statements);
     } catch (err) {
       if (!/UNIQUE|constraint/i.test(String(err && err.message))) throw err;
       return fail(409, `“${name}” is already taken. Try another name.`);
@@ -383,15 +435,25 @@ const RENAME_LOCKED = `This link has more than ${RENAME_MAX_CLICKS.toLocaleStrin
 async function deleteLink(request, env, code) {
   const owner = getOwner(request);
   const json = (request.headers.get('Accept') || '').includes('application/json');
+  const now = Math.floor(Date.now() / 1000);
   const results = owner.isNew
     ? null
     : await env.DB.batch([
+        env.DB.prepare(
+          `INSERT INTO retired_names (code, link_code, owner_id, retired_at)
+           SELECT code, NULL, owner_id, ? FROM links WHERE code = ? AND owner_id = ?`
+        ).bind(now, code, owner.id),
+        env.DB.prepare(
+          `UPDATE retired_names SET link_code = NULL
+           WHERE link_code = ? AND EXISTS (SELECT 1 FROM links WHERE code = ? AND owner_id = ?)`
+        ).bind(code, code, owner.id),
         env.DB.prepare(
           'DELETE FROM clicks WHERE code = ? AND EXISTS (SELECT 1 FROM links WHERE code = ? AND owner_id = ?)'
         ).bind(code, code, owner.id),
         env.DB.prepare('DELETE FROM links WHERE code = ? AND owner_id = ?').bind(code, owner.id),
       ]);
-  if (!results || !results[1].meta.changes) {
+  // The link delete is the last statement. Nothing is retired when it changes no row.
+  if (!results || !results[3].meta.changes) {
     if (json) return jsonResponse({ error: 'This link is not in your list.' }, 404);
     return await messagePage(request, env, 404, 'Link not found', 'This link is not in your list.');
   }
@@ -615,7 +677,7 @@ function mcpLine(mcp, url) {
 // Clicking anywhere in the box, or the pen, starts editing (see the page script).
 function renameForm(link, url, back) {
   const confirm = link.click_count
-    ? ' data-confirm="Change the name? The old address will stop working for anyone who already has it."'
+    ? ' data-confirm="Change the name? The old address keeps working and forwards to the new one."'
     : '';
   const size = link.code.length > 14 ? ' long' : '';
   return `<form class="rn${size}" method="post" action="/links/${link.code}/rename" data-rename${confirm}>
@@ -726,7 +788,7 @@ async function detailPage(request, env, url, code) {
     </section>
     <p class="note">${offset ? `Days follow your time zone (${utcLabel(offset)}).` : 'Days are in UTC.'} Unique clicks count each visitor once per day; link previews and known bots are not counted.</p>
     <div class="rnz">
-      <p>${link.click_count > RENAME_MAX_CLICKS ? esc(RENAME_LOCKED) : 'Change the name. The old address stops working.'}</p>
+      <p>${link.click_count > RENAME_MAX_CLICKS ? esc(RENAME_LOCKED) : 'Change the name. The old address keeps working and forwards to the new one.'}</p>
       ${link.click_count > RENAME_MAX_CLICKS ? '' : `<div class="rnw">${renameForm(link, url, 'detail')}</div>`}
     </div>
     <form class="dz" method="post" action="/links/${link.code}/delete" data-confirm="Delete this link? The short link will stop working and its click history will be removed. This cannot be undone.">
