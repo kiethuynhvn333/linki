@@ -280,7 +280,7 @@ test('creating a link gives the browser its owner cookie and shows the result', 
 
 test('a custom name becomes the short link, for free, and capitals do not matter', async () => {
   const home = await (await request('/')).text();
-  assert.match(home, /<span class="pre" aria-hidden="true">linki\.test\/<\/span>/);
+  assert.match(home, /<span class="pre" aria-hidden="true"><bdi>linki\.test\/<\/bdi><\/span>/);
   assert.match(home, /<input id="name" name="name"/);
 
   const { code } = await createLink({ url: 'https://example.com/tet', name: 'Khuyến mãi Tết!' });
@@ -354,6 +354,8 @@ test('a link can be renamed from its result box, and the clicks move with it', a
   const card = await (await request(`/?new=${code}`, { cookie })).text();
   assert.match(card, new RegExp(`<form class="rn" method="post" action="/links/${code}/rename" data-rename data-confirm="Change the name\\?`));
   assert.match(card, /name="name"[^>]*value="rename-me"/);
+  assert.match(card, /<button type="button" class="pen"[^>]*aria-label="Change the name">/);
+  assert.match(card, /<button type="submit" class="sv">Save<\/button>/);
   assert.doesNotMatch(card, /class="tk"|Want a different name/); // no extra line under the box
 
   const json = { Accept: 'application/json' };

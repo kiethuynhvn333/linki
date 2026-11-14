@@ -509,7 +509,7 @@ async function homePage(request, env, url, state = {}) {
             placeholder="Paste a long URL" maxlength="${MAX_URL_LENGTH}" value="${esc(state.rawUrl || '')}">
           <label class="sr" for="name">Custom name for your short link (optional)</label>
           <div class="namef">
-            <span class="pre" aria-hidden="true">${esc(url.host)}/</span>
+            <span class="pre" aria-hidden="true"><bdi>${esc(url.host)}/</bdi></span>
             <input id="name" name="name" type="text" autocomplete="off" autocapitalize="none" spellcheck="false"
               placeholder="your-name (optional)" maxlength="60" value="${esc(state.name || '')}">
           </div>
@@ -574,22 +574,22 @@ function mcpLine(mcp, url) {
             </aside>`;
 }
 
-// The short link with a name that can be edited in place. Save shows up once the
-// name is changed (see the page script). A link that already has clicks asks first.
+// The short link with a name that can be edited in place. The name gets the
+// room: a long host is cut from its start ("…workers.dev/") before the name is.
+// Clicking anywhere in the box, or the pen, starts editing (see the page script).
 function renameForm(link, url, back) {
   const confirm = link.click_count
     ? ' data-confirm="Change the name? The old address will stop working for anyone who already has it."'
     : '';
-  // A long address gets smaller type, so the name is not cut off.
-  const size = url.host.length + link.code.length > 26 ? ' long' : '';
+  const size = link.code.length > 14 ? ' long' : '';
   return `<form class="rn${size}" method="post" action="/links/${link.code}/rename" data-rename${confirm}>
           <input type="hidden" name="back" value="${back}">
-          <span class="pre" aria-hidden="true">${esc(url.host)}/</span>
+          <span class="pre" aria-hidden="true"><bdi>${esc(url.host)}/</bdi></span>
           <input name="name" type="text" required autocomplete="off" autocapitalize="none" spellcheck="false" maxlength="60"
-            value="${link.code}" data-was="${link.code}" title="Click to change the name" aria-label="Name of your short link, after ${esc(url.host)}/"
-            style="min-width:min(70%,${link.code.length + 1}ch)">
-          <svg class="pen" viewBox="0 0 20 20" aria-hidden="true">${EDIT_ICON}</svg>
-          <button type="submit">Save</button>
+            value="${link.code}" data-was="${link.code}" aria-label="Name of your short link, after ${esc(url.host)}/"
+            style="flex-basis:${link.code.length + 1}ch">
+          <button type="button" class="pen" tabindex="-1" aria-label="Change the name"><svg viewBox="0 0 20 20" aria-hidden="true">${EDIT_ICON}</svg></button>
+          <button type="submit" class="sv">Save</button>
         </form>
         <p class="rnmsg" role="alert" hidden></p>`;
 }
@@ -1436,11 +1436,28 @@ document.addEventListener('click', async function (e) {
     btn.classList.remove('copied');
   }, 1500);
 });
-// Rename: Save shows up once the name is different from the saved one.
+// Rename. Clicking the box or the pen starts editing with the name selected.
+// While editing, the name is highlighted and Save replaces the pen. Escape undoes.
 document.querySelectorAll('form[data-rename]').forEach(function (form) {
   var input = form.querySelector('input[name=name]');
-  input.addEventListener('input', function () {
-    form.classList.toggle('dirty', input.value.trim() !== input.getAttribute('data-was'));
+  var was = input.getAttribute('data-was');
+  var note = form.parentNode.querySelector('.rnmsg');
+  var sync = function () {
+    form.classList.toggle('dirty', input.value.trim() !== was);
+    input.style.flexBasis = (input.value.length + 1) + 'ch';
+    if (note) note.hidden = true;
+  };
+  input.addEventListener('input', sync);
+  form.addEventListener('click', function (e) {
+    if (e.target === input || e.target.closest('.sv')) return;
+    input.focus();
+    input.select();
+  });
+  input.addEventListener('keydown', function (e) {
+    if (e.key !== 'Escape') return;
+    input.value = was;
+    sync();
+    input.blur();
   });
 });
 document.querySelectorAll('input.short').forEach(function (el) {
@@ -1448,6 +1465,12 @@ document.querySelectorAll('input.short').forEach(function (el) {
 });
 document.addEventListener('submit', function (e) {
   var form = e.target;
+  // Saving a name that was not changed just leaves the box.
+  if (form.hasAttribute('data-rename') && !form.classList.contains('dirty')) {
+    e.preventDefault();
+    if (document.activeElement) document.activeElement.blur();
+    return;
+  }
   var msg = form.getAttribute('data-confirm');
   if (msg && !window.confirm(msg)) {
     e.preventDefault();
@@ -1456,7 +1479,7 @@ document.addEventListener('submit', function (e) {
   if (form.hasAttribute('data-rename')) {
     e.preventDefault();
     var note = form.parentNode.querySelector('.rnmsg');
-    var save = form.querySelector('button');
+    var save = form.querySelector('.sv');
     save.disabled = true;
     fetch(form.action, {
       method: 'POST',
@@ -1562,7 +1585,7 @@ input::placeholder{color:var(--muted);opacity:1}
 #url{height:58px;font-size:16px;border:2px solid var(--ink)}
 .namef{display:flex;align-items:center;width:100%;margin-top:10px;padding-left:18px;border-radius:16px;background:var(--paper)}
 .namef:focus-within{outline:3px solid var(--ink);outline-offset:2px}
-.namef .pre{flex:0 1 auto;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font:700 14px var(--mono);color:var(--muted)}
+.namef .pre{flex:0 1 auto;min-width:0;max-width:55%;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;direction:rtl;font:700 14px var(--mono);color:var(--muted)}
 .namef input{flex:1 1 7em;width:0;min-width:7em;padding:0 18px 0 1px;background:none;font:700 14px var(--mono)}
 .namef input::placeholder{font-weight:400}
 .namef input:focus-visible{outline:0}
@@ -1586,14 +1609,18 @@ button.copied{background:var(--accent);color:var(--on-accent);border-color:var(-
 .rn{display:flex;align-items:center;margin-top:14px;padding:6px 6px 6px 16px;border-radius:14px;background:#FFFFFF;color:#1E2330;font:700 22px/1.2 var(--mono);cursor:text}
 .rn.long{font-size:17px}
 .rn:focus-within{outline:3px solid var(--on-accent);outline-offset:2px}
-.rn .pre{flex:0 1 auto;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;color:#676B77}
-.rn input[type=text]{flex:1 1 0;width:0;height:40px;padding:0;border-radius:0;background:none;color:inherit;font:inherit;text-overflow:ellipsis}
+.rn .pre{flex:0 1000 auto;min-width:2.5ch;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;direction:rtl;color:#676B77}
+.rn input[type=text]{flex:1 1 auto;width:0;min-width:6ch;height:40px;padding:0 6px 0 3px;border-radius:8px;background:none;color:inherit;font:inherit;text-overflow:ellipsis}
+.rn:hover input[type=text]{box-shadow:inset 0 -2px 0 #C5D2EE}
+.rn:focus-within input[type=text]{background:#E8EFFF;box-shadow:inset 0 -2px 0 #2665D6}
 .rn input:focus-visible{outline:0}
-.rn .pen{flex:none;width:18px;height:18px;margin:0 10px;fill:none;stroke:#676B77;stroke-width:2;stroke-linecap:round;stroke-linejoin:round;pointer-events:none}
-.rn button{display:none;flex:none;height:38px;padding:0 18px;border:0;background:#1E2330;color:#FFFFFF;font-size:13px}
-.rn.dirty button{display:inline-flex}
-.rn.dirty .pen{display:none}
-.rn button:disabled{opacity:.6;cursor:default}
+.rn .pen{flex:none;width:34px;height:34px;margin-left:6px;padding:0;border:0;background:none;color:#676B77}
+.rn .pen svg{width:18px;height:18px;fill:none;stroke:currentColor;stroke-width:2;stroke-linecap:round;stroke-linejoin:round}
+.rn:hover .pen{background:#F3F3F1;color:#1E2330}
+.rn .sv{display:none;flex:none;height:30px;margin-left:8px;padding:0 13px;border:0;background:#1E2330;color:#FFFFFF;font-size:12px}
+.rn:focus-within .sv,.rn.dirty .sv{display:inline-flex}
+.rn:focus-within .pen,.rn.dirty .pen{display:none}
+.rn .sv:disabled{opacity:.6;cursor:default}
 .rnmsg{margin-top:8px;font-size:13px;font-weight:600;color:var(--danger)}
 .rc .rnmsg{align-self:flex-start;padding:8px 12px;border-radius:10px;background:var(--pink);color:var(--on-pink)}
 .go{max-width:70%;margin-top:12px;font-size:13px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
@@ -1811,8 +1838,11 @@ button.copied{background:var(--accent);color:var(--on-accent);border-color:var(-
 .rnw{flex:0 1 420px;min-width:0}
 .rnz .rn{margin-top:0;padding:5px 5px 5px 18px;border-radius:999px;background:var(--paper);color:var(--ink);font-size:15px}
 .rnz .rn:focus-within{outline-color:var(--ink)}
-.rnz .rn .pre,.rnz .rn .pen{color:var(--muted);stroke:var(--muted)}
-.rnz .rn button{background:var(--ink);color:var(--on-ink)}
+.rnz .rn .pre,.rnz .rn .pen{color:var(--muted)}
+.rnz .rn:hover .pen{background:var(--surface);color:var(--ink)}
+.rnz .rn:hover input[type=text]{box-shadow:inset 0 -2px 0 var(--line)}
+.rnz .rn:focus-within input[type=text]{background:var(--surface);box-shadow:inset 0 -2px 0 var(--accent-text)}
+.rnz .rn .sv{background:var(--ink);color:var(--on-ink)}
 .rnz+.dz{margin-top:20px}
 .dz{display:flex;justify-content:space-between;align-items:center;gap:16px;margin-top:28px;padding-top:20px;border-top:1px solid var(--line-soft);font-size:14px;color:var(--muted)}
 .danger{color:var(--danger);border-color:currentColor}
