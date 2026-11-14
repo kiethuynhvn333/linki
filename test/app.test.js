@@ -3,6 +3,7 @@
 
 import { test, before, after } from 'node:test';
 import assert from 'node:assert/strict';
+import { createHash } from 'node:crypto';
 import { readFileSync, readdirSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import { Miniflare } from 'miniflare';
@@ -75,16 +76,28 @@ function setCookies(res) {
 }
 
 // Creates a link. Returns its code and the owner cookie to send on later requests.
-async function createLink({ url = 'https://example.com/page', label = '', cookie, ip = freshIp() } = {}) {
-  const res = await post('/create', { url, label }, { cookie, headers: { 'CF-Connecting-IP': ip } });
+async function createLink({ url = 'https://example.com/page', name = '', cookie, ip = freshIp() } = {}) {
+  const res = await post('/create', { url, name }, { cookie, headers: { 'CF-Connecting-IP': ip } });
   assert.equal(res.status, 303);
-  const code = res.headers.get('Location').match(/^\/\?new=([a-z0-9]+)$/)[1];
+  const location = res.headers.get('Location');
+  const code = location.match(/^\/\?new=([a-z0-9-]+)(&asked=[a-z0-9-]+)?$/)[1];
   const owner = setCookies(res).owner;
-  return { code, cookie: cookie || `owner=${owner.value}`, res };
+  return { code, location, cookie: cookie || `owner=${owner.value}`, res };
+}
+
+async function toolCall(token, name, args) {
+  const { json } = await rpc(token, 'tools/call', { name, arguments: args });
+  return json.result;
 }
 
 function click(code, { ip = '198.51.100.1', ua = BROWSER_UA, method = 'GET', headers = {} } = {}) {
   return request(`/${code}`, { method, headers: { 'User-Agent': ua, 'CF-Connecting-IP': ip, ...headers } });
+}
+
+// Where a short link leads, asked as a tool that is never counted as a click.
+async function goesTo(code) {
+  const res = await click(code, { ua: 'curl/8.4.0' });
+  return res.status === 302 ? res.headers.get('Location') : res.status;
 }
 
 function linkRow(code) {
@@ -187,21 +200,23 @@ test('the homepage shows the headline, the four selling points and no footer sta
   assert.match(html, /<h1>a very good alternative to <span class="hl">bitly<\/span><\/h1>/);
   assert.equal(html.match(/<section class="usp"/g).length, 1);
   assert.equal(html.match(/<li><span class="ic t\d"/g).length, 4);
-  for (const title of ['Paste and go', 'No sign-up', 'See every click', 'Agent-ready']) {
+  for (const title of ['Paste and go', 'Free custom links', 'No sign-up', 'MCP-ready']) {
     assert.ok(html.includes(`<h3>${title}</h3>`), title);
   }
+  assert.doesNotMatch(html, /See every click|Agent-ready/);
   assert.doesNotMatch(html, /<footer|tied to this browser/);
   assert.doesNotMatch(await (await request('/links')).text(), /class="usp"/);
 });
 
 test('the tab title is the headline, and every page links the cursor favicon', async () => {
-  const { code, cookie } = await createLink({ label: 'Launch post' });
+  const { code, cookie } = await createLink({ name: 'Tab title' });
+  assert.equal(code, 'tab-title');
   const cases = [
     ['/', 'Linki — a very good alternative to bitly'],
     [`/?new=${code}`, 'Linki — a very good alternative to bitly'],
     ['/links', 'Your links — Linki'],
-    [`/links/${code}`, 'Launch post — Linki'],
-    ['/no-such-page', 'Page not found — Linki'],
+    [`/links/${code}`, 'tab-title — Linki'],
+    ['/no/such/page', 'Page not found — Linki'],
     ['/zzzzzz', 'Link not found — Linki'],
   ];
   for (const [path, title] of cases) {
@@ -238,7 +253,7 @@ test('a staging copy (NOINDEX set) tells search engines to stay away', async () 
     bindings: { HASH_SECRET: 'test-secret', NOINDEX: '1' },
   });
   try {
-    for (const path of ['/robots.txt', '/favicon.svg', '/nothing-here-at-all']) {
+    for (const path of ['/robots.txt', '/favicon.svg', '/nothing/here/at/all']) {
       const res = await staging.dispatchFetch(`${ORIGIN}${path}`);
       assert.equal(res.headers.get('X-Robots-Tag'), 'noindex, nofollow', path);
       await res.arrayBuffer();
@@ -251,7 +266,8 @@ test('a staging copy (NOINDEX set) tells search engines to stay away', async () 
 // ---------- creating links ----------
 
 test('creating a link gives the browser its owner cookie and shows the result', async () => {
-  const { code, cookie, res } = await createLink({ url: 'example.com/hello', label: 'My label' });
+  const { code, cookie, res } = await createLink({ url: 'example.com/hello' });
+  assert.match(code, /^[a-z2-9]{6}$/);
   const owner = setCookies(res).owner;
   assert.match(owner.line, /HttpOnly/);
   assert.match(owner.line, /Secure/);
@@ -259,7 +275,145 @@ test('creating a link gives the browser its owner cookie and shows the result', 
   const html = await (await request(`/?new=${code}`, { cookie })).text();
   assert.match(html, /Your short link is ready/);
   assert.ok(html.includes(`linki.test/${code}`));
-  assert.match(html, /My label/);
+  assert.doesNotMatch(html, /name="label"/);
+});
+
+test('a custom name becomes the short link, for free, and capitals do not matter', async () => {
+  const home = await (await request('/')).text();
+  assert.match(home, /<span class="pre" aria-hidden="true"><bdi>linki\.test\/<\/bdi><\/span>/);
+  assert.match(home, /<input id="name" name="name"/);
+
+  const { code } = await createLink({ url: 'https://example.com/tet', name: 'Khuyến mãi Tết!' });
+  assert.equal(code, 'khuyen-mai-tet');
+  for (const path of ['/khuyen-mai-tet', '/Khuyen-Mai-TET']) {
+    const res = await request(path);
+    assert.equal(res.status, 302, path);
+    assert.equal(res.headers.get('Location'), 'https://example.com/tet');
+  }
+});
+
+test('a name someone already has gets a short ending, and nobody is turned away', async () => {
+  const first = await createLink({ url: 'https://example.com/first', name: 'spring-sale' });
+  assert.equal(first.code, 'spring-sale');
+  const second = await createLink({ url: 'https://example.com/second', name: 'Spring Sale' });
+  assert.match(second.code, /^spring-sale-[a-z2-9]{2}$/);
+  assert.equal(second.location, `/?new=${second.code}&asked=spring-sale`);
+  const html = await (await request(second.location, { cookie: second.cookie })).text();
+  assert.match(html, /“spring-sale” was already taken, so your link has a short ending\. You can change the name above\./);
+  assert.equal((await request('/spring-sale')).headers.get('Location'), 'https://example.com/first');
+  assert.equal((await request(`/${second.code}`)).headers.get('Location'), 'https://example.com/second');
+
+  // Linki's own paths cannot be taken as names.
+  const reserved = await createLink({ name: 'links' });
+  assert.match(reserved.code, /^links-[a-z2-9]{2}$/);
+  assert.equal((await request('/links')).status, 200);
+
+  // A 40-character name still fits its ending.
+  const long = 'a'.repeat(40);
+  assert.equal((await createLink({ name: long })).code, long);
+  assert.match((await createLink({ name: long })).code, /^a{37}-[a-z2-9]{2}$/);
+});
+
+test('a name with no usable letters is refused, and the form keeps what was typed', async () => {
+  for (const name of ['a', '!!', '--', '日本']) {
+    const res = await post('/create', { url: 'https://example.com/x', name });
+    assert.equal(res.status, 400, name);
+    const html = await res.text();
+    assert.match(html, /A custom name needs at least 3 letters or numbers/, name);
+    assert.ok(html.includes('value="https://example.com/x"'), name);
+  }
+});
+
+test('the MCP link is offered under Recent links, and the hero stays clean', async () => {
+  const { code, cookie } = await createLink();
+  const res = await request(`/?new=${code}`, { cookie });
+  const token = setCookies(res).mcp.value;
+  const html = await res.text();
+  assert.equal(html.match(/<aside class="mcpf"/g).length, 1);
+  assert.match(html, new RegExp(`data-copy="${ORIGIN}/mcp/${token}">.*Copy MCP link</button>`));
+  assert.ok(html.indexOf('<ul class="links">') < html.indexOf('<aside class="mcpf"'));
+  const hero = html.slice(html.indexOf('<div class="hero'), html.indexOf('Recent links'));
+  assert.doesNotMatch(hero, /MCP/);
+  assert.equal((await rpc(token, 'tools/list')).status, 200);
+
+  // It stays under the list on later visits, and Your links shows the same link below its list.
+  const later = await (await request('/', { cookie: `${cookie}; mcp=${token}` })).text();
+  assert.ok(later.includes(`data-copy="${ORIGIN}/mcp/${token}"`));
+  const yours = await (await request('/links', { cookie: `${cookie}; mcp=${token}` })).text();
+  assert.ok(yours.includes(`${ORIGIN}/mcp/${token}`));
+  assert.ok(yours.indexOf('<ul class="links">') < yours.indexOf('<section class="agent"'));
+  // A browser that lost the MCP cookie is sent to Your links, where Reset gives a new one.
+  assert.match(await (await request('/', { cookie })).text(), /<a class="button secondary" href="\/links">.*Get MCP link<\/a>/);
+  assert.doesNotMatch(await (await request('/')).text(), /class="mcpf"/);
+});
+
+test('a link can be renamed from its result box, and the clicks move with it', async () => {
+  const { code, cookie } = await createLink({ url: 'https://example.com/rename-me', name: 'rename-me' });
+  await click(code);
+  await waitForClicks(code, 1);
+  const card = await (await request(`/?new=${code}`, { cookie })).text();
+  assert.match(card, new RegExp(`<form class="rn" method="post" action="/links/${code}/rename" data-rename data-confirm="Change the name\\?`));
+  assert.match(card, /name="name"[^>]*value="rename-me"/);
+  assert.match(card, /<button type="button" class="pen"[^>]*aria-label="Change the name">/);
+  assert.match(card, /<button type="submit" class="sv">Save<\/button>/);
+  assert.doesNotMatch(card, /class="tk"|Want a different name/); // no extra line under the box
+
+  const json = { Accept: 'application/json' };
+  const ok = await post(`/links/${code}/rename`, { name: 'Renamed Link', back: 'home' }, { cookie, headers: json });
+  assert.equal(ok.status, 200);
+  assert.deepEqual(await ok.json(), { ok: true, code: 'renamed-link', location: '/?new=renamed-link' });
+  assert.equal(await goesTo('rename-me'), 404);
+  assert.equal(await goesTo('renamed-link'), 'https://example.com/rename-me');
+  assert.deepEqual(await linkRow('renamed-link'), { click_count: 1, unique_count: 1 });
+  assert.equal(await count('SELECT COUNT(*) AS n FROM clicks WHERE code = ?', 'renamed-link'), 1);
+  assert.equal(await count('SELECT COUNT(*) AS n FROM clicks WHERE code = ?', 'rename-me'), 0);
+  assert.match(await (await request('/?new=renamed-link', { cookie })).text(), /value="renamed-link"/);
+
+  // Without the page script the form still works, and the detail page sends you back to it.
+  const plain = await post('/links/renamed-link/rename', { name: 'renamed-again', back: 'detail' }, { cookie });
+  assert.equal(plain.status, 303);
+  assert.equal(plain.headers.get('Location'), '/links/renamed-again');
+  const detail = await (await request('/links/renamed-again', { cookie })).text();
+  assert.match(detail, /action="\/links\/renamed-again\/rename" data-rename data-confirm=/);
+  // Saving the same name changes nothing.
+  assert.equal((await post('/links/renamed-again/rename', { name: 'renamed-again' }, { cookie, headers: json })).status, 200);
+});
+
+test('renaming to a taken name is refused with a message, and the owner picks another', async () => {
+  const mine = await createLink({ url: 'https://example.com/mine', name: 'my-first-name' });
+  const theirs = await createLink({ url: 'https://example.com/theirs', name: 'their-name' });
+  await click(theirs.code);
+  await waitForClicks(theirs.code, 1);
+  const json = { Accept: 'application/json' };
+  const rename = (code, name, options = {}) =>
+    post(`/links/${code}/rename`, { name }, { cookie: mine.cookie, headers: json, ...options });
+
+  const taken = await rename(mine.code, 'Their Name');
+  assert.equal(taken.status, 409);
+  assert.equal((await taken.json()).error, '“their-name” is already taken. Try another name.');
+  assert.equal(await goesTo('my-first-name'), 'https://example.com/mine');
+  assert.equal(await goesTo('their-name'), 'https://example.com/theirs');
+  assert.equal(await count('SELECT COUNT(*) AS n FROM clicks WHERE code = ?', 'their-name'), 1);
+
+  assert.equal((await rename(mine.code, 'links')).status, 409); // one of Linki's own paths
+  assert.equal((await rename(mine.code, 'a')).status, 400);
+  assert.equal((await rename(mine.code, '')).status, 400);
+  assert.equal((await rename(theirs.code, 'stolen')).status, 404); // not my link
+  assert.equal((await rename(mine.code, 'x'.repeat(3), { cookie: undefined })).status, 404); // no cookie
+  assert.equal((await rename(mine.code, 'elsewhere', { headers: { ...json, Origin: 'https://evil.example' } })).status, 403);
+  assert.equal(await count('SELECT COUNT(*) AS n FROM links WHERE code IN (?, ?)', 'stolen', 'elsewhere'), 0);
+  const plain = await post(`/links/${mine.code}/rename`, { name: 'their-name' }, { cookie: mine.cookie });
+  assert.equal(plain.status, 409);
+  assert.match(await plain.text(), /Name not changed/);
+
+  // A link with a lot of clicks keeps its name.
+  await db.prepare('UPDATE links SET click_count = 1001 WHERE code = ?').bind(mine.code).run();
+  const locked = await rename(mine.code, 'too-late');
+  assert.equal(locked.status, 409);
+  assert.match((await locked.json()).error, /more than 1,000 clicks/);
+  const detail = await (await request(`/links/${mine.code}`, { cookie: mine.cookie })).text();
+  assert.match(detail, /more than 1,000 clicks/);
+  assert.doesNotMatch(detail, /<form class="rn"/);
 });
 
 test('bad destinations are refused with a clear message', async () => {
@@ -300,6 +454,26 @@ test('one address can create 20 links an hour, then is asked to wait', async () 
   for (let i = 0; i < 20; i++) ({ cookie } = await createLink({ cookie, ip }));
   const res = await post('/create', { url: 'https://example.com/more' }, { cookie, headers: { 'CF-Connecting-IP': ip } });
   assert.equal(res.status, 429);
+  assert.match(await res.text(), /in the last hour/);
+});
+
+test('one address can create 50 links a day', async () => {
+  const ip = freshIp();
+  const creator = createHash('sha256').update(`test-secret|creator|${ip}`).digest('hex').slice(0, 32);
+  const earlier = Math.floor(Date.now() / 1000) - 2 * 3600;
+  const rows = [];
+  for (let i = 0; i < 49; i++) {
+    rows.push(
+      db
+        .prepare('INSERT INTO links (code, owner_id, destination, created_at, creator_hash) VALUES (?, ?, ?, ?, ?)')
+        .bind(`daycap-${i}`, 'f'.repeat(32), 'https://example.com/', earlier, creator)
+    );
+  }
+  await db.batch(rows);
+  await createLink({ ip }); // the 50th
+  const res = await post('/create', { url: 'https://example.com/more' }, { headers: { 'CF-Connecting-IP': ip } });
+  assert.equal(res.status, 429);
+  assert.match(await res.text(), /daily limit/);
 });
 
 // ---------- redirects and click counting ----------
@@ -386,14 +560,17 @@ test('an owner with a link gets one connector URL, reused on later visits', asyn
 });
 
 test('the connector reports clicks, only for its own links, and reset replaces it', async () => {
-  const mine = await createLink({ label: 'Mine' });
-  const theirs = await createLink({ label: 'Theirs' });
+  const mine = await createLink();
+  const theirs = await createLink();
   await click(mine.code);
   await waitForClicks(mine.code, 1);
   const token = setCookies(await request('/links', { cookie: mine.cookie })).mcp.value;
 
   assert.equal((await rpc('a'.repeat(43), 'tools/list')).status, 401);
-  assert.equal((await rpc(token, 'tools/list')).json.result.tools.length, 3);
+  assert.deepEqual(
+    (await rpc(token, 'tools/list')).json.result.tools.map((t) => t.name),
+    ['list_links', 'link_report', 'clicks_summary', 'create_link']
+  );
 
   const list = JSON.parse((await rpc(token, 'tools/call', { name: 'list_links' })).json.result.content[0].text);
   assert.deepEqual(
@@ -416,15 +593,51 @@ test('the connector reports clicks, only for its own links, and reset replaces i
   assert.equal((await post('/mcp/reset', {})).status, 401); // no cookie, nothing to reset
 });
 
+test('an agent can create links through the connector, with its own smaller limit', async () => {
+  const ip = freshIp();
+  const { code, cookie } = await createLink({ ip });
+  const token = setCookies(await request('/links', { cookie })).mcp.value;
+
+  const made = await toolCall(token, 'create_link', { url: 'example.com/from-agent', name: 'Agent Made' });
+  assert.equal(made.isError, undefined);
+  assert.deepEqual(JSON.parse(made.content[0].text), {
+    slug: 'agent-made',
+    short_url: `${ORIGIN}/agent-made`,
+    destination: 'https://example.com/from-agent',
+  });
+  assert.equal((await request('/agent-made')).headers.get('Location'), 'https://example.com/from-agent');
+  const list = JSON.parse((await toolCall(token, 'list_links', {})).content[0].text);
+  assert.deepEqual(list.links.map((l) => l.slug).sort(), ['agent-made', code].sort());
+  assert.match(await (await request('/links', { cookie })).text(), /agent-made/);
+
+  const again = JSON.parse((await toolCall(token, 'create_link', { url: 'https://example.com/2', name: 'agent-made' })).content[0].text);
+  assert.match(again.slug, /^agent-made-[a-z2-9]{2}$/);
+  assert.match(again.note, /already taken/);
+
+  for (const args of [{}, { url: 'javascript:alert(1)' }, { url: 'https://linki.test/x' }, { url: 'https://example.com', name: 5 }]) {
+    assert.equal((await toolCall(token, 'create_link', args)).isError, true, JSON.stringify(args));
+  }
+
+  // 10 an hour per connector: two are made, eight more fit, the next is refused.
+  for (let i = 0; i < 8; i++) {
+    assert.equal((await toolCall(token, 'create_link', { url: `https://example.com/n${i}` })).isError, undefined);
+  }
+  const refused = await toolCall(token, 'create_link', { url: 'https://example.com/too-many' });
+  assert.equal(refused.isError, true);
+  assert.match(refused.content[0].text, /10 links an hour and 25 a day/);
+  // The website limit is counted separately, per network address.
+  await createLink({ cookie, ip });
+});
+
 // ---------- link detail, time zone, delete ----------
 
 test('the detail page is only visible to the link owner', async () => {
-  const { code, cookie } = await createLink({ label: 'Launch post' });
+  const { code, cookie } = await createLink({ name: 'Launch post' });
   const other = await createLink();
   await click(code);
   await waitForClicks(code, 1);
   const html = await (await request(`/links/${code}`, { cookie })).text();
-  assert.match(html, /Launch post/);
+  assert.match(html, /<h1>launch-post<\/h1>/);
   assert.match(html, /Unique clicks<\/span><span class="num">1</);
   assert.match(html, /Days are in UTC\./);
   assert.equal((await request(`/links/${code}`, { cookie: other.cookie })).status, 404);

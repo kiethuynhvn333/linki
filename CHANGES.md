@@ -1,3 +1,17 @@
+# Free custom names and links from agents (14 Nov 2026)
+
+From Kiet's review comments #1, #2 and #3 on staging.
+
+- **Custom names (free).** The label box on the home form is replaced by a name box that starts with `linki.ing/`. What you type becomes the short link: `linki.ing/your-name`. Names are letters, numbers and hyphens, 3 to 40 characters. Spaces, capitals and accents are converted, and short links ignore capitals. The preview card shows the name as you type.
+- **A taken name is not an error.** A link address can only lead to one place, so two people cannot both own `linki.ing/hello`. The second person gets the name plus a short ending (`hello-k7`), and the result card says so and points to the name box. Linki's own paths (`links`, `mcp`, and others in `RESERVED`) are handled the same way.
+- **Rename.** The name in the result card can be edited in place: click it, type, Save (`POST /links/:code/rename`). A link's page has the same box above Delete. A taken name gives a message and the owner picks another; no ending is added. The old address stops working. Click rows move to the new name in one transaction, so a link with more than 1,000 clicks keeps its name (`RENAME_MAX_CLICKS`): a rename rewrites every click row, and the free plan allows 100,000 row writes a day. A visitor who clicked before the rename counts as a new unique visitor for the rest of that day.
+- **Labels.** New links have no label. Links that already have one keep it.
+- **Selling points.** Paste and go, Free custom links, No sign-up, MCP-ready. "See every click" is removed.
+- **MCP entry point.** The hero has no MCP element. On the home page, one line under Recent links copies the MCP link (`mcpLine`). On Your links, the section is renamed "Use Linki from your AI agent (MCP)", sits below the list, and is smaller and quieter than the links.
+- **Agents can create links.** The connector has a new `create_link` tool (`url`, optional `name`). It is no longer read-only.
+- **Limits** (`CREATE_LIMITS`): the website allows 20 new links an hour and 50 a day per network address (it was 20 an hour with no daily cap, so up to 480 a day). A connector allows 10 an hour and 25 a day. Agents call from their vendor's servers, so the connector limit is counted per connector, not per address.
+- No database change. A custom name is stored in `links.code`.
+
 # Home page refresh (14 Nov 2026)
 
 - **Headline:** "a very good alternative to bitly".
