@@ -153,9 +153,23 @@ test('pages send security headers, and the script nonce matches the policy', asy
   for (const tag of scripts) assert.ok(tag.includes(`nonce="${nonce}"`), tag);
 });
 
-test('HEAD requests get the same status as GET', async () => {
-  assert.equal((await request('/', { method: 'HEAD' })).status, 200);
+test('HEAD requests get the same status as GET and no body', async () => {
+  const head = await request('/', { method: 'HEAD' });
+  const get = await request('/');
+  assert.equal(head.status, 200);
+  assert.equal(get.status, 200);
+  assert.equal(head.headers.get('Content-Type'), get.headers.get('Content-Type'));
+  assert.equal(await head.text(), '');
   assert.equal((await request('/links', { method: 'HEAD' })).status, 200);
+  assert.equal((await request('/zzzzzz', { method: 'HEAD' })).status, 404);
+
+  const { code } = await createLink({ url: 'https://example.com/head-target' });
+  const redirect = await click(code, { method: 'HEAD' });
+  assert.equal(redirect.status, 302);
+  assert.equal(redirect.headers.get('Location'), 'https://example.com/head-target');
+  assert.equal(await redirect.text(), '');
+  await click(code);
+  await waitForClicks(code, 1);
 });
 
 test('http and www visitors are sent to the https bare domain', async () => {
@@ -178,6 +192,30 @@ test('the homepage shows the headline, the four selling points and no footer sta
   }
   assert.doesNotMatch(html, /<footer|tied to this browser/);
   assert.doesNotMatch(await (await request('/links')).text(), /class="usp"/);
+});
+
+test('the tab title is the headline, and every page links the cursor favicon', async () => {
+  const { code, cookie } = await createLink({ label: 'Launch post' });
+  const cases = [
+    ['/', 'Linki — a very good alternative to bitly'],
+    [`/?new=${code}`, 'Linki — a very good alternative to bitly'],
+    ['/links', 'Your links — Linki'],
+    [`/links/${code}`, 'Launch post — Linki'],
+    ['/no-such-page', 'Page not found — Linki'],
+    ['/zzzzzz', 'Link not found — Linki'],
+  ];
+  for (const [path, title] of cases) {
+    const html = await (await request(path, { cookie })).text();
+    assert.ok(html.includes(`<title>${title}</title>`), path);
+    assert.ok(html.includes('<link rel="icon" href="/favicon.svg" type="image/svg+xml">'), path);
+  }
+  const home = await (await request('/', { cookie })).text();
+  assert.ok(home.includes('property="og:title" content="Linki — a very good alternative to bitly"'));
+  assert.match(home, new RegExp(`method="post" action="/links/${code}/delete" data-row-delete`));
+  assert.match(home, new RegExp(`aria-label="Delete ${ORIGIN}/${code}"`));
+  const yours = await (await request('/links', { cookie })).text();
+  assert.match(yours, new RegExp(`action="/links/${code}/delete"`));
+  assert.match(yours, />Delete</);
 });
 
 test('the header logo and the favicon are the same drawing', async () => {
@@ -414,6 +452,47 @@ test('the chart counts days in the browser time zone when it is known', async (t
   assert.match(local, /Days follow your time zone \(UTC[+-]\d/);
   const ignored = await (await request(`/links/${code}`, { cookie: `${cookie}; tz=99999` })).text();
   assert.match(ignored, /Days are in UTC\./);
+});
+
+test('a list delete is POST-only, and a JSON delete removes the link and its clicks', async () => {
+  const { code, cookie } = await createLink();
+  await click(code);
+  await waitForClicks(code, 1);
+  const home = await (await request('/', { cookie })).text();
+  assert.match(home, new RegExp(`method="post" action="/links/${code}/delete"`));
+  assert.doesNotMatch(home, new RegExp(`href="/links/${code}/delete"`));
+
+  assert.equal((await request(`/links/${code}/delete`, { cookie })).status, 404);
+  assert.equal(await count('SELECT COUNT(*) AS n FROM links WHERE code = ?', code), 1);
+
+  const other = await createLink();
+  const denied = await post(`/links/${code}/delete`, {}, {
+    cookie: other.cookie,
+    headers: { Accept: 'application/json' },
+  });
+  assert.equal(denied.status, 404);
+  assert.equal((await denied.json()).error, 'This link is not in your list.');
+
+  const blocked = await post(`/links/${code}/delete`, {}, {
+    cookie,
+    headers: { Accept: 'application/json', Origin: 'https://evil.example' },
+  });
+  assert.equal(blocked.status, 403);
+  assert.equal(await count('SELECT COUNT(*) AS n FROM clicks WHERE code = ?', code), 1);
+
+  const ok = await post(`/links/${code}/delete`, {}, {
+    cookie,
+    headers: { Accept: 'application/json' },
+  });
+  assert.equal(ok.status, 200);
+  assert.deepEqual(await ok.json(), { ok: true });
+  assert.equal((await click(code)).status, 404);
+  const missing = await (await click(code)).text();
+  assert.match(missing, /Link not found/);
+  assert.match(missing, /<link rel="icon" href="\/favicon\.svg"/);
+  assert.equal(await count('SELECT COUNT(*) AS n FROM links WHERE code = ?', code), 0);
+  assert.equal(await count('SELECT COUNT(*) AS n FROM clicks WHERE code = ?', code), 0);
+  assert.equal(await count('SELECT COUNT(*) AS n FROM links WHERE code = ?', other.code), 1);
 });
 
 test('only the owner can delete a link, and deleting removes its clicks', async () => {

@@ -14,7 +14,7 @@ const CLICK_RETENTION_DAYS = 400; // raw click rows; totals live on the links ro
 const PRUNE_BATCH = 10000;
 const BOT_RE =
   /bot|crawl|spider|slurp|facebookexternalhit|meta-externalagent|whatsapp\/|preview|curl|wget|python|headless|pingdom|uptime|monitor|go-http-client|okhttp|axios|node-fetch|undici|java\/|dalvik|libwww|httpclient|scrapy|postman|insomnia|google-inspectiontool|googleother|lighthouse|embedly|vkshare|validator|feedfetcher|mediapartners/i;
-const HOME_TITLE = 'Linki: short links with click counts, no sign-up';
+const HOME_TITLE = 'Linki — a very good alternative to bitly';
 const HOME_DESCRIPTION =
   'Paste a long URL, get a short link, and see how many people click it. Free, with no sign-up.';
 const BLOCKED_SCHEME_RE = /^(javascript|data|vbscript|file|mailto|tel|blob|about):/i;
@@ -239,6 +239,7 @@ async function createLink(request, env, url) {
 
 async function deleteLink(request, env, code) {
   const owner = getOwner(request);
+  const json = (request.headers.get('Accept') || '').includes('application/json');
   const results = owner.isNew
     ? null
     : await env.DB.batch([
@@ -248,11 +249,20 @@ async function deleteLink(request, env, code) {
         env.DB.prepare('DELETE FROM links WHERE code = ? AND owner_id = ?').bind(code, owner.id),
       ]);
   if (!results || !results[1].meta.changes) {
+    if (json) return jsonResponse({ error: 'This link is not in your list.' }, 404);
     return messagePage(404, 'Link not found', 'This link is not in your list.');
   }
+  if (json) return jsonResponse({ ok: true }, 200);
   return new Response(null, {
     status: 303,
     headers: { Location: '/links?deleted=1', 'Cache-Control': 'no-store' },
+  });
+}
+
+function jsonResponse(body, status) {
+  return new Response(JSON.stringify(body), {
+    status,
+    headers: { 'Content-Type': 'application/json; charset=utf-8', 'Cache-Control': 'no-store' },
   });
 }
 
@@ -547,7 +557,12 @@ function linkList(links, origin, offset = 0) {
         </a>
         <span class="date">${dayNum === todayNum ? 'Today' : formatDay(dayNum)}</span>
         <span class="count"><span class="num">${l.click_count.toLocaleString('en-US')}</span><span class="cc">${l.click_count === 1 ? 'click' : 'clicks'}</span></span>
-        <button type="button" class="secondary" data-copy="${esc(shortUrl)}" aria-label="Copy ${esc(shortUrl)}">Copy</button>
+        <span class="rowbtns">
+          <button type="button" class="secondary" data-copy="${esc(shortUrl)}" aria-label="Copy ${esc(shortUrl)}">Copy</button>
+          <form method="post" action="/links/${l.code}/delete" data-row-delete data-confirm="Delete this link? The short link will stop working and its click history will be removed. This cannot be undone.">
+            <button class="secondary del" type="submit" aria-label="Delete ${esc(shortUrl)}">Delete</button>
+          </form>
+        </span>
       </li>`;
     })
     .join('')}</ul>`;
@@ -592,7 +607,7 @@ function contentSecurityPolicy(nonce) {
     "style-src 'unsafe-inline' https://fonts.googleapis.com",
     'font-src https://fonts.gstatic.com',
     "img-src 'self' data: https://*.google-analytics.com https://*.googletagmanager.com",
-    'connect-src https://*.google-analytics.com https://*.analytics.google.com https://*.googletagmanager.com',
+    "connect-src 'self' https://*.google-analytics.com https://*.analytics.google.com https://*.googletagmanager.com",
     "form-action 'self'",
     "base-uri 'none'",
     "frame-ancestors 'none'",
@@ -601,13 +616,14 @@ function contentSecurityPolicy(nonce) {
 
 function page(title, body, { owner, url, status = 200, linkCreated = false, mcpToken, index = false } = {}) {
   const nonce = base64url(crypto.getRandomValues(new Uint8Array(16)));
+  const fullTitle = title.startsWith('Linki —') ? title : `${title} — Linki`;
   const html = `<!doctype html>
 <html lang="en">
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 ${seoHead(index, url)}
-<title>${esc(title)}</title>
+<title>${esc(fullTitle)}</title>
 <link rel="icon" href="/favicon.svg" type="image/svg+xml">
 ${gaHead(linkCreated, nonce)}<link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
@@ -1192,8 +1208,52 @@ document.querySelectorAll('input.short').forEach(function (el) {
   el.addEventListener('focus', function () { el.select(); });
 });
 document.addEventListener('submit', function (e) {
-  var msg = e.target.getAttribute('data-confirm');
-  if (msg && !window.confirm(msg)) e.preventDefault();
+  var form = e.target;
+  var msg = form.getAttribute('data-confirm');
+  if (msg && !window.confirm(msg)) {
+    e.preventDefault();
+    return;
+  }
+  if (!form.hasAttribute('data-row-delete')) return;
+  e.preventDefault();
+  var btn = form.querySelector('button');
+  var row = form.closest('li');
+  if (btn) btn.disabled = true;
+  fetch(form.action, { method: 'POST', headers: { Accept: 'application/json' } })
+    .then(function (res) {
+      if (res.ok) return;
+      return res.json().catch(function () { return {}; }).then(function (data) {
+        var fallback = res.status === 403 ? 'This delete was blocked.' : 'Could not delete this link.';
+        throw new Error((data && data.error) || fallback);
+      });
+    })
+    .then(function () {
+      var list = row.parentNode;
+      var note = list.previousElementSibling;
+      if (!note || !note.classList.contains('delnote')) {
+        note = document.createElement('p');
+        note.className = 'notice delnote';
+        note.setAttribute('role', 'status');
+        list.parentNode.insertBefore(note, list);
+      }
+      note.textContent = 'Deleted';
+      row.remove();
+      if (!list.children.length) list.remove();
+    })
+    .catch(function (err) {
+      if (btn) btn.disabled = false;
+      if (!row) return;
+      var errEl = row.querySelector('.rowmsg');
+      if (!errEl) {
+        errEl = document.createElement('p');
+        errEl.className = 'rowmsg';
+        errEl.setAttribute('role', 'alert');
+        row.appendChild(errEl);
+      }
+      var message = err && err.message ? err.message : '';
+      if (!message || message === 'Failed to fetch') message = 'Could not delete this link.';
+      errEl.textContent = message;
+    });
 });
 // Tell the server this browser's UTC offset so "Today" and the chart use local days.
 try {
@@ -1287,7 +1347,7 @@ button.copied{background:var(--accent);color:var(--on-accent);border-color:var(-
 .sectionhead.top{margin:0 0 20px}
 .sectionhead>a:not(.button){display:inline-flex;align-items:center;min-height:44px;font-size:14px;font-weight:600}
 .links{list-style:none;margin:0 -12px;padding:0}
-.links li{display:grid;grid-template-columns:minmax(0,1fr) 130px 90px 80px;gap:16px;align-items:center;padding:12px;border-top:1px solid var(--line-soft);border-radius:16px}
+.links li{display:grid;grid-template-columns:minmax(0,1fr) 130px 90px auto;gap:16px;align-items:center;padding:12px;border-top:1px solid var(--line-soft);border-radius:16px}
 .links li:first-child{border-top:0}
 .links li:hover{background:var(--paper)}
 .links li:hover+li{border-top-color:transparent}
@@ -1309,6 +1369,12 @@ button.copied{background:var(--accent);color:var(--on-accent);border-color:var(-
 .count .num{display:block;font-size:24px}
 .cc{display:block;margin-top:3px;font-size:12px;font-weight:500;color:var(--muted)}
 .links .secondary{justify-self:end}
+.rowbtns{display:flex;gap:8px;justify-content:flex-end;align-items:center}
+.rowbtns form{margin:0}
+.rowbtns .secondary{flex:none}
+.rowbtns .del:hover{color:var(--maroon);border-color:var(--maroon);background:color-mix(in srgb, var(--maroon) 10%, var(--surface))}
+.rowbtns button:disabled{opacity:.6;cursor:default}
+.rowmsg{grid-column:1/-1;margin:0;font-size:13px;font-weight:500;color:var(--danger)}
 .empty{display:grid;justify-items:center;gap:20px;padding:48px;text-align:center;border:2px dashed var(--line);border-radius:22px}
 .empty p{font:700 24px/1.2 var(--display)}
 
@@ -1384,6 +1450,17 @@ button.copied{background:var(--accent);color:var(--on-accent);border-color:var(-
   .pv .n{font-size:22px}
 }
 
+@media (max-width:640px){
+  .links{margin:0 -8px}
+  .links li{grid-template-columns:minmax(0,1fr) auto;grid-template-areas:"link count" "btns btns";gap:10px 12px;padding:12px 8px}
+  .rowmain{grid-area:link;gap:12px}
+  .date{display:none}
+  .count{grid-area:count;align-self:center}
+  .count .num{font-size:20px}
+  .rowbtns{grid-area:btns;justify-content:flex-start}
+  .rowbtns .secondary{height:44px;min-height:44px;padding:0 16px}
+}
+
 @media (max-width:520px){
   header{padding:0 10px}
   .pill{height:44px}
@@ -1405,11 +1482,6 @@ button.copied{background:var(--accent);color:var(--on-accent);border-color:var(-
   .cl{align-self:stretch;margin-top:18px}
   .secondary{height:44px}
   .sectionhead{margin-top:30px}
-  .links{margin:0 -8px}
-  .links li{grid-template-columns:minmax(0,1fr) auto auto;gap:12px;padding:12px 8px}
-  .rowmain{gap:12px}
-  .date{display:none}
-  .count .num{font-size:20px}
   .dtop{flex-direction:column;align-items:stretch;gap:16px}
   .up{flex:none}
   .up input.short{height:44px;font-size:13px}
@@ -1438,6 +1510,7 @@ button.copied{background:var(--accent);color:var(--on-accent);border-color:var(-
 .agent .up{flex:1 1 auto;width:100%;max-width:none;margin-top:14px}
 .agent .up input.short{min-width:0}
 .notice{margin:-6px 0 18px;padding:12px 16px;border-radius:14px;background:var(--paper);font-size:14px;font-weight:500}
+.delnote{margin:8px 0 12px}
 .dz{display:flex;justify-content:space-between;align-items:center;gap:16px;margin-top:28px;padding-top:20px;border-top:1px solid var(--line-soft);font-size:14px;color:var(--muted)}
 .danger{color:var(--danger);border-color:currentColor}
 @media (max-width:520px){
