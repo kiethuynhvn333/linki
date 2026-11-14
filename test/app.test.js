@@ -364,7 +364,7 @@ test('a name someone already has gets a short ending, and nobody is turned away'
   assert.match(second.code, /^spring-sale-[a-z2-9]{2}$/);
   assert.equal(second.location, `/?new=${second.code}&asked=spring-sale`);
   const html = await (await request(second.location, { cookie: second.cookie })).text();
-  assert.match(html, /“spring-sale” was already taken, so your link has a short ending\. You can change the name above\./);
+  assert.match(html, /“spring-sale” was already taken, so your link has a short ending\. You can change the name\sabove\./);
   assert.equal((await request('/spring-sale')).headers.get('Location'), 'https://example.com/first');
   assert.equal((await request(`/${second.code}`)).headers.get('Location'), 'https://example.com/second');
 
@@ -440,7 +440,7 @@ test('a link can be renamed from its result box, and the clicks move with it', a
   assert.equal(plain.headers.get('Location'), '/links/renamed-again');
   const detail = await (await request('/links/renamed-again', { cookie })).text();
   assert.match(detail, /action="\/links\/renamed-again\/rename" data-rename data-confirm=/);
-  assert.match(detail, /Change the name\. The old address keeps working and forwards to the new one\./);
+  assert.match(detail, /Change the name\. The old address keeps working and forwards to the new\sone\./);
   assert.doesNotMatch(detail, /old address stops working/);
   // Saving the same name changes nothing.
   assert.equal((await post('/links/renamed-again/rename', { name: 'renamed-again' }, { cookie, headers: json })).status, 200);
@@ -868,7 +868,7 @@ test('the detail page is only visible to the link owner', async () => {
   await waitForClicks(code, 1);
   const html = await (await request(`/links/${code}`, { cookie })).text();
   assert.match(html, /<h1>launch-post<\/h1>/);
-  assert.match(html, /Unique clicks<\/span><span class="num">1</);
+  assert.match(html, /Unique(?:&nbsp;|\s)clicks<\/span><span class="num">1</);
   assert.match(html, /Days are in UTC\./);
   assert.equal((await request(`/links/${code}`, { cookie: other.cookie })).status, 404);
   assert.equal((await request(`/links/${code}`)).status, 404);

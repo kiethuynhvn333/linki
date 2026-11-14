@@ -551,7 +551,7 @@ async function homePage(request, env, url, state = {}) {
       const asked = url.searchParams.get('asked') || '';
       const note =
         CODE_RE.test(asked) && asked !== link.code
-          ? `<p class="tk">“${esc(asked)}” was already taken, so your link has a short ending. You can change the name above.</p>`
+          ? `<p class="tk">“${esc(asked)}” ${noOrphan('was already taken, so your link has a short ending. You can change the name above.')}</p>`
           : '';
       created = `
       <section class="rc" aria-live="polite">
@@ -587,14 +587,14 @@ async function homePage(request, env, url, state = {}) {
       <h2 id="usp-h" class="sr">Why Linki</h2>
       <ul>${USPS.map(
         ([tile, icon, title, text]) =>
-          `<li><span class="ic ${tile}" aria-hidden="true"><svg viewBox="0 0 20 20">${icon}</svg></span><h3>${title}</h3><p>${text}</p></li>`
+          `<li><span class="ic ${tile}" aria-hidden="true"><svg viewBox="0 0 20 20">${icon}</svg></span><h3>${title}</h3><p>${noOrphan(text)}</p></li>`
       ).join('')}</ul>
     </section>`;
   const body = `
     <div class="hero${created ? ' has' : ''}">
       <section>
         <h1>a very good alternative to <span class="hl">bitly</span></h1>
-        <p class="lede">Paste a URL, name the link your way, see who clicks. Free, no sign-up.</p>
+        <p class="lede">${noOrphan('Paste a URL, name the link your way, see who clicks. Free, no sign-up.')}</p>
         <form method="post" action="/create" class="create">
           <label class="sr" for="url">Destination URL</label>
           <input id="url" name="url" type="text" inputmode="url" autocomplete="off" autofocus required
@@ -640,7 +640,7 @@ async function linksPage(request, env, url) {
   const mcp = await connectorForOwner(request, env, owner, links.length > 0);
   const notice =
     url.searchParams.get('deleted') === '1'
-      ? '<p class="notice" role="status">Link deleted. Its short link no longer works.</p>'
+      ? `<p class="notice" role="status">${noOrphan('Link deleted. Its short link no longer works.')}</p>`
       : '';
   const body = `
     <div class="sectionhead top"><h1>Your links</h1><a class="button secondary" href="/">New link</a></div>
@@ -667,7 +667,7 @@ function mcpLine(mcp, url) {
     : `<a class="button secondary" href="/links">${spark}Get MCP link</a>`;
   return `<aside class="mcpf" aria-label="Connect your AI agent">
               <span class="ic" aria-hidden="true"><svg viewBox="0 0 20 20">${AGENT_ICON}</svg></span>
-              <p><strong>Use your links from your AI agent.</strong> Paste your MCP link into Claude or Cursor to create links and check clicks from chat.</p>
+              <p><strong>Use your links from your AI agent.</strong> ${noOrphan('Paste your MCP link into Claude or Cursor to create links and check clicks from chat.')}</p>
               ${action}
             </aside>`;
 }
@@ -711,10 +711,10 @@ function agentSection(mcp, url) {
   return `
     <section class="agent" aria-labelledby="agent-h">
       <div class="agenthead">
-        <h2 id="agent-h"><span class="ic" aria-hidden="true"><svg viewBox="0 0 20 20">${AGENT_ICON}</svg></span><span>Use Linki from your AI agent <span class="tag">MCP</span></span></h2>
+        <h2 id="agent-h"><span class="ic" aria-hidden="true"><svg viewBox="0 0 20 20">${AGENT_ICON}</svg></span><span>Use Linki from your AI agent&nbsp;<span class="tag">MCP</span></span></h2>
         ${reset}
       </div>
-      <p class="hint">${esc(hint)}</p>
+      <p class="hint">${esc(noOrphan(hint))}</p>
       ${urlRow}
     </section>`;
 }
@@ -767,7 +767,7 @@ async function detailPage(request, env, url, code) {
     <div class="dtop">
       <div>
         <h1>${esc(link.label || link.code)}</h1>
-        <p class="meta dest">Goes to <a href="${esc(link.destination)}" rel="noopener noreferrer nofollow" target="_blank">${esc(truncate(link.destination, 90))}</a> · Created ${formatDate(link.created_at + offset)}</p>
+        <p class="meta dest">Goes to <a href="${esc(link.destination)}" rel="noopener noreferrer nofollow" target="_blank">${esc(truncate(link.destination, 90))}</a> · Created&nbsp;${formatDate(link.created_at + offset)}</p>
       </div>
       <div class="up">
         <input class="short" type="text" readonly value="${esc(shortUrl.replace(/^https?:\/\//, ''))}" aria-label="Short link">
@@ -776,9 +776,9 @@ async function detailPage(request, env, url, code) {
     </div>
 
     <div class="stats">
-      <div class="stat t1"><span class="label">Total clicks</span><span class="num">${link.click_count.toLocaleString('en-US')}</span></div>
-      <div class="stat t2"><span class="label">Unique clicks</span><span class="num">${link.unique_count.toLocaleString('en-US')}</span></div>
-      <div class="stat t3"><span class="label">Last ${CHART_DAYS} days</span><span class="num">${last30.toLocaleString('en-US')}</span></div>
+      <div class="stat t1"><span class="label">Total&nbsp;clicks</span><span class="num">${link.click_count.toLocaleString('en-US')}</span></div>
+      <div class="stat t2"><span class="label">Unique&nbsp;clicks</span><span class="num">${link.unique_count.toLocaleString('en-US')}</span></div>
+      <div class="stat t3"><span class="label">Last&nbsp;${CHART_DAYS}&nbsp;days</span><span class="num">${last30.toLocaleString('en-US')}</span></div>
     </div>
 
     <section class="chartcard">
@@ -786,13 +786,13 @@ async function detailPage(request, env, url, code) {
       <div class="chart" role="img" aria-label="Clicks per day for the last ${CHART_DAYS} days, ${last30} in total">${bars}</div>
       <div class="axis"><span>${formatDay(days[0].day)}</span><span>Today · ${days[days.length - 1].clicks}</span></div>
     </section>
-    <p class="note">${offset ? `Days follow your time zone (${utcLabel(offset)}).` : 'Days are in UTC.'} Unique clicks count each visitor once per day; link previews and known bots are not counted.</p>
+    <p class="note">${noOrphan(`${offset ? `Days follow your time zone (${utcLabel(offset)}).` : 'Days are in UTC.'} Unique clicks count each visitor once per day; link previews and known bots are not counted.`)}</p>
     <div class="rnz">
-      <p>${link.click_count > RENAME_MAX_CLICKS ? esc(RENAME_LOCKED) : 'Change the name. The old address keeps working and forwards to the new one.'}</p>
+      <p>${link.click_count > RENAME_MAX_CLICKS ? esc(noOrphan(RENAME_LOCKED)) : noOrphan('Change the name. The old address keeps working and forwards to the new one.')}</p>
       ${link.click_count > RENAME_MAX_CLICKS ? '' : `<div class="rnw">${renameForm(link, url, 'detail')}</div>`}
     </div>
     <form class="dz" method="post" action="/links/${link.code}/delete" data-confirm="Delete this link? The short link will stop working and its click history will be removed. This cannot be undone.">
-      <p>Deleting stops the short link and removes its click history.</p>
+      <p>${noOrphan('Deleting stops the short link and removes its click history.')}</p>
       <button class="secondary danger" type="submit">Delete link</button>
     </form>`;
   return page(link.label || link.code, body, { owner, url, review: await reviewOn(request, env) });
@@ -837,7 +837,7 @@ function linkList(links, origin, offset = 0) {
 }
 
 async function messagePage(request, env, status, title, text) {
-  const body = `<section class="msg"><p class="status">${status}</p><h1>${esc(title)}</h1><p class="muted">${esc(text)}</p><a class="button secondary" href="/">Go to the homepage</a></section>`;
+  const body = `<section class="msg"><p class="status">${status}</p><h1>${esc(title)}</h1><p class="muted">${esc(noOrphan(text))}</p><a class="button secondary" href="/">Go to the homepage</a></section>`;
   return page(title, body, { status, review: await reviewOn(request, env) });
 }
 
@@ -1437,6 +1437,12 @@ function esc(value) {
   );
 }
 
+// Keep the last two words together. text-wrap balances the lines in current
+// browsers; this is the fallback for browsers that ignore it.
+function noOrphan(text) {
+  return String(text).replace(/ ([^ ]+)\s*$/, '\u00A0$1');
+}
+
 function truncate(text, max) {
   return text.length > max ? `${text.slice(0, max - 1)}…` : text;
 }
@@ -1449,7 +1455,7 @@ const MONTHS = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', '
 
 function formatDate(unixSeconds) {
   const d = new Date(unixSeconds * 1000);
-  return `${d.getUTCDate()} ${MONTHS[d.getUTCMonth()]} ${d.getUTCFullYear()}`;
+  return `${d.getUTCDate()}\u00A0${MONTHS[d.getUTCMonth()]}\u00A0${d.getUTCFullYear()}`;
 }
 
 function formatDay(dayNumber) {
@@ -3173,6 +3179,11 @@ a{color:var(--ink);text-underline-offset:3px}
 p{margin:0}
 h1{margin:0;font:800 44px/.98 var(--display);letter-spacing:-.035em;overflow-wrap:anywhere}
 h2{margin:0;font:700 24px/1.2 var(--display);letter-spacing:-.02em}
+/* Even out headings and short lines. Body copy avoids a one-word last line.
+   noOrphan() does the same for browsers that do not understand text-wrap. */
+h1,h2,h3{text-wrap:balance}
+p{text-wrap:pretty}
+.lede,.usp p,.note,.hint,.mcpf p,.tk,.notice,.error,.rnz>p,.dz>p,.msg .muted{text-wrap:balance}
 .sr{position:absolute;width:1px;height:1px;overflow:hidden;clip:rect(0 0 0 0);white-space:nowrap}
 
 /* header, panel, footer */
