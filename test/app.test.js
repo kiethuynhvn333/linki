@@ -11,10 +11,24 @@ import { Miniflare } from 'miniflare';
 const ROOT = fileURLToPath(new URL('..', import.meta.url));
 const ORIGIN = 'https://linki.test';
 const BROWSER_UA = 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 Chrome/130.0 Safari/537.36';
+// Obviously fake. Production never has this binding.
+const REVIEW_KEY = 'test-review-key';
+const REVIEW_HASH = createHash('sha256').update(REVIEW_KEY).digest('hex');
 
 let mf;
 let db;
+let reviewMf;
+let reviewDb;
 let ipCounter = 0;
+
+async function applyMigrations(database) {
+  for (const file of readdirSync(`${ROOT}migrations`).sort()) {
+    const sql = readFileSync(`${ROOT}migrations/${file}`, 'utf8').replace(/^--.*$/gm, '');
+    for (const statement of sql.split(';').map((s) => s.trim()).filter(Boolean)) {
+      await database.prepare(statement).run();
+    }
+  }
+}
 
 before(async () => {
   mf = new Miniflare({
@@ -25,16 +39,21 @@ before(async () => {
     bindings: { HASH_SECRET: 'test-secret' },
   });
   db = await mf.getD1Database('DB');
-  for (const file of readdirSync(`${ROOT}migrations`).sort()) {
-    const sql = readFileSync(`${ROOT}migrations/${file}`, 'utf8').replace(/^--.*$/gm, '');
-    for (const statement of sql.split(';').map((s) => s.trim()).filter(Boolean)) {
-      await db.prepare(statement).run();
-    }
-  }
+  await applyMigrations(db);
+  reviewMf = new Miniflare({
+    modules: true,
+    scriptPath: `${ROOT}src/index.js`,
+    compatibilityDate: '2025-01-01',
+    d1Databases: { DB: 'linki-review-test' },
+    bindings: { HASH_SECRET: 'test-secret', REVIEW_KEY, NOINDEX: '1' },
+  });
+  reviewDb = await reviewMf.getD1Database('DB');
+  await applyMigrations(reviewDb);
 });
 
 after(async () => {
   await mf.dispose();
+  await reviewMf.dispose();
 });
 
 // ---------- helpers ----------
@@ -129,6 +148,52 @@ async function rpc(token, method, params) {
   });
   return { status: res.status, json: await res.json() };
 }
+
+function reviewRequest(path, { method = 'GET', cookie, headers = {}, body, origin = ORIGIN } = {}) {
+  return reviewMf.dispatchFetch(`${origin}${path}`, {
+    method,
+    body,
+    redirect: 'manual',
+    headers: { 'User-Agent': BROWSER_UA, ...(cookie ? { Cookie: cookie } : {}), ...headers },
+  });
+}
+
+function reviewPost(path, data, cookie, headers = {}) {
+  return reviewRequest(path, {
+    method: 'POST',
+    cookie,
+    body: JSON.stringify(data),
+    headers: {
+      'Content-Type': 'application/json',
+      Accept: 'application/json',
+      Origin: ORIGIN,
+      ...headers,
+    },
+  });
+}
+
+async function reviewCookie() {
+  const res = await reviewRequest(`/?review=${REVIEW_KEY}`);
+  assert.equal(res.status, 302);
+  const cookie = setCookies(res).review;
+  assert.equal(cookie.value, REVIEW_HASH);
+  return `review=${cookie.value}`;
+}
+
+async function reviewCount(sql, ...params) {
+  return (await reviewDb.prepare(sql).bind(...params).first()).n;
+}
+
+const SAMPLE_COMMENT = {
+  path: '/',
+  selector: 'h1',
+  element_desc: 'h1 "a very good alternative to bitly"',
+  x_pct: 40,
+  y_pct: 20,
+  viewport_w: 1280,
+  author: 'Kiet',
+  body: 'The hero is cramped on a phone. @Claude',
+};
 
 // ---------- pages, headers, search engines ----------
 
@@ -748,4 +813,288 @@ test('the daily job removes click rows older than the retention window and keeps
   );
   assert.equal(await count('SELECT COUNT(*) AS n FROM clicks WHERE visitor_hash = ?', 'recent'), 1);
   assert.deepEqual(await linkRow(code), { click_count: 2, unique_count: 2 });
+});
+
+// ---------- staging review mode ----------
+
+test('without REVIEW_KEY every review route is the normal 404 and no comment UI is injected', async () => {
+  assert.equal(await count("SELECT COUNT(*) AS n FROM sqlite_master WHERE type = 'table' AND name = 'review_comments'"), 1);
+  const paths = ['/review/comments', '/review/link', '/review/agent/test-review-key', '/mcp-review/test-review-key'];
+  for (const path of paths) {
+    const res = await request(path);
+    assert.equal(res.status, 404, path);
+    const html = await res.text();
+    assert.match(html, /Page not found/, path);
+    assert.doesNotMatch(html, /review-fab|data-review/, path);
+  }
+  for (const [path, headers] of [
+    ['/review/comments', { 'Content-Type': 'application/json', Origin: ORIGIN }],
+    ['/review/comments', { 'Content-Type': 'application/json', Origin: 'https://evil.example' }],
+    ['/mcp-review/test-review-key', { 'Content-Type': 'application/json', Origin: 'https://evil.example' }],
+    ['/review/agent/test-review-key/comments/1', { 'Content-Type': 'application/json', Origin: 'https://evil.example' }],
+  ]) {
+    const res = await request(path, { method: 'POST', body: '{}', headers });
+    assert.equal(res.status, 404, path);
+    assert.match(await res.text(), /Page not found/);
+  }
+  const hinted = await request('/?review=test-review-key');
+  assert.equal(hinted.status, 200);
+  assert.equal(setCookies(hinted).review, undefined);
+  const hintedHtml = await hinted.text();
+  assert.doesNotMatch(hintedHtml, /review-fab|data-review/);
+  assert.match(hintedHtml, /a very good alternative to <span class="hl">bitly<\/span>/);
+  const withCookie = await (await request('/', { cookie: `review=${REVIEW_HASH}` })).text();
+  assert.doesNotMatch(withCookie, /review-fab|data-review/);
+  assert.match(withCookie, /method="post" action="\/create"/);
+});
+
+test('a correct review key sets a hashed cookie and a wrong key sets nothing', async () => {
+  const ok = await reviewRequest(`/?new=abcd&review=${REVIEW_KEY}`);
+  assert.equal(ok.status, 302);
+  assert.equal(ok.headers.get('Location'), '/?new=abcd');
+  assert.equal(ok.headers.get('Cache-Control'), 'no-store');
+  const cookie = setCookies(ok).review;
+  assert.equal(cookie.value, REVIEW_HASH);
+  assert.match(cookie.line, /HttpOnly/);
+  assert.match(cookie.line, /Secure/);
+  assert.match(cookie.line, /SameSite=Lax/);
+  assert.equal(setCookies(ok).owner, undefined);
+
+  const bad = await reviewRequest('/links?review=not-the-key');
+  assert.equal(bad.status, 200);
+  assert.equal(bad.headers.get('Location'), null);
+  assert.equal(setCookies(bad).review, undefined);
+  const html = await bad.text();
+  assert.doesNotMatch(html, /review-fab/);
+
+  const home = await reviewRequest('/', { cookie: `review=${REVIEW_HASH}` });
+  const page = await home.text();
+  assert.match(page, /<body class="review-on">/);
+  assert.match(page, /review-fab/);
+  assert.match(page, /crosshair/);
+  assert.match(page, /Copy agent link/);
+  assert.doesNotMatch(page, new RegExp(REVIEW_KEY));
+  const csp = home.headers.get('Content-Security-Policy');
+  const nonce = csp.match(/'nonce-([A-Za-z0-9_-]+)'/)[1];
+  const scripts = [...page.matchAll(/<script nonce="[^"]+">([\s\S]*?)<\/script>/g)].map((match) => match[1]);
+  const review = scripts.find((src) => src.includes('review-fab'));
+  assert.ok(review);
+  assert.match(page, new RegExp(`<script nonce="${nonce}">[\\s\\S]*review-fab`));
+  assert.doesNotMatch(review, /gtag|\/create/);
+  assert.match(page, /<h1>a very good alternative to <span class="hl">bitly<\/span><\/h1>/);
+  assert.match(page, /class="create"/);
+  assert.match(page, /id="name" name="name"/);
+  const made = await reviewRequest('/create', {
+    method: 'POST',
+    body: new URLSearchParams({ url: 'https://example.com/row', name: 'pinned-row' }).toString(),
+    headers: { 'Content-Type': 'application/x-www-form-urlencoded', Origin: ORIGIN },
+  });
+  assert.equal(made.status, 303);
+  const yours = await (
+    await reviewRequest('/links', { cookie: `review=${REVIEW_HASH}; owner=${setCookies(made).owner.value}` })
+  ).text();
+  assert.match(yours, /<h1>Your links<\/h1>/);
+  assert.match(yours, /Use Linki from your AI agent/);
+  assert.match(yours, /class="secondary del"/);
+  assert.match(yours, /review-fab/);
+});
+
+test('a custom name cannot shadow /review or /mcp-review', async () => {
+  for (const name of ['review', 'mcp-review']) {
+    const made = await createLink({ name, url: `https://example.com/${name}` });
+    assert.match(made.code, new RegExp(`^${name}-[a-z2-9]{2}$`));
+    const page = await request(`/${name}`);
+    assert.equal(page.status, 404);
+    assert.equal(page.headers.get('Location'), null);
+    assert.match(await page.text(), /Page not found/);
+    assert.equal((await request(`/${made.code}`)).headers.get('Location'), `https://example.com/${name}`);
+  }
+  const renamed = await createLink({ name: 'keep-me' });
+  const blocked = await post(`/links/${renamed.code}/rename`, { name: 'review' }, { cookie: renamed.cookie });
+  assert.equal(blocked.status, 409);
+  assert.equal((await request('/keep-me')).status, 302);
+  assert.equal((await request('/review')).status, 404);
+
+  assert.equal((await reviewRequest('/review/comments')).status, 401);
+  const mcp = await reviewRequest('/mcp-review/not-the-key', {
+    method: 'POST',
+    body: '{}',
+    headers: { 'Content-Type': 'application/json' },
+  });
+  assert.equal(mcp.status, 401);
+});
+
+test('review comments can be created, listed, replied to, and resolved only with the cookie', async () => {
+  const cookie = await reviewCookie();
+  const linksBefore = await reviewCount('SELECT COUNT(*) AS n FROM links');
+  const denied = await reviewPost('/review/comments', SAMPLE_COMMENT);
+  assert.equal(denied.status, 401);
+  const tampered = await reviewPost('/review/comments', SAMPLE_COMMENT, `review=${'a'.repeat(64)}`);
+  assert.equal(tampered.status, 401);
+
+  const blocked = await reviewPost('/review/comments', SAMPLE_COMMENT, cookie, { Origin: 'https://evil.example' });
+  assert.equal(blocked.status, 403);
+  assert.equal(await reviewCount('SELECT COUNT(*) AS n FROM review_comments'), 0);
+
+  const created = await reviewPost('/review/comments', SAMPLE_COMMENT, cookie);
+  assert.equal(created.status, 201);
+  assert.equal(created.headers.get('Cache-Control'), 'no-store');
+  const comment = await created.json();
+  assert.equal(comment.path, '/');
+  assert.equal(comment.status, 'open');
+  assert.deepEqual(comment.mentions, ['Claude']);
+  assert.equal(comment.author, 'Kiet');
+  assert.equal(comment.viewport_w, 1280);
+  assert.equal(await reviewCount('SELECT COUNT(*) AS n FROM links'), linksBefore);
+
+  const onLinks = await reviewPost('/review/comments', {
+    ...SAMPLE_COMMENT,
+    path: '/links',
+    selector: 'button.del',
+    element_desc: 'button "Delete" in row 2 of Your links',
+    body: 'Move Delete away from Copy. Email kiet@example.com stays plain.',
+    author: '',
+  }, cookie);
+  assert.equal(onLinks.status, 201);
+  const second = await onLinks.json();
+  assert.equal(second.author, 'Kiet');
+  assert.deepEqual(second.mentions, []);
+  assert.ok(second.id > comment.id);
+
+  const tooLong = await reviewPost('/review/comments', { ...SAMPLE_COMMENT, body: 'x'.repeat(4001) }, cookie);
+  assert.equal(tooLong.status, 400);
+
+  const listed = await reviewRequest('/review/comments?path=/', { cookie });
+  const pageComments = await listed.json();
+  assert.deepEqual(pageComments.comments.map((row) => row.id), [comment.id]);
+  const encoded = await reviewRequest('/review/comments?path=%2Flinks', { cookie });
+  assert.deepEqual((await encoded.json()).comments.map((row) => row.id), [second.id]);
+
+  const reply = await reviewPost(`/review/comments/${comment.id}/reply`, { body: 'I will look.', author: 'Kiet' }, cookie);
+  assert.equal(reply.status, 201);
+  const got = await reviewRequest(`/review/comments?path=${encodeURIComponent('/')}`, { cookie });
+  const withReply = (await got.json()).comments[0];
+  assert.equal(withReply.replies.length, 1);
+  assert.equal(withReply.replies[0].body, 'I will look.');
+  const updatedAt = withReply.updated_at;
+
+  const readOnly = await reviewRequest(`/review/comments/${comment.id}`, { cookie });
+  assert.equal(readOnly.status, 405);
+  assert.equal((await reviewRequest(`/review/comments?path=/`, { cookie }).then((res) => res.json())).comments[0].updated_at, updatedAt);
+
+  const resolved = await reviewPost(`/review/comments/${comment.id}`, { status: 'fixed', pr_url: 'https://example.com/should-be-ignored' }, cookie);
+  assert.equal(resolved.status, 200);
+  const fixed = await resolved.json();
+  assert.equal(fixed.status, 'fixed');
+  assert.equal(fixed.pr_url, null);
+
+  const missing = await reviewPost('/review/comments/999999/reply', { body: 'nope', author: 'Kiet' }, cookie);
+  assert.equal(missing.status, 404);
+});
+
+test('the agent link is markdown and JSON, and a wrong key is rejected', async () => {
+  const wrong = await reviewRequest('/review/agent/not-the-key');
+  assert.equal(wrong.status, 401);
+  assert.equal(wrong.headers.get('Cache-Control'), 'no-store');
+  assert.match(await wrong.text(), /Unauthorized/);
+
+  const res = await reviewRequest(`/review/agent/${REVIEW_KEY}?status=open&mention=Claude`);
+  assert.equal(res.headers.get('Content-Type'), 'text/markdown; charset=utf-8');
+  const browser = await reviewRequest(`/review/agent/${REVIEW_KEY}`, { headers: { 'Sec-Fetch-Dest': 'document' } });
+  assert.equal(browser.headers.get('Content-Type'), 'text/plain; charset=utf-8');
+  assert.match(await browser.text(), /# Linki review/);
+  assert.equal(res.headers.get('Cache-Control'), 'no-store');
+  const markdown = await res.text();
+  assert.match(markdown, /https:\/\/github.com\/kiethuynhvn333\/linki/);
+  assert.match(markdown, /Never push to main/);
+  assert.match(markdown, /Kiet approves merges/);
+  assert.doesNotMatch(markdown, /The hero is cramped/);
+  assert.doesNotMatch(markdown, new RegExp(REVIEW_KEY));
+
+  const openLinks = await reviewRequest(`/review/agent/${REVIEW_KEY}?status=open&path=/links`);
+  const openMarkdown = await openLinks.text();
+  assert.match(openMarkdown, /button "Delete" in row 2 of Your links/);
+  assert.match(openMarkdown, /Viewport: 1280px/);
+  assert.doesNotMatch(openMarkdown, /The hero is cramped/);
+
+  const all = await (await reviewRequest(`/review/agent/${REVIEW_KEY}?format=json`)).json();
+  assert.equal(all.repo, 'https://github.com/kiethuynhvn333/linki');
+  assert.deepEqual(all.comments.map((row) => row.path), ['/links', '/']);
+  assert.equal(all.comments[1].replies[0].body, 'I will look.');
+  assert.equal(all.comments[1].status, 'fixed');
+
+  const before = await reviewDb.prepare('SELECT updated_at FROM review_comments WHERE path = ?').bind('/links').first();
+  await reviewRequest(`/review/agent/${REVIEW_KEY}`);
+  const after = await reviewDb.prepare('SELECT updated_at FROM review_comments WHERE path = ?').bind('/links').first();
+  assert.equal(after.updated_at, before.updated_at);
+});
+
+test('agents can update a comment over MCP and over plain POST without an Origin check', async () => {
+  const cookie = await reviewCookie();
+  const created = await (await reviewPost('/review/comments', {
+    ...SAMPLE_COMMENT,
+    path: '/links',
+    body: 'Chart labels overlap. @Linki',
+  }, cookie)).json();
+
+  const denied = await reviewRequest('/mcp-review/not-the-key', {
+    method: 'POST',
+    body: JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'tools/list' }),
+    headers: { 'Content-Type': 'application/json' },
+  });
+  assert.equal(denied.status, 401);
+
+  const listed = await reviewRequest(`/mcp-review/${REVIEW_KEY}`, {
+    method: 'POST',
+    body: JSON.stringify({ jsonrpc: '2.0', id: 7, method: 'tools/list' }),
+    headers: { 'Content-Type': 'application/json', Origin: 'https://claude.ai' },
+  });
+  assert.equal(listed.status, 200);
+  assert.equal(listed.headers.get('Cache-Control'), 'no-store');
+  const tools = (await listed.json()).result.tools.map((tool) => tool.name);
+  assert.deepEqual(tools, ['list_comments', 'get_comment', 'update_comment', 'reply']);
+
+  const pr = 'https://github.com/kiethuynhvn333/linki/pull/12';
+  const updated = await reviewRequest(`/mcp-review/${REVIEW_KEY}`, {
+    method: 'POST',
+    body: JSON.stringify({
+      jsonrpc: '2.0',
+      id: 8,
+      method: 'tools/call',
+      params: { name: 'update_comment', arguments: { id: created.id, status: 'in_progress', note: 'On a branch.', assignee: 'Claude' } },
+    }),
+    headers: { 'Content-Type': 'application/json' },
+  });
+  const progress = JSON.parse((await updated.json()).result.content[0].text);
+  assert.equal(progress.status, 'in_progress');
+  assert.equal(progress.assignee, 'Claude');
+
+  const plain = await reviewRequest(`/review/agent/${REVIEW_KEY}/comments/${created.id}`, {
+    method: 'POST',
+    body: JSON.stringify({ status: 'fixed', pr_url: pr, note: 'Opened the pull request.' }),
+    headers: { 'Content-Type': 'application/json', Origin: 'https://evil.example' },
+  });
+  assert.equal(plain.status, 200);
+  const fixed = await plain.json();
+  assert.equal(fixed.status, 'fixed');
+  assert.equal(fixed.pr_url, pr);
+  assert.equal(fixed.status_note, 'Opened the pull request.');
+
+  const agentReply = await reviewRequest(`/review/agent/${REVIEW_KEY}/comments/${created.id}/reply`, {
+    method: 'POST',
+    body: JSON.stringify({ body: 'Marked fixed.', author: 'Claude' }),
+    headers: { 'Content-Type': 'application/json', Origin: 'https://evil.example' },
+  });
+  assert.equal(agentReply.status, 201);
+
+  const filtered = await (await reviewRequest(`/review/agent/${REVIEW_KEY}?status=fixed&mention=Linki&path=/links&format=json`)).json();
+  assert.equal(filtered.comments.length, 1);
+  assert.equal(filtered.comments[0].id, created.id);
+  assert.equal(filtered.comments[0].replies.at(-1).body, 'Marked fixed.');
+
+  const link = await (await reviewRequest('/review/link', { cookie })).json();
+  assert.equal(link.url, `${ORIGIN}/review/agent/${REVIEW_KEY}`);
+  assert.equal(link.text, `${link.url}\nRead this, fix open comments in the Linki repo, open a PR, mark them fixed.`);
+  const linkDenied = await reviewRequest('/review/link');
+  assert.equal(linkDenied.status, 401);
 });

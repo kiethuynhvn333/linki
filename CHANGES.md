@@ -1,3 +1,15 @@
+# Staging review comments (14 Nov 2026)
+
+A Figma-style comment layer for the staging Worker only. It turns on when `REVIEW_KEY` is set, which is a staging secret. With no secret, `/review` routes are the normal 404 page and pages do not gain a comment button, so production is unchanged.
+
+- `GET /?review=<key>` sets an HttpOnly cookie (the SHA-256 of the key) and redirects back without the query. A wrong key sets nothing.
+- With the cookie, each page has a Comment button and a slide-out list. A pin stores the path, a CSS selector, a short description of the element, the click as a percentage of that element, the viewport width, and the note. @mentions are copied into a `mentions` field.
+- The shared inbox is `GET /review/agent/<key>` (markdown, or `?format=json`). Filters: `status`, `mention`, `path`.
+- Agents can update comments at `POST /mcp-review/<key>` (`list_comments`, `get_comment`, `update_comment`, `reply`) or with plain JSON at `POST /review/agent/<key>/comments/<id>` and `.../reply`.
+- Migration `0003_review.sql` adds `review_comments` and `review_replies`. Apply it with `--env staging`. It is additive, so it is harmless if it also runs on production, and the feature still stays off there.
+
+Release on staging only: `npx wrangler d1 migrations apply linki-staging --env staging --remote`, then `npx wrangler secret put REVIEW_KEY --env staging`, then `npx wrangler deploy --env staging`. Do not set `REVIEW_KEY` on production.
+
 # Free custom names and links from agents (14 Nov 2026)
 
 From Kiet's review comments #1, #2 and #3 on staging.
