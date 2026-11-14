@@ -18,6 +18,20 @@ const HOME_TITLE = 'Linki — a very good alternative to bitly';
 const HOME_DESCRIPTION =
   'Paste a long URL, get a short link, and see how many people click it. Free, with no sign-up.';
 const BLOCKED_SCHEME_RE = /^(javascript|data|vbscript|file|mailto|tel|blob|about):/i;
+const REVIEW_BODY_MAX = 4000;
+const REVIEW_LIST_LIMIT = 200;
+const REVIEW_REPLY_CAP = 500;
+const REVIEW_STATUSES = new Set(['open', 'in_progress', 'fixed']);
+const REPO_URL = 'https://github.com/kiethuynhvn333/linki';
+const AGENT_INSTRUCTION = 'Read this, fix open comments in the Linki repo, open a PR, mark them fixed.';
+const REVIEW_ABOUT =
+  'This is the shared comment board for the Linki staging site. Comments are pinned to a page, and any agent can read them here.';
+const REVIEW_WORKFLOW = [
+  'Read one comment.',
+  'Create a branch and open a pull request with the fix. Never push to main.',
+  'Mark the comment in_progress, then fixed, and set pr_url to the pull request.',
+  'Kiet approves merges.',
+];
 
 // The Linki mark: a white cursor on a cobalt tile, with the pink and mustard
 // shapes of the hero card. The header logo and the favicon are this one SVG.
@@ -32,8 +46,22 @@ const worker = {
     try {
       const moved = canonicalRedirect(url);
       if (moved) return moved;
+      // Agent routes carry REVIEW_KEY in the path and skip the Origin check,
+      // the same way /mcp/<token> does. They 404 with everything else when the secret is unset.
+      if (reviewEnabled(env) && isReviewKeyRoute(path)) {
+        return await reviewKeyRoute(request, env, url);
+      }
       if (method === 'POST' && !isMcpApi(path) && !sameOrigin(request, url)) {
-        return messagePage(403, 'Request blocked', 'This form was sent from another site.');
+        if (reviewEnabled(env) || !isReviewPath(path)) {
+          return await messagePage(request, env, 403, 'Request blocked', 'This form was sent from another site.');
+        }
+      }
+      if (method === 'GET' && reviewEnabled(env) && url.searchParams.has('review')) {
+        const granted = await grantReview(env, url);
+        if (granted) return granted;
+      }
+      if (reviewEnabled(env) && isReviewBrowserRoute(path)) {
+        return await reviewBrowserRoute(request, env, url, method);
       }
       if (path === '/' && method === 'GET') return homePage(request, env, url);
       if (path === '/create' && method === 'POST') return createLink(request, env, url);
@@ -49,10 +77,10 @@ const worker = {
       if (del && method === 'POST') return deleteLink(request, env, del[1]);
       const short = path.match(/^\/([a-z0-9]{4,12})$/);
       if (short && method === 'GET') return redirect(request, env, ctx, short[1]);
-      return messagePage(404, 'Page not found', 'There is nothing at this address.');
+      return await messagePage(request, env, 404, 'Page not found', 'There is nothing at this address.');
     } catch (err) {
       console.error(err);
-      return messagePage(500, 'Something went wrong', 'Please try again in a moment.');
+      return await messagePage(request, env, 500, 'Something went wrong', 'Please try again in a moment.');
     }
   },
 
@@ -119,10 +147,10 @@ async function redirect(request, env, ctx, code) {
     .bind(code)
     .first();
   if (!link) {
-    return messagePage(404, 'Link not found', 'This short link does not exist.');
+    return await messagePage(request, env, 404, 'Link not found', 'This short link does not exist.');
   }
   if (link.status !== 'active') {
-    return messagePage(410, 'Link unavailable', 'This short link has been turned off.');
+    return await messagePage(request, env, 410, 'Link unavailable', 'This short link has been turned off.');
   }
   if (shouldCount(request)) {
     ctx.waitUntil(recordClick(request, env, code));
@@ -250,7 +278,7 @@ async function deleteLink(request, env, code) {
       ]);
   if (!results || !results[1].meta.changes) {
     if (json) return jsonResponse({ error: 'This link is not in your list.' }, 404);
-    return messagePage(404, 'Link not found', 'This link is not in your list.');
+    return await messagePage(request, env, 404, 'Link not found', 'This link is not in your list.');
   }
   if (json) return jsonResponse({ ok: true }, 200);
   return new Response(null, {
@@ -405,6 +433,7 @@ async function homePage(request, env, url, state = {}) {
     status,
     linkCreated: Boolean(created),
     index: status === 200 && !url.search,
+    review: await reviewOn(request, env),
   });
 }
 
@@ -425,7 +454,12 @@ async function linksPage(request, env, url) {
         : '<div class="empty"><p>No links yet</p><a class="button primary" href="/">Create your first link</a></div>'
     }
     ${agentSection(mcp, url)}`;
-  return page('Your links', body, { owner, url, mcpToken: mcp.token || undefined });
+  return page('Your links', body, {
+    owner,
+    url,
+    mcpToken: mcp.token || undefined,
+    review: await reviewOn(request, env),
+  });
 }
 
 function agentSection(mcp, url) {
@@ -465,7 +499,7 @@ async function detailPage(request, env, url, code) {
         .bind(code, owner.id)
         .first();
   if (!link) {
-    return messagePage(404, 'Link not found', 'This link is not in your list.');
+    return await messagePage(request, env, 404, 'Link not found', 'This link is not in your list.');
   }
 
   // Days are counted in the visitor's time zone (see tzOffset). The query only
@@ -527,7 +561,7 @@ async function detailPage(request, env, url, code) {
       <p>Deleting stops the short link and removes its click history.</p>
       <button class="secondary danger" type="submit">Delete link</button>
     </form>`;
-  return page(link.label || link.code, body, { owner, url });
+  return page(link.label || link.code, body, { owner, url, review: await reviewOn(request, env) });
 }
 
 async function listLinks(env, ownerId, limit) {
@@ -568,9 +602,9 @@ function linkList(links, origin, offset = 0) {
     .join('')}</ul>`;
 }
 
-function messagePage(status, title, text) {
+async function messagePage(request, env, status, title, text) {
   const body = `<section class="msg"><p class="status">${status}</p><h1>${esc(title)}</h1><p class="muted">${esc(text)}</p><a class="button secondary" href="/">Go to the homepage</a></section>`;
-  return page(title, body, { status });
+  return page(title, body, { status, review: await reviewOn(request, env) });
 }
 
 function gaHead(linkCreated, nonce) {
@@ -614,7 +648,7 @@ function contentSecurityPolicy(nonce) {
   ].join('; ');
 }
 
-function page(title, body, { owner, url, status = 200, linkCreated = false, mcpToken, index = false } = {}) {
+function page(title, body, { owner, url, status = 200, linkCreated = false, mcpToken, index = false, review = false } = {}) {
   const nonce = base64url(crypto.getRandomValues(new Uint8Array(16)));
   const fullTitle = title.startsWith('Linki —') ? title : `${title} — Linki`;
   const html = `<!doctype html>
@@ -628,13 +662,13 @@ ${seoHead(index, url)}
 ${gaHead(linkCreated, nonce)}<link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
 <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Bricolage+Grotesque:opsz,wght@12..96,700;12..96,800&family=Inter:wght@400;500;600;700&family=Space+Mono:wght@400;700&display=swap">
-<style>${CSS}</style>
+<style>${CSS}${review ? REVIEW_CSS : ''}</style>
 </head>
-<body>
+<body${review ? ' class="review-on"' : ''}>
 <header><a class="brand" href="/">${LOGO_SVG.replace('<svg ', '<svg aria-hidden="true" ')}Linki</a><nav><a class="pill" href="/links"${url && url.pathname.startsWith('/links') ? ' aria-current="page"' : ''}>Your links</a></nav></header>
 <main class="panel">${body}</main>
 <script nonce="${nonce}">${JS}</script>
-</body>
+${review ? `<script nonce="${nonce}">${REVIEW_JS}</script>\n` : ''}</body>
 </html>`;
   const headers = new Headers({
     'Content-Type': 'text/html; charset=utf-8',
@@ -801,7 +835,9 @@ async function resetMcp(request, env, url) {
   }
   const owner = getOwner(request);
   if (owner.isNew) {
-    return messagePage(
+    return await messagePage(
+      request,
+      env,
       401,
       'Reset unavailable',
       'Open Your links in this browser, then reset the connector.'
@@ -843,34 +879,41 @@ async function ownerForMcpToken(env, token) {
   return row ? row.owner_id : null;
 }
 
-async function mcpPost(request, env, url, ownerId, cors) {
+async function readRpcRequest(request, cors) {
   const declared = Number(request.headers.get('Content-Length') || 0);
-  if (declared > 65536) return rpcError(null, -32700, 'Parse error', cors, 400);
+  if (declared > 65536) return { response: rpcError(null, -32700, 'Parse error', cors, 400) };
   const raw = await request.text();
-  if (raw.length > 65536) return rpcError(null, -32700, 'Parse error', cors, 400);
+  if (raw.length > 65536) return { response: rpcError(null, -32700, 'Parse error', cors, 400) };
   let msg;
   try {
     msg = JSON.parse(raw);
   } catch {
-    return rpcError(null, -32700, 'Parse error', cors, 400);
+    return { response: rpcError(null, -32700, 'Parse error', cors, 400) };
   }
   if (!msg || typeof msg !== 'object' || Array.isArray(msg)) {
-    return rpcError(null, -32600, 'Invalid Request', cors, 400);
+    return { response: rpcError(null, -32600, 'Invalid Request', cors, 400) };
   }
   const hasId = Object.prototype.hasOwnProperty.call(msg, 'id');
   const id = hasId ? msg.id : null;
   if (msg.jsonrpc !== '2.0' || typeof msg.method !== 'string') {
-    return rpcError(id, -32600, 'Invalid Request', cors, 400);
+    return { response: rpcError(id, -32600, 'Invalid Request', cors, 400) };
   }
   if (hasId && id !== null && typeof id !== 'string' && typeof id !== 'number') {
-    return rpcError(null, -32600, 'Invalid Request', cors, 400);
+    return { response: rpcError(null, -32600, 'Invalid Request', cors, 400) };
   }
   if (!hasId) {
     if (msg.method.startsWith('notifications/')) {
-      return new Response(null, { status: 202, headers: cors });
+      return { response: new Response(null, { status: 202, headers: cors }) };
     }
-    return rpcError(null, -32600, 'Invalid Request', cors, 400);
+    return { response: rpcError(null, -32600, 'Invalid Request', cors, 400) };
   }
+  return { msg, id };
+}
+
+async function mcpPost(request, env, url, ownerId, cors) {
+  const parsed = await readRpcRequest(request, cors);
+  if (parsed.response) return parsed.response;
+  const { msg, id } = parsed;
   if (msg.method === 'initialize') return rpcResult(id, initializeResult(msg.params), cors);
   if (msg.method === 'ping') return rpcResult(id, {}, cors);
   if (msg.method === 'tools/list') return rpcResult(id, { tools: MCP_TOOLS }, cors);
@@ -894,20 +937,24 @@ function initializeResult(params) {
   };
 }
 
-async function callTool(env, origin, ownerId, params) {
+function readToolCall(params) {
   if (!params || typeof params.name !== 'string') {
     return { rpcError: { code: -32602, message: 'Invalid params' } };
   }
-  let args = {};
   if (params.arguments !== undefined) {
     if (!params.arguments || typeof params.arguments !== 'object' || Array.isArray(params.arguments)) {
       return { rpcError: { code: -32602, message: 'Invalid params' } };
     }
-    args = params.arguments;
   }
-  if (params.name === 'list_links') return toolText(await reportLinks(env, origin, ownerId));
-  if (params.name === 'link_report') return reportLink(env, origin, ownerId, args);
-  if (params.name === 'clicks_summary') return reportSummary(env, origin, ownerId, args);
+  return { name: params.name, args: params.arguments || {} };
+}
+
+async function callTool(env, origin, ownerId, params) {
+  const call = readToolCall(params);
+  if (call.rpcError) return call;
+  if (call.name === 'list_links') return toolText(await reportLinks(env, origin, ownerId));
+  if (call.name === 'link_report') return reportLink(env, origin, ownerId, call.args);
+  if (call.name === 'clicks_summary') return reportSummary(env, origin, ownerId, call.args);
   return { rpcError: { code: -32602, message: 'Unknown tool' } };
 }
 
@@ -1127,6 +1174,877 @@ function formatDay(dayNumber) {
   return `${d.getUTCDate()} ${MONTHS[d.getUTCMonth()]}`;
 }
 
+// ---------- review (staging only, REVIEW_KEY) ----------
+
+function reviewEnabled(env) {
+  return typeof env.REVIEW_KEY === 'string' && env.REVIEW_KEY.length > 0;
+}
+
+function isReviewPath(path) {
+  return (
+    path === '/review' ||
+    path.startsWith('/review/') ||
+    path === '/mcp-review' ||
+    path.startsWith('/mcp-review/')
+  );
+}
+
+function isReviewKeyRoute(path) {
+  return (
+    path.startsWith('/mcp-review/') ||
+    /^\/review\/agent\/[^/]+\/comments\/\d+(?:\/reply)?$/.test(path)
+  );
+}
+
+function isReviewBrowserRoute(path) {
+  return (
+    path === '/review/comments' ||
+    path === '/review/link' ||
+    /^\/review\/comments\/\d+(?:\/reply)?$/.test(path) ||
+    /^\/review\/agent\/[^/]+$/.test(path)
+  );
+}
+
+// Compare two strings without returning on the first difference.
+function timingSafeEqual(a, b) {
+  const left = String(a);
+  const right = String(b);
+  const length = Math.max(left.length, right.length);
+  let diff = left.length ^ right.length;
+  for (let i = 0; i < length; i++) {
+    const lc = left.charCodeAt(i);
+    const rc = right.charCodeAt(i);
+    diff |= (Number.isNaN(lc) ? 0 : lc) ^ (Number.isNaN(rc) ? 0 : rc);
+  }
+  return diff === 0;
+}
+
+async function keysMatch(presented, expected) {
+  const withinLimit = typeof presented === 'string' && presented.length > 0 && presented.length <= 500;
+  const got = await sha256(withinLimit ? presented : 'nope');
+  const want = await sha256(String(expected));
+  const equal = timingSafeEqual(got, want);
+  return withinLimit && equal;
+}
+
+async function reviewCookieValid(request, env) {
+  if (!reviewEnabled(env)) return false;
+  const presented = cookieValue(request, 'review');
+  const expected = await sha256(env.REVIEW_KEY);
+  const shapeOk = /^[a-f0-9]{64}$/.test(presented);
+  const equal = timingSafeEqual(shapeOk ? presented : expected, expected);
+  return shapeOk && equal;
+}
+
+function reviewOn(request, env) {
+  return reviewCookieValid(request, env);
+}
+
+function setReviewCookie(headers, hash) {
+  headers.append(
+    'Set-Cookie',
+    `review=${hash}; Path=/; Max-Age=${OWNER_COOKIE_MAX_AGE}; HttpOnly; SameSite=Lax; Secure`
+  );
+}
+
+async function grantReview(env, url) {
+  const presented = url.searchParams.get('review');
+  if (presented == null || !(await keysMatch(presented, env.REVIEW_KEY))) return null;
+  const params = new URLSearchParams(url.searchParams);
+  params.delete('review');
+  const search = params.toString();
+  const headers = new Headers({
+    Location: `${url.pathname}${search ? `?${search}` : ''}`,
+    'Cache-Control': 'no-store',
+    'X-Robots-Tag': 'noindex, nofollow',
+    'Referrer-Policy': 'no-referrer',
+  });
+  setReviewCookie(headers, await sha256(env.REVIEW_KEY));
+  return new Response(null, { status: 302, headers });
+}
+
+function withReviewHeaders(response, extra) {
+  response.headers.set('Cache-Control', 'no-store');
+  response.headers.set('X-Robots-Tag', 'noindex, nofollow');
+  response.headers.set('Referrer-Policy', 'no-referrer');
+  if (extra) {
+    for (const [key, value] of Object.entries(extra)) response.headers.set(key, value);
+  }
+  return response;
+}
+
+function reviewText(body, status, contentType, extra) {
+  return withReviewHeaders(
+    new Response(body, {
+      status,
+      headers: {
+        'Content-Type': contentType,
+        'X-Content-Type-Options': 'nosniff',
+      },
+    }),
+    extra
+  );
+}
+
+function reviewMarkdownResponse(body) {
+  return withReviewHeaders(
+    new Response(body, {
+      status: 200,
+      headers: {
+        'Content-Type': 'text/markdown; charset=utf-8',
+        'Content-Disposition': 'inline',
+      },
+    })
+  );
+}
+
+function methodNotAllowed(allow) {
+  return withReviewHeaders(jsonResponse({ error: 'Method not allowed' }, 405), { Allow: allow });
+}
+
+async function reviewKeyRoute(request, env, url) {
+  if (url.pathname.startsWith('/mcp-review/')) return reviewMcpEndpoint(request, env, url);
+  return reviewAgentPost(request, env, url);
+}
+
+async function reviewBrowserRoute(request, env, url, method) {
+  const agent = url.pathname.match(/^\/review\/agent\/([^/]+)$/);
+  if (agent) return reviewAgentRead(request, env, url, agent[1], method);
+
+  if (!(await reviewCookieValid(request, env))) {
+    return withReviewHeaders(jsonResponse({ error: 'Unauthorized' }, 401));
+  }
+  if (url.pathname === '/review/link') {
+    if (method !== 'GET') return methodNotAllowed('GET');
+    return withReviewHeaders(jsonResponse(reviewLinkPayload(url, env)));
+  }
+  if (url.pathname === '/review/comments') {
+    if (method === 'GET') return listReviewRequest(env, url);
+    if (method === 'POST') return createReviewRequest(request, env, url);
+    return methodNotAllowed('GET, POST');
+  }
+  const reply = url.pathname.match(/^\/review\/comments\/(\d+)\/reply$/);
+  if (reply) {
+    if (method !== 'POST') return methodNotAllowed('POST');
+    const id = idFromParam(reply[1]);
+    if (!id) return withReviewHeaders(jsonResponse({ error: 'Comment not found.' }, 404));
+    return createReviewReplyRequest(request, env, id);
+  }
+  const one = url.pathname.match(/^\/review\/comments\/(\d+)$/);
+  if (one) {
+    if (method !== 'POST') return methodNotAllowed('POST');
+    const id = idFromParam(one[1]);
+    if (!id) return withReviewHeaders(jsonResponse({ error: 'Comment not found.' }, 404));
+    return updateReviewFromBrowser(request, env, url, id);
+  }
+  return messagePage(request, env, 404, 'Page not found', 'There is nothing at this address.');
+}
+
+function reviewLinkPayload(url, env) {
+  const agentUrl = `${url.origin}/review/agent/${env.REVIEW_KEY}`;
+  return { url: agentUrl, text: `${agentUrl}\n${AGENT_INSTRUCTION}` };
+}
+
+async function reviewAgentRead(request, env, url, rawKey, method) {
+  if (!(await keysMatch(decodeKey(rawKey), env.REVIEW_KEY))) {
+    return reviewText('Unauthorized\n', 401, 'text/plain; charset=utf-8');
+  }
+  if (method !== 'GET') return reviewText('Method not allowed\n', 405, 'text/plain; charset=utf-8', { Allow: 'GET' });
+  const filters = filtersFromSearch(url);
+  if (filters.error) return reviewText(`${filters.error}\n`, 400, 'text/plain; charset=utf-8');
+  const { comments, truncated } = await listReviewComments(env, url.origin, filters);
+  const format = url.searchParams.get('format');
+  if (format === 'json') {
+    return withReviewHeaders(
+      jsonResponse({
+        about: REVIEW_ABOUT,
+        repo: REPO_URL,
+        workflow: REVIEW_WORKFLOW,
+        filters: { status: filters.status, path: filters.path, mention: filters.mention },
+        truncated,
+        comments,
+      })
+    );
+  }
+  if (format) return reviewText('format must be json.\n', 400, 'text/plain; charset=utf-8');
+  // Agents get text/markdown. A browser address bar sends Sec-Fetch-Dest: document
+  // and would download that type, so the same bytes are shown as plain text.
+  const markdown = reviewMarkdown(comments, truncated);
+  if (request.headers.get('Sec-Fetch-Dest') === 'document') {
+    return reviewText(markdown, 200, 'text/plain; charset=utf-8');
+  }
+  return reviewMarkdownResponse(markdown);
+}
+
+async function reviewAgentPost(request, env, url) {
+  const match = url.pathname.match(/^\/review\/agent\/([^/]+)\/comments\/(\d+)(\/reply)?$/);
+  if (!match) return reviewText('Not found\n', 404, 'text/plain; charset=utf-8');
+  if (!(await keysMatch(decodeKey(match[1]), env.REVIEW_KEY))) {
+    return withReviewHeaders(jsonResponse({ error: 'Unauthorized' }, 401));
+  }
+  if (request.method !== 'POST') return methodNotAllowed('POST');
+  const id = idFromParam(match[2]);
+  if (!id) return withReviewHeaders(jsonResponse({ error: 'Comment not found.' }, 404));
+  if (match[3]) return createReviewReplyRequest(request, env, id);
+  return updateReviewFromAgent(request, env, url, id);
+}
+
+function decodeKey(raw) {
+  try {
+    return decodeURIComponent(raw);
+  } catch {
+    return '';
+  }
+}
+
+async function listReviewRequest(env, url) {
+  const filters = filtersFromSearch(url);
+  if (filters.error) return withReviewHeaders(jsonResponse({ error: filters.error }, 400));
+  const { comments } = await listReviewComments(env, url.origin, filters);
+  return withReviewHeaders(jsonResponse({ comments }));
+}
+
+async function createReviewRequest(request, env, url) {
+  const body = await readJsonObject(request);
+  if (body.error) return withReviewHeaders(jsonResponse({ error: body.error }, 400));
+  const parsed = validateNewComment(body.data, request);
+  if (parsed.error) return withReviewHeaders(jsonResponse({ error: parsed.error }, 400));
+  const comment = await insertReviewComment(env, parsed.value, url.origin);
+  return withReviewHeaders(jsonResponse(comment, 201));
+}
+
+async function updateReviewFromBrowser(request, env, url, id) {
+  const body = await readJsonObject(request);
+  if (body.error) return withReviewHeaders(jsonResponse({ error: body.error }, 400));
+  // The browser can change status only. Agents set the pull request fields.
+  const parsed = validateReviewUpdate({ status: body.data.status });
+  if (parsed.error) return withReviewHeaders(jsonResponse({ error: parsed.error }, 400));
+  const comment = await updateReviewComment(env, id, parsed.patch, url.origin);
+  if (!comment) return withReviewHeaders(jsonResponse({ error: 'Comment not found.' }, 404));
+  return withReviewHeaders(jsonResponse(comment));
+}
+
+async function updateReviewFromAgent(request, env, url, id) {
+  const body = await readJsonObject(request);
+  if (body.error) return withReviewHeaders(jsonResponse({ error: body.error }, 400));
+  const parsed = validateReviewUpdate(body.data);
+  if (parsed.error) return withReviewHeaders(jsonResponse({ error: parsed.error }, 400));
+  const comment = await updateReviewComment(env, id, parsed.patch, url.origin);
+  if (!comment) return withReviewHeaders(jsonResponse({ error: 'Comment not found.' }, 404));
+  return withReviewHeaders(jsonResponse(comment));
+}
+
+async function createReviewReplyRequest(request, env, id) {
+  const body = await readJsonObject(request);
+  if (body.error) return withReviewHeaders(jsonResponse({ error: body.error }, 400));
+  const parsed = validateReviewReply(body.data);
+  if (parsed.error) return withReviewHeaders(jsonResponse({ error: parsed.error }, 400));
+  const reply = await addReviewReply(env, id, parsed);
+  if (!reply) return withReviewHeaders(jsonResponse({ error: 'Comment not found.' }, 404));
+  return withReviewHeaders(jsonResponse(reply, 201));
+}
+
+async function readJsonObject(request) {
+  const declared = Number(request.headers.get('Content-Length') || 0);
+  if (Number.isFinite(declared) && declared > 20000) return { error: 'That request is too large.' };
+  let raw = '';
+  try {
+    raw = await request.text();
+  } catch {
+    return { error: 'That request could not be read.' };
+  }
+  if (raw.length > 20000) return { error: 'That request is too large.' };
+  try {
+    const data = JSON.parse(raw);
+    if (!data || typeof data !== 'object' || Array.isArray(data)) return { error: 'Send a JSON object.' };
+    return { data };
+  } catch {
+    return { error: 'That request could not be read.' };
+  }
+}
+
+function filtersFromSearch(url) {
+  return parseReviewFilters({
+    status: url.searchParams.get('status') || undefined,
+    path: url.searchParams.get('path') || undefined,
+    mention: url.searchParams.get('mention') || undefined,
+  });
+}
+
+function parseReviewFilters(input) {
+  const source = input || {};
+  let status = source.status;
+  let path = source.path;
+  let mention = source.mention;
+  if (status === '' || status == null) status = undefined;
+  if (path === '' || path == null) path = undefined;
+  if (mention === '' || mention == null) mention = undefined;
+  if (status !== undefined) {
+    if (typeof status !== 'string' || !REVIEW_STATUSES.has(status)) {
+      return { error: 'Status must be open, in_progress, or fixed.' };
+    }
+  }
+  if (path !== undefined) {
+    const cleaned = cleanPath(path);
+    if (!cleaned) return { error: 'That page path is not valid.' };
+    path = cleaned;
+  }
+  if (mention !== undefined) {
+    if (typeof mention !== 'string') return { error: 'That mention is not valid.' };
+    mention = mention.trim().replace(/^@/, '');
+    if (!/^[A-Za-z][A-Za-z0-9_-]{0,30}$/.test(mention)) return { error: 'That mention is not valid.' };
+  }
+  return { status: status || null, path: path || null, mention: mention || null };
+}
+
+function cleanPath(value) {
+  if (typeof value !== 'string') return null;
+  const path = value.trim();
+  if (!path.startsWith('/') || path.length > 500) return null;
+  if (/[\s?#\\]/.test(path) || path.includes('//')) return null;
+  return path;
+}
+
+function cleanSelector(value) {
+  if (typeof value !== 'string') return null;
+  const selector = value.trim();
+  if (!selector || selector.length > 500 || /[\r\n]/.test(selector)) return null;
+  return selector;
+}
+
+function cleanLine(value, max) {
+  if (typeof value !== 'string') return null;
+  const text = value.replace(/[\r\n]+/g, ' ').trim();
+  if (!text || text.length > max) return null;
+  return text;
+}
+
+function cleanPct(value) {
+  const n =
+    typeof value === 'number'
+      ? value
+      : typeof value === 'string' && /^-?\d+(\.\d+)?$/.test(value)
+        ? Number(value)
+        : NaN;
+  if (!Number.isFinite(n) || n < 0 || n > 100) return null;
+  return Math.round(n * 10) / 10;
+}
+
+function cleanViewport(value) {
+  const n =
+    typeof value === 'number' ? value : typeof value === 'string' && /^\d+$/.test(value) ? Number(value) : NaN;
+  if (!Number.isInteger(n) || n < 1 || n > 8192) return null;
+  return n;
+}
+
+function cleanMultiline(value, max, emptyError) {
+  if (typeof value !== 'string') return { error: 'That text is not valid.' };
+  const text = value.replace(/\r\n/g, '\n').trim();
+  if (!text) return { error: emptyError };
+  if (text.length > max) return { error: 'That text is too long.' };
+  return { value: text };
+}
+
+function cleanAuthor(value) {
+  if (value == null || value === '') return { value: 'Kiet' };
+  if (typeof value !== 'string') return { error: 'That name is not valid.' };
+  const author = value.replace(/\s+/g, ' ').trim();
+  if (!author) return { value: 'Kiet' };
+  if (author.length > 80) return { error: 'That name is too long.' };
+  return { value: author };
+}
+
+function cleanNote(value) {
+  if (value == null || value === '') return { value: null };
+  if (typeof value !== 'string') return { error: 'That note is not valid.' };
+  const note = value.replace(/\r\n/g, '\n').trim();
+  if (note.length > 1000) return { error: 'That note is too long.' };
+  return { value: note || null };
+}
+
+function cleanAssignee(value) {
+  if (value == null || value === '') return { value: null };
+  if (typeof value !== 'string') return { error: 'That assignee is not valid.' };
+  const assignee = value.replace(/\s+/g, ' ').trim();
+  if (!assignee) return { value: null };
+  if (assignee.length > 80) return { error: 'That assignee is too long.' };
+  return { value: assignee };
+}
+
+function cleanOptionalUrl(value) {
+  if (value == null || value === '') return { value: null };
+  if (typeof value !== 'string' || value.length > 500) return { error: 'That pull request URL is not valid.' };
+  let parsed;
+  try {
+    parsed = new URL(value);
+  } catch {
+    return { error: 'That pull request URL is not valid.' };
+  }
+  if ((parsed.protocol !== 'http:' && parsed.protocol !== 'https:') || parsed.username || parsed.password) {
+    return { error: 'That pull request URL is not valid.' };
+  }
+  return { value: parsed.href };
+}
+
+function cleanUserAgent(request) {
+  return (request.headers.get('User-Agent') || '').replace(/[\r\n]+/g, ' ').slice(0, 300);
+}
+
+function mentionsField(text) {
+  const names = [];
+  const re = /(^|[^A-Za-z0-9_])@([A-Za-z][A-Za-z0-9_-]{0,30})/g;
+  let match;
+  while ((match = re.exec(text))) {
+    if (!names.includes(match[2])) names.push(match[2]);
+  }
+  return names.length ? `,${names.join(',')},` : '';
+}
+
+function mentionsList(stored) {
+  return String(stored || '')
+    .split(',')
+    .map((part) => part.trim())
+    .filter(Boolean);
+}
+
+function validateNewComment(input, request) {
+  const path = cleanPath(input.path);
+  if (!path) return { error: 'That page path is not valid.' };
+  const selector = cleanSelector(input.selector);
+  if (!selector) return { error: 'That element selector is not valid.' };
+  const element = cleanLine(input.element_desc, 200);
+  if (!element) return { error: 'That element description is not valid.' };
+  const x = cleanPct(input.x_pct);
+  const y = cleanPct(input.y_pct);
+  if (x == null || y == null) return { error: 'That click position is not valid.' };
+  const viewport = cleanViewport(input.viewport_w);
+  if (viewport == null) return { error: 'That viewport width is not valid.' };
+  const body = cleanMultiline(input.body, REVIEW_BODY_MAX, 'Write a comment first.');
+  if (body.error) return body;
+  const author = cleanAuthor(input.author);
+  if (author.error) return author;
+  return {
+    value: {
+      path,
+      selector,
+      element_desc: element,
+      x_pct: x,
+      y_pct: y,
+      viewport_w: viewport,
+      user_agent: cleanUserAgent(request),
+      author: author.value,
+      body: body.value,
+      mentions: mentionsField(body.value),
+    },
+  };
+}
+
+function validateReviewUpdate(input) {
+  if (!input || typeof input !== 'object') return { error: 'Send a JSON object.' };
+  if (!REVIEW_STATUSES.has(input.status)) return { error: 'Status must be open, in_progress, or fixed.' };
+  const patch = { status: input.status };
+  if ('note' in input) {
+    const note = cleanNote(input.note);
+    if (note.error) return note;
+    patch.note = note.value;
+  }
+  if ('pr_url' in input) {
+    const pr = cleanOptionalUrl(input.pr_url);
+    if (pr.error) return pr;
+    patch.pr_url = pr.value;
+  }
+  if ('assignee' in input) {
+    const assignee = cleanAssignee(input.assignee);
+    if (assignee.error) return assignee;
+    patch.assignee = assignee.value;
+  }
+  return { patch };
+}
+
+function validateReviewReply(input) {
+  if (!input || typeof input !== 'object') return { error: 'Send a JSON object.' };
+  const body = cleanMultiline(input.body, REVIEW_BODY_MAX, 'Write a reply first.');
+  if (body.error) return body;
+  const author = cleanAuthor(input.author);
+  if (author.error) return author;
+  return { body: body.value, author: author.value };
+}
+
+function idFromParam(raw) {
+  if (!/^[1-9]\d{0,15}$/.test(String(raw))) return null;
+  const n = Number(raw);
+  return Number.isSafeInteger(n) ? n : null;
+}
+
+function idValue(value) {
+  if (typeof value === 'number' && Number.isSafeInteger(value) && value >= 1) return value;
+  if (typeof value === 'string' && /^[1-9]\d{0,15}$/.test(value)) {
+    const n = Number(value);
+    if (Number.isSafeInteger(n)) return n;
+  }
+  return null;
+}
+
+async function insertReviewComment(env, value, origin) {
+  const now = Math.floor(Date.now() / 1000);
+  const inserted = await env.DB.prepare(
+    `INSERT INTO review_comments (
+      created_at, updated_at, path, selector, element_desc, x_pct, y_pct, viewport_w,
+      user_agent, author, body, mentions, status
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'open')`
+  )
+    .bind(
+      now,
+      now,
+      value.path,
+      value.selector,
+      value.element_desc,
+      value.x_pct,
+      value.y_pct,
+      value.viewport_w,
+      value.user_agent,
+      value.author,
+      value.body,
+      value.mentions
+    )
+    .run();
+  return getReviewComment(env, inserted.meta.last_row_id, origin);
+}
+
+async function updateReviewComment(env, id, patch, origin) {
+  const existing = await env.DB.prepare('SELECT id FROM review_comments WHERE id = ?').bind(id).first();
+  if (!existing) return null;
+  const sets = ['status = ?', 'updated_at = ?'];
+  const binds = [patch.status, Math.floor(Date.now() / 1000)];
+  if ('note' in patch) {
+    sets.push('status_note = ?');
+    binds.push(patch.note);
+  }
+  if ('pr_url' in patch) {
+    sets.push('pr_url = ?');
+    binds.push(patch.pr_url);
+  }
+  if ('assignee' in patch) {
+    sets.push('assignee = ?');
+    binds.push(patch.assignee);
+  }
+  binds.push(id);
+  await env.DB.prepare(`UPDATE review_comments SET ${sets.join(', ')} WHERE id = ?`)
+    .bind(...binds)
+    .run();
+  return getReviewComment(env, id, origin);
+}
+
+async function addReviewReply(env, id, { body, author }) {
+  const existing = await env.DB.prepare('SELECT id FROM review_comments WHERE id = ?').bind(id).first();
+  if (!existing) return null;
+  const now = Math.floor(Date.now() / 1000);
+  const inserted = await env.DB.prepare(
+    'INSERT INTO review_replies (comment_id, created_at, author, body) VALUES (?, ?, ?, ?)'
+  )
+    .bind(id, now, author, body)
+    .run();
+  await env.DB.prepare('UPDATE review_comments SET updated_at = ? WHERE id = ?').bind(now, id).run();
+  return { id: inserted.meta.last_row_id, comment_id: id, created_at: now, author, body };
+}
+
+async function queryReviewComments(env, filters) {
+  const where = [];
+  const binds = [];
+  if (filters.status) {
+    where.push('status = ?');
+    binds.push(filters.status);
+  }
+  if (filters.path) {
+    where.push('path = ?');
+    binds.push(filters.path);
+  }
+  if (filters.mention) {
+    where.push("mentions LIKE ? ESCAPE '\\'");
+    binds.push(`%,${filters.mention.replace(/[\\%_]/g, (ch) => `\\${ch}`)},%`);
+  }
+  binds.push(REVIEW_LIST_LIMIT + 1);
+  const { results } = await env.DB.prepare(
+    `SELECT id, created_at, updated_at, path, selector, element_desc, x_pct, y_pct, viewport_w, user_agent, author, body, mentions, status, status_note, pr_url, assignee
+     FROM review_comments
+     ${where.length ? `WHERE ${where.join(' AND ')}` : ''}
+     ORDER BY id DESC
+     LIMIT ?`
+  )
+    .bind(...binds)
+    .all();
+  const truncated = results.length > REVIEW_LIST_LIMIT;
+  return { rows: truncated ? results.slice(0, REVIEW_LIST_LIMIT) : results, truncated };
+}
+
+async function loadReplies(env, ids) {
+  const map = new Map();
+  if (!ids.length) return map;
+  const placeholders = ids.map(() => '?').join(',');
+  const { results } = await env.DB.prepare(
+    `SELECT id, comment_id, created_at, author, body
+     FROM review_replies WHERE comment_id IN (${placeholders}) ORDER BY id ASC LIMIT ?`
+  )
+    .bind(...ids, REVIEW_REPLY_CAP)
+    .all();
+  for (const reply of results) {
+    const list = map.get(reply.comment_id) || [];
+    if (list.length < 50) list.push(reply);
+    map.set(reply.comment_id, list);
+  }
+  return map;
+}
+
+function commentJson(row, replies, origin) {
+  return {
+    id: row.id,
+    created_at: row.created_at,
+    updated_at: row.updated_at,
+    status: row.status,
+    path: row.path,
+    page_url: `${origin}${row.path}`,
+    element_desc: row.element_desc,
+    selector: row.selector,
+    x_pct: row.x_pct,
+    y_pct: row.y_pct,
+    viewport_w: row.viewport_w,
+    user_agent: row.user_agent,
+    author: row.author,
+    body: row.body,
+    mentions: mentionsList(row.mentions),
+    status_note: row.status_note || null,
+    pr_url: row.pr_url || null,
+    assignee: row.assignee || null,
+    replies: replies.map((reply) => ({
+      id: reply.id,
+      created_at: reply.created_at,
+      author: reply.author,
+      body: reply.body,
+    })),
+  };
+}
+
+async function listReviewComments(env, origin, filters) {
+  const { rows, truncated } = await queryReviewComments(env, filters);
+  const replies = await loadReplies(
+    env,
+    rows.map((row) => row.id)
+  );
+  return {
+    truncated,
+    comments: rows.map((row) => commentJson(row, replies.get(row.id) || [], origin)),
+  };
+}
+
+async function getReviewComment(env, id, origin) {
+  const row = await env.DB.prepare(
+    `SELECT id, created_at, updated_at, path, selector, element_desc, x_pct, y_pct, viewport_w, user_agent, author, body, mentions, status, status_note, pr_url, assignee
+     FROM review_comments WHERE id = ?`
+  )
+    .bind(id)
+    .first();
+  if (!row) return null;
+  const replies = await loadReplies(env, [id]);
+  return commentJson(row, replies.get(id) || [], origin);
+}
+
+function reviewMarkdown(comments, truncated) {
+  const lines = [
+    '# Linki review',
+    '',
+    REVIEW_ABOUT,
+    '',
+    `Repository: ${REPO_URL}`,
+    '',
+    'How to work:',
+    ...REVIEW_WORKFLOW.map((step) => `- ${step}`),
+    '',
+    'Filters: ?status=open&mention=Claude&path=/links. Add ?format=json for JSON.',
+    'MCP: POST /mcp-review/<REVIEW_KEY> with tools list_comments, get_comment, update_comment, and reply.',
+    'Plain POST: /review/agent/<REVIEW_KEY>/comments/<id> with JSON {status, note, pr_url, assignee}, and /reply with {body, author}.',
+    '',
+  ];
+  if (truncated) lines.push(`Showing the newest ${REVIEW_LIST_LIMIT} comments.`, '');
+  if (!comments.length) {
+    lines.push('No comments.');
+    return `${lines.join('\n')}\n`;
+  }
+  for (const comment of comments) {
+    lines.push(`## #${comment.id} · ${comment.status} · ${comment.path}`);
+    lines.push(`- Page: ${comment.page_url}`);
+    lines.push(`- Element: ${comment.element_desc}`);
+    lines.push(`- Selector: \`${String(comment.selector).replace(/`/g, "'")}\``);
+    lines.push(`- Viewport: ${comment.viewport_w}px`);
+    lines.push(`- Author: ${comment.author}`);
+    if (comment.mentions.length) lines.push(`- Mentions: ${comment.mentions.join(', ')}`);
+    if (comment.assignee) lines.push(`- Assignee: ${comment.assignee}`);
+    if (comment.status_note) lines.push(`- Note: ${comment.status_note}`);
+    lines.push(`- PR: ${comment.pr_url || 'none'}`);
+    lines.push(`- Created: ${new Date(comment.created_at * 1000).toISOString()}`);
+    lines.push('');
+    lines.push(comment.body);
+    lines.push('');
+    if (comment.replies.length) {
+      lines.push('Replies:');
+      for (const reply of comment.replies) lines.push(`- ${reply.author}: ${reply.body}`);
+      lines.push('');
+    }
+  }
+  return `${lines.join('\n')}\n`;
+}
+
+const REVIEW_MCP_TOOLS = [
+  {
+    name: 'list_comments',
+    description:
+      'List Linki review comments, newest first. Optional filters: status (open, in_progress, fixed), path (for example /links), mention (a name without @, for example Claude).',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        status: { type: 'string', enum: ['open', 'in_progress', 'fixed'] },
+        path: { type: 'string', description: 'Page path, for example / or /links.' },
+        mention: { type: 'string', description: 'Mention name without the @.' },
+      },
+    },
+    annotations: { readOnlyHint: true, destructiveHint: false, openWorldHint: false },
+  },
+  {
+    name: 'get_comment',
+    description: 'Get one review comment by id, including its replies.',
+    inputSchema: {
+      type: 'object',
+      properties: { id: { type: 'integer', description: 'Comment id.' } },
+      required: ['id'],
+    },
+    annotations: { readOnlyHint: true, destructiveHint: false, openWorldHint: false },
+  },
+  {
+    name: 'update_comment',
+    description:
+      'Update a review comment. Set status to in_progress when you start, then fixed when the pull request is open, and set pr_url. Never push to main. Kiet approves merges.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        id: { type: 'integer' },
+        status: { type: 'string', enum: ['open', 'in_progress', 'fixed'] },
+        note: { type: 'string' },
+        pr_url: { type: 'string', description: 'Pull request URL.' },
+        assignee: { type: 'string' },
+      },
+      required: ['id', 'status'],
+    },
+    annotations: { readOnlyHint: false, destructiveHint: false, openWorldHint: true },
+  },
+  {
+    name: 'reply',
+    description: 'Add a reply to a review comment.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        id: { type: 'integer', description: 'Comment id.' },
+        body: { type: 'string' },
+        author: { type: 'string' },
+      },
+      required: ['id', 'body', 'author'],
+    },
+    annotations: { readOnlyHint: false, destructiveHint: false, openWorldHint: false },
+  },
+];
+
+function reviewInitialize(params) {
+  const requested = params && typeof params.protocolVersion === 'string' ? params.protocolVersion : '';
+  const protocolVersion = /^\d{4}-\d{2}-\d{2}$/.test(requested) ? requested : '2025-03-26';
+  return {
+    protocolVersion,
+    capabilities: { tools: {} },
+    serverInfo: { name: 'Linki Review', version: '0.1.0' },
+    instructions: `${REVIEW_ABOUT} Repository: ${REPO_URL}. ${REVIEW_WORKFLOW.join(' ')}`,
+  };
+}
+
+async function reviewMcpEndpoint(request, env, url) {
+  const cors = mcpCors(request);
+  if (!(await keysMatch(decodeKey(url.pathname.slice('/mcp-review/'.length)), env.REVIEW_KEY))) {
+    return stampReviewMcp(mcpJson({ error: 'Unauthorized' }, 401, cors));
+  }
+  if (request.method === 'OPTIONS') {
+    const headers = new Headers(cors);
+    headers.set('Cache-Control', 'no-store');
+    headers.set('X-Robots-Tag', 'noindex, nofollow');
+    headers.set('Referrer-Policy', 'no-referrer');
+    return new Response(null, { status: 204, headers });
+  }
+  if (request.method !== 'POST') {
+    return stampReviewMcp(mcpJson({ error: 'Method not allowed' }, 405, cors, { Allow: 'POST' }));
+  }
+  try {
+    return stampReviewMcp(await reviewMcpPost(request, env, url, cors));
+  } catch (err) {
+    console.error(err);
+    return stampReviewMcp(rpcError(null, -32603, 'Internal error', cors, 500));
+  }
+}
+
+function stampReviewMcp(response) {
+  response.headers.set('Cache-Control', 'no-store');
+  response.headers.set('X-Robots-Tag', 'noindex, nofollow');
+  response.headers.set('Referrer-Policy', 'no-referrer');
+  return response;
+}
+
+async function reviewMcpPost(request, env, url, cors) {
+  const parsed = await readRpcRequest(request, cors);
+  if (parsed.response) return parsed.response;
+  const { msg, id } = parsed;
+  if (msg.method === 'initialize') return rpcResult(id, reviewInitialize(msg.params), cors);
+  if (msg.method === 'ping') return rpcResult(id, {}, cors);
+  if (msg.method === 'tools/list') return rpcResult(id, { tools: REVIEW_MCP_TOOLS }, cors);
+  if (msg.method === 'tools/call') {
+    const result = await callReviewTool(env, url.origin, msg.params);
+    if (result.rpcError) return rpcError(id, result.rpcError.code, result.rpcError.message, cors);
+    return rpcResult(id, result, cors);
+  }
+  return rpcError(id, -32601, 'Method not found', cors);
+}
+
+async function callReviewTool(env, origin, params) {
+  const call = readToolCall(params);
+  if (call.rpcError) return call;
+  const args = call.args;
+  if (call.name === 'list_comments') {
+    const filters = parseReviewFilters(args);
+    if (filters.error) return toolError(filters.error);
+    return toolText(await listReviewComments(env, origin, filters));
+  }
+  if (call.name === 'get_comment') {
+    const id = idValue(args.id);
+    if (!id) return toolError('Comment not found.');
+    const comment = await getReviewComment(env, id, origin);
+    if (!comment) return toolError('Comment not found.');
+    return toolText(comment);
+  }
+  if (call.name === 'update_comment') {
+    const id = idValue(args.id);
+    if (!id) return toolError('Comment not found.');
+    const parsed = validateReviewUpdate(args);
+    if (parsed.error) return toolError(parsed.error);
+    const comment = await updateReviewComment(env, id, parsed.patch, origin);
+    if (!comment) return toolError('Comment not found.');
+    return toolText(comment);
+  }
+  if (call.name === 'reply') {
+    const id = idValue(args.id);
+    if (!id) return toolError('Comment not found.');
+    const parsed = validateReviewReply(args);
+    if (parsed.error) return toolError(parsed.error);
+    const reply = await addReviewReply(env, id, parsed);
+    if (!reply) return toolError('Comment not found.');
+    return toolText(reply);
+  }
+  return { rpcError: { code: -32602, message: 'Unknown tool' } };
+}
+
+
 const JS = `
 // Home hero motion. All of it is decorative and is skipped under prefers-reduced-motion.
 (function () {
@@ -1260,6 +2178,632 @@ try {
   document.cookie = 'tz=' + (-new Date().getTimezoneOffset()) + '; Path=/; Max-Age=31536000; SameSite=Lax' +
     (location.protocol === 'https:' ? '; Secure' : '');
 } catch (e) {}
+`;
+
+const REVIEW_JS = `
+// Comment pins for staging review mode. Clicks here stay on the page.
+(function () {
+  var reduce = window.matchMedia('(prefers-reduced-motion: reduce)').matches;
+  var AUTHOR_KEY = 'linki-review-author';
+  var pageItems = [];
+  var allItems = [];
+  var tab = 'page';
+  var picking = false;
+  var picked = null;
+  var hoverQueued = false;
+
+  function authorName() {
+    try {
+      var saved = localStorage.getItem(AUTHOR_KEY);
+      if (saved && saved.trim()) return saved.trim().slice(0, 80);
+    } catch (err) {}
+    return 'Kiet';
+  }
+
+  function rememberAuthor(value) {
+    var clean = String(value || '').trim().slice(0, 80) || 'Kiet';
+    try { localStorage.setItem(AUTHOR_KEY, clean); } catch (err) {}
+    return clean;
+  }
+
+  function node(tag, className, text) {
+    var el = document.createElement(tag);
+    if (className) el.className = className;
+    if (text != null) el.textContent = text;
+    return el;
+  }
+
+  function statusLabel(status) {
+    return status === 'in_progress' ? 'in progress' : (status || 'open');
+  }
+
+  function api(path, options) {
+    var opts = options || {};
+    var headers = opts.headers || {};
+    headers.Accept = 'application/json';
+    opts.headers = headers;
+    opts.credentials = 'same-origin';
+    return fetch(path, opts).then(function (res) {
+      return res.json().catch(function () { return {}; }).then(function (data) {
+        if (!res.ok) throw new Error((data && data.error) || 'Could not save.');
+        return data;
+      });
+    });
+  }
+
+  var dock = node('div', 'review-dock');
+  dock.setAttribute('data-review', '');
+  var listBtn = node('button', 'secondary review-listbtn', 'List');
+  listBtn.type = 'button';
+  listBtn.setAttribute('aria-label', 'Open comments');
+  var fab = node('button', 'review-fab', 'Comment');
+  fab.type = 'button';
+  fab.setAttribute('data-review-fab', '');
+  fab.setAttribute('aria-pressed', 'false');
+  dock.append(listBtn, fab);
+
+  var hover = node('div', 'review-hover');
+  hover.setAttribute('data-review', '');
+  hover.hidden = true;
+
+  var pop = node('div', 'review-pop');
+  pop.setAttribute('data-review', '');
+  pop.hidden = true;
+  pop.setAttribute('role', 'dialog');
+  pop.setAttribute('aria-label', 'New comment');
+  var popLabel = node('p', 'review-pop-label', 'Comment');
+  var area = node('textarea');
+  area.setAttribute('aria-label', 'Comment');
+  area.placeholder = 'Comment';
+  area.maxLength = 4000;
+  area.rows = 3;
+  var nameInput = node('input');
+  nameInput.type = 'text';
+  nameInput.maxLength = 80;
+  nameInput.placeholder = 'Name';
+  nameInput.setAttribute('aria-label', 'Name');
+  nameInput.value = authorName();
+  var popErr = node('p', 'review-err');
+  popErr.hidden = true;
+  popErr.setAttribute('role', 'alert');
+  var popActions = node('div', 'review-actions');
+  var saveBtn = node('button', 'review-go', 'Save');
+  saveBtn.type = 'button';
+  var cancelBtn = node('button', 'secondary', 'Cancel');
+  cancelBtn.type = 'button';
+  popActions.append(saveBtn, cancelBtn);
+  pop.append(popLabel, area, nameInput, popErr, popActions);
+
+  var panel = node('aside', 'review-panel');
+  panel.setAttribute('data-review', '');
+  panel.setAttribute('role', 'dialog');
+  panel.setAttribute('aria-label', 'Comments');
+  panel.hidden = true;
+  var head = node('div', 'review-head');
+  head.append(node('h2', null, 'Comments'));
+  var headBtns = node('div', 'review-head-btns');
+  var copyBtn = node('button', 'secondary', 'Copy agent link');
+  copyBtn.type = 'button';
+  var closeBtn = node('button', 'secondary', 'Close');
+  closeBtn.type = 'button';
+  closeBtn.setAttribute('aria-label', 'Close comments');
+  headBtns.append(copyBtn, closeBtn);
+  head.append(headBtns);
+  var who = node('label', 'review-who');
+  who.append(document.createTextNode('Name'));
+  var whoInput = node('input');
+  whoInput.type = 'text';
+  whoInput.maxLength = 80;
+  whoInput.value = authorName();
+  whoInput.setAttribute('aria-label', 'Your name');
+  who.append(whoInput);
+  var tabs = node('div', 'review-tabs');
+  tabs.setAttribute('role', 'tablist');
+  var tabPage = node('button', 'review-tab', 'This page');
+  tabPage.type = 'button';
+  tabPage.setAttribute('role', 'tab');
+  var tabAll = node('button', 'review-tab', 'All pages');
+  tabAll.type = 'button';
+  tabAll.setAttribute('role', 'tab');
+  tabs.append(tabPage, tabAll);
+  var list = node('div', 'review-list');
+  list.setAttribute('role', 'tabpanel');
+  panel.append(head, who, tabs, list);
+
+  var layer = node('div', 'review-pins');
+  layer.setAttribute('data-review', '');
+  document.body.append(layer, hover, pop, panel, dock);
+
+  function syncName(from) {
+    var author = rememberAuthor(from.value);
+    if (nameInput.value !== author) nameInput.value = author;
+    if (whoInput.value !== author) whoInput.value = author;
+  }
+  nameInput.addEventListener('change', function () { syncName(nameInput); });
+  whoInput.addEventListener('change', function () { syncName(whoInput); });
+
+  function closePop() {
+    pop.hidden = true;
+    popErr.hidden = true;
+    picked = null;
+    hover.hidden = true;
+  }
+
+  function setPicking(on) {
+    picking = on;
+    document.body.classList.toggle('review-picking', on);
+    fab.setAttribute('aria-pressed', on ? 'true' : 'false');
+    fab.textContent = on ? 'Cancel' : 'Comment';
+    if (!on) closePop();
+  }
+
+  function openPanel() {
+    setPicking(false);
+    panel.hidden = false;
+    document.body.classList.add('review-panel-open');
+    if (reduce) panel.classList.add('open');
+    else requestAnimationFrame(function () { panel.classList.add('open'); });
+    if (tab === 'page') renderList(pageItems);
+    else renderList(allItems);
+  }
+
+  function closePanel() {
+    panel.classList.remove('open');
+    document.body.classList.remove('review-panel-open');
+    if (reduce) panel.hidden = true;
+    else setTimeout(function () {
+      if (!panel.classList.contains('open')) panel.hidden = true;
+    }, 200);
+  }
+
+  function showPopErr(message) {
+    popErr.hidden = false;
+    popErr.textContent = message;
+  }
+
+  function showListError(message) {
+    var err = node('p', 'review-err', message);
+    err.setAttribute('role', 'alert');
+    list.prepend(err);
+  }
+
+  function updateCount() {
+    var n = pageItems.length;
+    listBtn.textContent = n ? String(n) : 'List';
+    listBtn.setAttribute('aria-label', n ? 'Open ' + n + ' comments' : 'Open comments');
+  }
+
+  function findEl(selector) {
+    if (!selector) return null;
+    try {
+      var el = document.querySelector(selector);
+      if (!el || (el.closest && el.closest('[data-review]'))) return null;
+      return el;
+    } catch (err) {
+      return null;
+    }
+  }
+
+  function placePins() {
+    var seen = {};
+    pageItems.forEach(function (item) {
+      var el = findEl(item.selector);
+      var rect = el ? el.getBoundingClientRect() : null;
+      item._found = !!(rect && (rect.width || rect.height));
+      var key = String(item.id);
+      seen[key] = true;
+      var pin = layer.querySelector('[data-pin="' + key + '"]');
+      if (!item._found) {
+        if (pin) pin.remove();
+        return;
+      }
+      if (!pin) {
+        pin = node('button', 'review-pin', key);
+        pin.type = 'button';
+        pin.setAttribute('data-pin', key);
+        pin.addEventListener('click', function (e) {
+          e.preventDefault();
+          e.stopPropagation();
+          focusComment(item.id);
+        });
+        layer.append(pin);
+      }
+      var kind = item.status === 'in_progress' ? 'progress' : (item.status || 'open');
+      pin.className = 'review-pin is-' + kind;
+      pin.textContent = key;
+      pin.style.left = (rect.left + (rect.width * Number(item.x_pct)) / 100) + 'px';
+      pin.style.top = (rect.top + (rect.height * Number(item.y_pct)) / 100) + 'px';
+      pin.setAttribute('aria-label', 'Comment ' + key + ', ' + statusLabel(item.status));
+      pin.title = String(item.body || '').slice(0, 140);
+    });
+    layer.querySelectorAll('[data-pin]').forEach(function (pin) {
+      if (!seen[pin.getAttribute('data-pin')]) pin.remove();
+    });
+    if (tab === 'page' && !panel.hidden) {
+      pageItems.forEach(function (item) {
+        var note = list.querySelector('[data-missing="' + item.id + '"]');
+        if (note) note.hidden = item._found !== false;
+      });
+    }
+  }
+
+  function placeDock() {
+    dock.classList.remove('raised');
+    var form = document.querySelector('form.create');
+    if (!form) return;
+    var fr = form.getBoundingClientRect();
+    var dr = dock.getBoundingClientRect();
+    var overlap = dr.left < fr.right && dr.right > fr.left && dr.top < fr.bottom && dr.bottom > fr.top;
+    if (overlap) dock.classList.add('raised');
+  }
+
+  function renderList(items) {
+    list.replaceChildren();
+    tabPage.setAttribute('aria-selected', tab === 'page' ? 'true' : 'false');
+    tabAll.setAttribute('aria-selected', tab === 'all' ? 'true' : 'false');
+    tabPage.classList.toggle('on', tab === 'page');
+    tabAll.classList.toggle('on', tab === 'all');
+    if (!items.length) {
+      list.append(node('p', 'review-empty', tab === 'page' ? 'No comments on this page.' : 'No comments yet.'));
+      return;
+    }
+    items.forEach(function (item) { list.append(renderCard(item)); });
+  }
+
+  function renderCard(item) {
+    var card = node('article', 'review-card');
+    card.setAttribute('data-review-id', String(item.id));
+    var top = node('div', 'review-card-top');
+    top.append(node('span', 'review-id', '#' + item.id));
+    var kind = item.status === 'in_progress' ? 'progress' : (item.status || 'open');
+    top.append(node('span', 'review-status st-' + kind, statusLabel(item.status)));
+    card.append(top);
+    if (tab === 'all') {
+      var pathLink = node('a', 'review-path', item.path);
+      pathLink.href = item.path;
+      card.append(pathLink);
+    }
+    card.append(node('p', 'review-el', item.element_desc || ''));
+    var missing = node('p', 'review-missing', 'element not found');
+    missing.setAttribute('data-missing', String(item.id));
+    missing.hidden = item.path !== location.pathname || item._found !== false;
+    card.append(missing);
+    card.append(node('p', 'review-body', item.body || ''));
+    var meta = item.author || 'Kiet';
+    if (item.assignee) meta += ' · ' + item.assignee;
+    card.append(node('p', 'review-meta', meta));
+    if (item.pr_url) {
+      var pr = node('a', 'review-pr', item.pr_url);
+      pr.href = item.pr_url;
+      pr.target = '_blank';
+      pr.rel = 'noopener noreferrer';
+      card.append(pr);
+    }
+    var resolve = node('button', 'secondary', item.status === 'fixed' ? 'Reopen' : 'Resolve');
+    resolve.type = 'button';
+    resolve.addEventListener('click', function () {
+      resolve.disabled = true;
+      api('/review/comments/' + item.id, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ status: item.status === 'fixed' ? 'open' : 'fixed' })
+      }).then(refresh).catch(function (err) {
+        resolve.disabled = false;
+        showListError(err.message);
+      });
+    });
+    card.append(resolve);
+    var replies = node('div', 'review-replies');
+    (item.replies || []).forEach(function (reply) {
+      var line = node('p', 'review-reply');
+      line.append(node('strong', null, reply.author || 'Kiet'));
+      line.append(document.createTextNode(' ' + (reply.body || '')));
+      replies.append(line);
+    });
+    card.append(replies);
+    var replyBox = node('textarea');
+    replyBox.rows = 2;
+    replyBox.maxLength = 4000;
+    replyBox.placeholder = 'Reply';
+    replyBox.setAttribute('aria-label', 'Reply to comment ' + item.id);
+    var replyBtn = node('button', 'secondary', 'Reply');
+    replyBtn.type = 'button';
+    replyBtn.addEventListener('click', function () {
+      var text = replyBox.value.trim();
+      if (!text) return;
+      replyBtn.disabled = true;
+      api('/review/comments/' + item.id + '/reply', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ body: text, author: rememberAuthor(whoInput.value) })
+      }).then(refresh).catch(function (err) {
+        replyBtn.disabled = false;
+        showListError(err.message);
+      });
+    });
+    card.append(replyBox, replyBtn);
+    return card;
+  }
+
+  function selectTab(next) {
+    tab = next;
+    if (next === 'page') renderList(pageItems);
+    else refreshAll();
+  }
+
+  function focusComment(id) {
+    tab = 'page';
+    openPanel();
+    var card = list.querySelector('[data-review-id="' + id + '"]');
+    if (!card) return;
+    list.querySelectorAll('.review-current').forEach(function (el) { el.classList.remove('review-current'); });
+    card.classList.add('review-current');
+    card.scrollIntoView({ block: 'nearest', behavior: reduce ? 'auto' : 'smooth' });
+  }
+
+  function refreshAll() {
+    return api('/review/comments').then(function (data) {
+      allItems = data.comments || [];
+      if (tab === 'all') renderList(allItems);
+    }).catch(function (err) {
+      showListError(err.message || 'Could not load comments.');
+    });
+  }
+
+  function refresh() {
+    var qs = new URLSearchParams();
+    qs.set('path', location.pathname);
+    return api('/review/comments?' + qs.toString()).then(function (data) {
+      pageItems = data.comments || [];
+      placePins();
+      updateCount();
+      if (tab === 'page') renderList(pageItems);
+      else return refreshAll();
+    }).catch(function (err) {
+      showListError(err.message || 'Could not load comments.');
+    });
+  }
+
+  function pinTarget(target) {
+    var el = target && target.nodeType === 1 ? target : target && target.parentElement;
+    if (!el || (el.closest && el.closest('[data-review]'))) return null;
+    var better = el.closest && el.closest('button, a, input, textarea, select, label, summary, h1, h2, h3, p, li');
+    if (better && !(better.closest && better.closest('[data-review]'))) el = better;
+    if (el === document.documentElement) return document.body;
+    return el;
+  }
+
+  function cssPath(el) {
+    if (!el || el === document.body || el === document.documentElement) return 'body';
+    var parts = [];
+    var node = el;
+    while (node && node.nodeType === 1 && node !== document.body && node !== document.documentElement) {
+      if (node.hasAttribute && node.hasAttribute('data-review')) return 'body';
+      var id = node.getAttribute && node.getAttribute('id');
+      if (id && /^[A-Za-z][\w-]*$/.test(id)) {
+        parts.unshift('#' + id);
+        break;
+      }
+      var part = node.tagName.toLowerCase();
+      var parent = node.parentElement;
+      if (parent) {
+        var same = 0;
+        var index = 0;
+        var kids = parent.children;
+        for (var i = 0; i < kids.length; i++) {
+          if (kids[i].tagName === node.tagName) {
+            same += 1;
+            if (kids[i] === node) index = same;
+          }
+        }
+        if (same > 1) part += ':nth-of-type(' + index + ')';
+      }
+      parts.unshift(part);
+      node = parent;
+    }
+    return parts.join(' > ') || 'body';
+  }
+
+  function visibleLabel(el) {
+    var text = '';
+    try { text = (el.innerText || '').replace(/\s+/g, ' ').trim(); } catch (err) {}
+    if (!text) text = (el.textContent || '').replace(/\s+/g, ' ').trim();
+    var aria = (el.getAttribute('aria-label') || '').replace(/\s+/g, ' ').trim();
+    var label = text;
+    if (!label || (aria && text.length > 40 && aria.length <= text.length)) label = aria;
+    if (!label) label = text;
+    if (label.length > 40) label = label.slice(0, 39) + '\u2026';
+    return label;
+  }
+
+  function sectionHeading(el) {
+    var node = el;
+    while (node && node !== document.body) {
+      var parent = node.parentElement;
+      if (!parent) break;
+      var sibs = parent.children;
+      for (var i = 0; i < sibs.length; i++) {
+        if (sibs[i] === node) break;
+        var heading = null;
+        if (sibs[i].matches && sibs[i].matches('h1, h2')) heading = sibs[i];
+        else if (sibs[i].querySelector) heading = sibs[i].querySelector('h1, h2');
+        if (heading && !(heading.closest && heading.closest('[data-review]'))) {
+          var text = (heading.textContent || '').replace(/\s+/g, ' ').trim();
+          if (text) return text.slice(0, 60);
+        }
+      }
+      node = parent;
+    }
+    var h1 = document.querySelector('main h1');
+    return h1 ? (h1.textContent || '').replace(/\s+/g, ' ').trim().slice(0, 60) : '';
+  }
+
+  function elementDesc(el) {
+    var tag = el.tagName ? el.tagName.toLowerCase() : 'element';
+    var label = visibleLabel(el);
+    var desc = label ? tag + ' "' + label + '"' : tag;
+    var row = el.closest ? el.closest('li') : null;
+    if (row && row.parentElement) {
+      var items = [];
+      var children = row.parentElement.children;
+      for (var i = 0; i < children.length; i++) if (children[i].tagName === 'LI') items.push(children[i]);
+      var index = items.indexOf(row) + 1;
+      var heading = sectionHeading(row);
+      if (index > 0 && heading) desc += ' in row ' + index + ' of ' + heading;
+    }
+    if (desc.length > 180) desc = desc.slice(0, 179) + '\u2026';
+    return desc;
+  }
+
+  function boxPercent(el, clientX, clientY) {
+    var rect = el.getBoundingClientRect();
+    var x = rect.width ? ((clientX - rect.left) / rect.width) * 100 : 50;
+    var y = rect.height ? ((clientY - rect.top) / rect.height) * 100 : 50;
+    x = Math.max(0, Math.min(100, x));
+    y = Math.max(0, Math.min(100, y));
+    return { x: Math.round(x * 10) / 10, y: Math.round(y * 10) / 10 };
+  }
+
+  function placePopover(x, y) {
+    pop.classList.remove('sheet');
+    if (window.innerWidth < 640) {
+      pop.classList.add('sheet');
+      pop.style.left = '';
+      pop.style.top = '';
+      return;
+    }
+    pop.style.left = Math.max(8, Math.min(x + 12, window.innerWidth - 308)) + 'px';
+    pop.style.top = Math.max(8, Math.min(y + 12, window.innerHeight - 250)) + 'px';
+  }
+
+  function openComposer(e) {
+    var el = pinTarget(e.target);
+    if (!el) return;
+    var pct = boxPercent(el, e.clientX, e.clientY);
+    picked = { el: el, x: pct.x, y: pct.y };
+    popLabel.textContent = elementDesc(el);
+    popErr.hidden = true;
+    area.value = '';
+    placePopover(e.clientX, e.clientY);
+    pop.hidden = false;
+    hover.hidden = true;
+    area.focus();
+  }
+
+  function saveComment() {
+    if (!picked) return;
+    var body = area.value.trim();
+    if (!body) { showPopErr('Write a comment first.'); return; }
+    var author = rememberAuthor(nameInput.value);
+    whoInput.value = author;
+    saveBtn.disabled = true;
+    api('/review/comments', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        path: location.pathname,
+        selector: cssPath(picked.el),
+        element_desc: elementDesc(picked.el),
+        x_pct: picked.x,
+        y_pct: picked.y,
+        viewport_w: window.innerWidth,
+        author: author,
+        body: body
+      })
+    }).then(function () {
+      closePop();
+      setPicking(false);
+      return refresh();
+    }).catch(function (err) {
+      showPopErr(err.message || 'Could not save the comment.');
+    }).then(function () { saveBtn.disabled = false; });
+  }
+
+  function fallbackCopy(text) {
+    var ta = document.createElement('textarea');
+    ta.value = text;
+    ta.setAttribute('data-review', '');
+    document.body.appendChild(ta);
+    ta.select();
+    try { document.execCommand('copy'); } catch (err) {}
+    ta.remove();
+  }
+
+  fab.addEventListener('click', function () {
+    if (!panel.hidden) closePanel();
+    setPicking(!picking);
+  });
+  listBtn.addEventListener('click', function () {
+    if (panel.hidden) openPanel();
+    else closePanel();
+  });
+  closeBtn.addEventListener('click', closePanel);
+  cancelBtn.addEventListener('click', function () { setPicking(false); });
+  saveBtn.addEventListener('click', saveComment);
+  tabPage.addEventListener('click', function () { selectTab('page'); });
+  tabAll.addEventListener('click', function () { selectTab('all'); });
+  copyBtn.addEventListener('click', function () {
+    api('/review/link').then(function (data) {
+      var text = data.text || '';
+      if (navigator.clipboard && navigator.clipboard.writeText) return navigator.clipboard.writeText(text);
+      fallbackCopy(text);
+    }).then(function () {
+      copyBtn.textContent = 'Copied';
+      setTimeout(function () { copyBtn.textContent = 'Copy agent link'; }, 1500);
+    }).catch(function () {
+      copyBtn.textContent = 'Could not copy';
+      setTimeout(function () { copyBtn.textContent = 'Copy agent link'; }, 1500);
+    });
+  });
+
+  document.addEventListener('click', function (e) {
+    if (!picking) return;
+    if (e.target.closest && e.target.closest('[data-review]')) return;
+    e.preventDefault();
+    e.stopPropagation();
+    openComposer(e);
+  }, true);
+  document.addEventListener('submit', function (e) {
+    if (!picking) return;
+    if (e.target.closest && e.target.closest('[data-review]')) return;
+    e.preventDefault();
+    e.stopPropagation();
+  }, true);
+  document.addEventListener('keydown', function (e) {
+    if (e.key !== 'Escape') return;
+    if (!pop.hidden) { setPicking(false); return; }
+    if (picking) { setPicking(false); return; }
+    if (!panel.hidden) closePanel();
+  });
+  document.addEventListener('pointermove', function (e) {
+    if (!picking || !pop.hidden) return;
+    if (e.pointerType && e.pointerType !== 'mouse') return;
+    var x = e.clientX;
+    var y = e.clientY;
+    if (hoverQueued) return;
+    hoverQueued = true;
+    requestAnimationFrame(function () {
+      hoverQueued = false;
+      if (!picking || !pop.hidden) { hover.hidden = true; return; }
+      var under = document.elementFromPoint(x, y);
+      var el = under ? pinTarget(under) : null;
+      if (!el) { hover.hidden = true; return; }
+      var rect = el.getBoundingClientRect();
+      hover.hidden = false;
+      hover.style.left = rect.left + 'px';
+      hover.style.top = rect.top + 'px';
+      hover.style.width = Math.max(rect.width, 2) + 'px';
+      hover.style.height = Math.max(rect.height, 2) + 'px';
+    });
+  }, { passive: true });
+
+  window.addEventListener('resize', function () { placePins(); placeDock(); });
+  window.addEventListener('scroll', function () { placePins(); placeDock(); }, true);
+  refresh().then(function () { placeDock(); });
+  if (document.fonts && document.fonts.ready) {
+    document.fonts.ready.then(function () { placePins(); placeDock(); });
+  }
+})();
 `;
 
 const CSS = `
@@ -1518,5 +3062,70 @@ button.copied{background:var(--accent);color:var(--on-accent);border-color:var(-
   .agent .up{flex-wrap:wrap;height:auto;padding:8px 8px 8px 14px;border-radius:18px}
   .agent .up input.short{flex:1 1 100%;height:40px;font-size:12px}
   .agent .up .primary{flex:1 1 auto;height:44px}
+}
+`;
+
+const REVIEW_CSS = `
+/* staging review pins. Injected only when the review cookie is valid. */
+body.review-on{padding-bottom:84px}
+.review-dock{position:fixed;right:16px;bottom:calc(16px + env(safe-area-inset-bottom));z-index:80;display:flex;gap:8px;align-items:center}
+.review-dock.raised{top:76px;bottom:auto}
+body.review-panel-open .review-dock{display:none}
+.review-fab{height:40px;padding:0 14px;border:0;background:var(--accent);color:#fff;font-size:13px;font-weight:700;box-shadow:0 8px 24px rgba(30,35,48,.18)}
+.review-listbtn{min-width:44px;height:40px;padding:0 12px;box-shadow:0 8px 24px rgba(30,35,48,.12)}
+.review-pins{position:fixed;inset:0;z-index:60;pointer-events:none}
+.review-pin{position:fixed;z-index:61;min-width:22px;height:22px;padding:0 5px;border:2px solid #fff;border-radius:999px;transform:translate(-50%,-50%);font:800 11px/18px var(--display);box-shadow:0 2px 8px rgba(30,35,48,.28);pointer-events:auto}
+.review-pin.is-open{background:var(--accent);color:#fff}
+.review-pin.is-progress{background:var(--mustard);color:var(--on-mustard)}
+.review-pin.is-fixed{background:var(--pressed);color:var(--muted)}
+.review-hover{position:fixed;z-index:55;box-sizing:border-box;pointer-events:none;border:2px solid var(--accent);border-radius:8px;background:color-mix(in srgb, var(--accent) 14%, transparent)}
+body.review-picking,body.review-picking *{cursor:crosshair !important}
+body.review-picking [data-review],body.review-picking [data-review] *{cursor:auto !important}
+.review-pop{position:fixed;z-index:85;width:300px;padding:12px;background:var(--surface);color:var(--ink);border:1px solid var(--line);border-radius:16px;box-shadow:0 12px 40px rgba(30,35,48,.18)}
+.review-pop.sheet{left:8px;right:8px;top:auto;bottom:calc(8px + env(safe-area-inset-bottom));width:auto}
+.review-pop-label{font-size:13px;font-weight:600;color:var(--muted)}
+.review-pop textarea,.review-card textarea{display:block;width:100%;min-height:64px;margin-top:8px;padding:10px 12px;border:1px solid var(--line);border-radius:12px;background:var(--paper);color:var(--ink);font:400 14px/1.4 var(--ui);resize:vertical}
+.review-pop input[type=text],.review-who input[type=text]{height:40px;margin-top:8px;border:0}
+.review-actions{display:flex;gap:8px;margin-top:10px}
+.review-go{height:40px;padding:0 16px;border:0;background:var(--ink);color:var(--on-ink)}
+.review-err{margin-top:8px;font-size:13px;font-weight:500;color:var(--danger)}
+.review-panel{position:fixed;top:0;right:0;z-index:70;display:flex;flex-direction:column;width:min(400px,100%);height:100%;height:100dvh;background:var(--surface);color:var(--ink);border-left:1px solid var(--line);border-top:3px solid var(--accent);box-shadow:-16px 0 40px rgba(30,35,48,.12);transform:translateX(100%)}
+.review-panel[hidden]{display:none}
+.review-panel.open{transform:none}
+.review-head{display:flex;justify-content:space-between;align-items:center;gap:12px;padding:16px 16px 8px}
+.review-head h2{font-size:22px}
+.review-head-btns{display:flex;gap:8px;flex:none}
+.review-who{display:grid;gap:0;padding:0 16px 8px;font-size:12px;font-weight:600;color:var(--muted)}
+.review-tabs{display:flex;gap:8px;padding:0 16px 8px}
+.review-tab{height:36px;padding:0 12px;border:1px solid var(--line);background:var(--surface);color:var(--ink);font-size:13px}
+.review-tab.on{background:var(--pressed)}
+.review-list{flex:1;overflow:auto;padding:4px 16px 28px}
+.review-empty{padding:12px 0;color:var(--muted);font-size:14px}
+.review-card{padding:12px 0;border-top:1px solid var(--line-soft)}
+.review-card.review-current{background:color-mix(in srgb, var(--accent) 8%, transparent);margin:0 -8px;padding-left:8px;padding-right:8px;border-radius:12px}
+.review-card-top{display:flex;justify-content:space-between;align-items:center;gap:8px}
+.review-id{font:700 13px var(--mono)}
+.review-status{padding:3px 8px;border-radius:999px;font-size:12px;font-weight:700}
+.st-open{background:var(--accent);color:#fff}
+.st-progress{background:var(--mustard);color:var(--on-mustard)}
+.st-fixed{background:var(--pressed);color:var(--muted)}
+.review-path,.review-pr{display:inline-block;margin-top:6px;font-size:13px;font-weight:600}
+.review-el{margin-top:6px;font-size:13px;color:var(--muted)}
+.review-missing{margin-top:4px;font-size:12px;font-weight:700;color:var(--maroon)}
+.review-body{margin-top:8px;font-size:15px;white-space:pre-wrap;overflow-wrap:anywhere}
+.review-meta{margin-top:6px;font-size:12px;font-weight:600;color:var(--muted)}
+.review-replies{margin-top:8px}
+.review-reply{margin-top:6px;font-size:14px}
+.review-reply strong{font-weight:700}
+.review-card .secondary,.review-card textarea{margin-top:8px}
+@media (prefers-reduced-motion: no-preference){
+  .review-panel{transition:transform 180ms ease-out}
+}
+@media (max-width:520px){
+  .review-dock{right:12px}
+  .review-fab,.review-listbtn{height:44px}
+  .review-head{align-items:flex-start;flex-wrap:wrap}
+  .review-head-btns{width:100%}
+  .review-head-btns .secondary{flex:1}
 }
 `;

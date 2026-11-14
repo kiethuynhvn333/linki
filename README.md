@@ -72,6 +72,30 @@ npm run release:staging   # tests, staging migrations, deploy to linki-staging.<
 
 Set its secret once: `openssl rand -hex 32 | npx wrangler secret put HASH_SECRET --env staging`.
 
+## Staging review mode
+
+Staging can show a comment layer, like pins in Figma, so notes on a page can be handed to any AI tool. It stays off unless the staging Worker has a `REVIEW_KEY` secret. Production does not have that secret. Without it the site is unchanged: `/review` routes are the normal 404 page and no comment button is added.
+
+The new tables are additive. Apply them to the staging database, not production:
+
+```
+npx wrangler d1 migrations apply linki-staging --env staging --remote
+npx wrangler secret put REVIEW_KEY --env staging
+npx wrangler deploy --env staging
+```
+
+Open `https://<staging-host>/?review=<REVIEW_KEY>` once in the browser you want to comment from. That sets a cookie and sends you back to the same page without the key in the address. A Comment button then sits at the bottom right of every page. Click it, click an element, and write the note. @mentions such as @Claude are kept as text and also stored so an agent can filter on them.
+
+The shared inbox is `https://<staging-host>/review/agent/<REVIEW_KEY>`. Paste that URL into Claude, Cursor, ChatGPT, Codex, or Grok Bot and ask it to read the page. The page is markdown. Add `?format=json` for JSON, or filter with `?status=open&mention=Claude&path=/links`. A browser address bar shows the same text as plain text.
+
+Agents that speak MCP can POST to `https://<staging-host>/mcp-review/<REVIEW_KEY>`. The tools are `list_comments`, `get_comment`, `update_comment`, and `reply`. An agent that can only POST JSON can use `POST /review/agent/<REVIEW_KEY>/comments/<id>` with `{status, note, pr_url, assignee}` and `.../reply` with `{body, author}`.
+
+Work a comment like this: read it, make a branch and a pull request, mark it `in_progress`, then `fixed` with the pull request URL. Never push to main. Kiet approves merges.
+
+The panel's "Copy agent link" copies the inbox URL and one line: "Read this, fix open comments in the Linki repo, open a PR, mark them fixed."
+
+To try it locally, put a throwaway `REVIEW_KEY` in `.dev.vars` (that file stays uncommitted), apply the migrations with `--env staging --local`, and run `npx wrangler dev --env staging --local`. Leave `REVIEW_KEY` unset to match production.
+
 ## Files
 - `src/index.js`: the whole app (routes, HTML, CSS, favicon, read-only MCP).
 - `migrations/`: the D1 tables, applied in order by `wrangler d1 migrations apply`.
