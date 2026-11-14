@@ -1,3 +1,12 @@
+# Retired names (14 Nov 2026)
+
+A short name is never given to someone else after it has been used.
+
+- **Rename.** The old address keeps working. It answers with the same 302 as any short link and forwards to the current destination. The click is counted on the current name, with the same bot, preview and `HEAD` exclusions. Renaming again points every older name straight at the newest name, not at the name in between. The owner can rename a link back to one of that link's own old names. Anyone else who asks for a retired name is treated as if it were taken: create adds the usual short ending, and rename shows the "already taken" message. `create_link` does the same.
+- **Delete.** The name is retired with nowhere to forward. Every older name that pointed at it is retired the same way. Those addresses show the not-found page, and they cannot be claimed again, including by the owner who deleted the link.
+- A link with more than 1,000 clicks still cannot be renamed (`RENAME_MAX_CLICKS`). A link that already has clicks still asks before the name changes. The question, and the line above the box, now say the old address keeps working and forwards to the new one.
+- Migration `0004_retired_names.sql` adds `retired_names` only. It does not change existing tables or rows. Apply it before deploying this Worker.
+
 # Staging review comments (14 Nov 2026)
 
 A Figma-style comment layer for the staging Worker only. It turns on when `REVIEW_KEY` is set, which is a staging secret. With no secret, `/review` routes are the normal 404 page and pages do not gain a comment button, so production is unchanged.
@@ -16,7 +25,7 @@ From Kiet's review comments #1, #2 and #3 on staging.
 
 - **Custom names (free).** The label box on the home form is replaced by a name box that starts with `linki.ing/`. What you type becomes the short link: `linki.ing/your-name`. Names are letters, numbers and hyphens, 3 to 40 characters. Spaces, capitals and accents are converted, and short links ignore capitals. The preview card shows the name as you type.
 - **A taken name is not an error.** A link address can only lead to one place, so two people cannot both own `linki.ing/hello`. The second person gets the name plus a short ending (`hello-k7`), and the result card says so and points to the name box. Linki's own paths (`links`, `mcp`, and others in `RESERVED`) are handled the same way.
-- **Rename.** The name in the result card can be edited in place: click it, type, Save (`POST /links/:code/rename`). A link's page has the same box above Delete. A taken name gives a message and the owner picks another; no ending is added. The old address stops working. Click rows move to the new name in one transaction, so a link with more than 1,000 clicks keeps its name (`RENAME_MAX_CLICKS`): a rename rewrites every click row, and the free plan allows 100,000 row writes a day. A visitor who clicked before the rename counts as a new unique visitor for the rest of that day.
+- **Rename.** The name in the result card can be edited in place: click it, type, Save (`POST /links/:code/rename`). A link's page has the same box above Delete. A taken name gives a message and the owner picks another; no ending is added. The old address keeps working and forwards to the new one (see Retired names above). Click rows move to the new name in one transaction, so a link with more than 1,000 clicks keeps its name (`RENAME_MAX_CLICKS`): a rename rewrites every click row, and the free plan allows 100,000 row writes a day. A visitor who clicked before the rename counts as a new unique visitor for the rest of that day.
 - **Labels.** New links have no label. Links that already have one keep it.
 - **Selling points.** Paste and go, Free custom links, No sign-up, MCP-ready. "See every click" is removed.
 - **MCP entry point.** The hero has no MCP element. On the home page, one line under Recent links copies the MCP link (`mcpLine`). On Your links, the section is renamed "Use Linki from your AI agent (MCP)", sits below the list, and is smaller and quieter than the links.

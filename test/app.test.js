@@ -427,7 +427,7 @@ test('a link can be renamed from its result box, and the clicks move with it', a
   const ok = await post(`/links/${code}/rename`, { name: 'Renamed Link', back: 'home' }, { cookie, headers: json });
   assert.equal(ok.status, 200);
   assert.deepEqual(await ok.json(), { ok: true, code: 'renamed-link', location: '/?new=renamed-link' });
-  assert.equal(await goesTo('rename-me'), 404);
+  assert.equal(await goesTo('rename-me'), 'https://example.com/rename-me');
   assert.equal(await goesTo('renamed-link'), 'https://example.com/rename-me');
   assert.deepEqual(await linkRow('renamed-link'), { click_count: 1, unique_count: 1 });
   assert.equal(await count('SELECT COUNT(*) AS n FROM clicks WHERE code = ?', 'renamed-link'), 1);
@@ -440,6 +440,8 @@ test('a link can be renamed from its result box, and the clicks move with it', a
   assert.equal(plain.headers.get('Location'), '/links/renamed-again');
   const detail = await (await request('/links/renamed-again', { cookie })).text();
   assert.match(detail, /action="\/links\/renamed-again\/rename" data-rename data-confirm=/);
+  assert.match(detail, /Change the name\. The old address keeps working and forwards to the new one\./);
+  assert.doesNotMatch(detail, /old address stops working/);
   // Saving the same name changes nothing.
   assert.equal((await post('/links/renamed-again/rename', { name: 'renamed-again' }, { cookie, headers: json })).status, 200);
 });
@@ -459,6 +461,7 @@ test('renaming to a taken name is refused with a message, and the owner picks an
   assert.equal(await goesTo('my-first-name'), 'https://example.com/mine');
   assert.equal(await goesTo('their-name'), 'https://example.com/theirs');
   assert.equal(await count('SELECT COUNT(*) AS n FROM clicks WHERE code = ?', 'their-name'), 1);
+  assert.equal(await count('SELECT COUNT(*) AS n FROM retired_names WHERE code = ?', 'my-first-name'), 0);
 
   assert.equal((await rename(mine.code, 'links')).status, 409); // one of Linki's own paths
   assert.equal((await rename(mine.code, 'a')).status, 400);
@@ -479,6 +482,168 @@ test('renaming to a taken name is refused with a message, and the owner picks an
   const detail = await (await request(`/links/${mine.code}`, { cookie: mine.cookie })).text();
   assert.match(detail, /more than 1,000 clicks/);
   assert.doesNotMatch(detail, /<form class="rn"/);
+});
+
+test('an old name forwards to the current link and the click is counted there', async () => {
+  const destination = 'https://example.com/tet-forward';
+  const { code, cookie } = await createLink({ url: destination, name: 'tet-sale' });
+  assert.equal(code, 'tet-sale');
+  const json = { Accept: 'application/json' };
+  const renamed = await post('/links/tet-sale/rename', { name: 'tet-sale-2026' }, { cookie, headers: json });
+  assert.equal(renamed.status, 200);
+
+  const retiredBefore = await count('SELECT COUNT(*) AS n FROM retired_names');
+  const linksBefore = await count('SELECT COUNT(*) AS n FROM links');
+  const head = await click('tet-sale', { method: 'HEAD' });
+  const preview = await click('tet-sale', { headers: { 'Sec-Purpose': 'prefetch' } });
+  const bot = await click('tet-sale', { ua: 'curl/8.4.0' });
+  for (const res of [head, preview, bot]) {
+    assert.equal(res.status, 302);
+    assert.equal(res.headers.get('Location'), destination);
+    assert.equal(res.headers.get('Cache-Control'), 'no-store');
+  }
+  await new Promise((resolve) => setTimeout(resolve, 50));
+  assert.deepEqual(await linkRow('tet-sale-2026'), { click_count: 0, unique_count: 0 });
+
+  const get = await click('tet-sale', { ip: '198.51.100.20' });
+  assert.equal(get.status, 302);
+  assert.equal(get.headers.get('Location'), destination);
+  assert.equal(get.headers.get('Cache-Control'), 'no-store');
+  await waitForClicks('tet-sale-2026', 1);
+  assert.deepEqual(await linkRow('tet-sale-2026'), { click_count: 1, unique_count: 1 });
+  assert.equal(await count('SELECT COUNT(*) AS n FROM clicks WHERE code = ?', 'tet-sale-2026'), 1);
+  assert.equal(await count('SELECT COUNT(*) AS n FROM clicks WHERE code = ?', 'tet-sale'), 0);
+  assert.equal(await linkRow('tet-sale'), null);
+  // A plain visit writes the click only. The retired row and the link list stay put.
+  assert.equal(await count('SELECT COUNT(*) AS n FROM retired_names'), retiredBefore);
+  assert.equal(await count('SELECT COUNT(*) AS n FROM links'), linksBefore);
+
+  const again = await post('/links/tet-sale-2026/rename', { name: 'tet-sale-final' }, { cookie, headers: json });
+  assert.equal(again.status, 200);
+  assert.equal(await goesTo('tet-sale'), destination);
+  assert.equal(await goesTo('tet-sale-2026'), destination);
+  const forwards = await db
+    .prepare('SELECT code, link_code FROM retired_names WHERE code IN (?, ?) ORDER BY code')
+    .bind('tet-sale', 'tet-sale-2026')
+    .all();
+  assert.deepEqual(forwards.results, [
+    { code: 'tet-sale', link_code: 'tet-sale-final' },
+    { code: 'tet-sale-2026', link_code: 'tet-sale-final' },
+  ]);
+  await click('tet-sale', { ip: '198.51.100.21' });
+  await click('tet-sale-2026', { ip: '198.51.100.22' });
+  await waitForClicks('tet-sale-final', 3);
+});
+
+test('someone else cannot take a retired name, and the owner can rename back to their own', async () => {
+  const destination = 'https://example.com/mine-forward';
+  const mine = await createLink({ url: destination, name: 'my-old-name' });
+  const json = { Accept: 'application/json' };
+  assert.equal(
+    (await post('/links/my-old-name/rename', { name: 'my-new-name' }, { cookie: mine.cookie, headers: json })).status,
+    200
+  );
+
+  const other = await createLink({ url: 'https://example.com/other-forward', name: 'my-old-name' });
+  assert.match(other.code, /^my-old-name-[a-z2-9]{2}$/);
+  assert.match(other.location, /asked=my-old-name/);
+  const token = setCookies(await request('/links', { cookie: other.cookie })).mcp.value;
+  const fromAgent = JSON.parse(
+    (await toolCall(token, 'create_link', { url: 'https://example.com/agent-old', name: 'my-old-name' })).content[0].text
+  );
+  assert.match(fromAgent.slug, /^my-old-name-[a-z2-9]{2}$/);
+  assert.match(fromAgent.note, /already taken/);
+  assert.notEqual(fromAgent.slug, other.code);
+
+  const taken = await post(`/links/${other.code}/rename`, { name: 'my-new-name' }, { cookie: other.cookie, headers: json });
+  assert.equal(taken.status, 409);
+  assert.equal((await taken.json()).error, '“my-new-name” is already taken. Try another name.');
+  const takenOld = await post(`/links/${other.code}/rename`, { name: 'My Old Name' }, { cookie: other.cookie, headers: json });
+  assert.equal(takenOld.status, 409);
+  assert.equal((await takenOld.json()).error, '“my-old-name” is already taken. Try another name.');
+  assert.equal(await goesTo('my-old-name'), destination);
+  assert.equal(await goesTo(other.code), 'https://example.com/other-forward');
+
+  // Creating again, even as the owner, does not hand the old name back. Renaming does.
+  const ownersNew = await createLink({ url: 'https://example.com/second', name: 'my-old-name', cookie: mine.cookie });
+  assert.match(ownersNew.code, /^my-old-name-[a-z2-9]{2}$/);
+  const back = await post('/links/my-new-name/rename', { name: 'my-old-name' }, { cookie: mine.cookie, headers: json });
+  assert.equal(back.status, 200);
+  assert.deepEqual(await back.json(), { ok: true, code: 'my-old-name', location: '/?new=my-old-name' });
+  assert.equal(await count('SELECT COUNT(*) AS n FROM retired_names WHERE code = ?', 'my-old-name'), 0);
+  assert.equal(await count('SELECT COUNT(*) AS n FROM links WHERE code = ?', 'my-old-name'), 1);
+  assert.equal(await goesTo('my-new-name'), destination);
+  assert.equal(await goesTo('my-old-name'), destination);
+  const kept = await db.prepare('SELECT link_code, owner_id FROM retired_names WHERE code = ?').bind('my-new-name').first();
+  assert.equal(kept.link_code, 'my-old-name');
+  // A different link of the same owner cannot take a name that still belongs to the first one.
+  const stolen = await post(`/links/${ownersNew.code}/rename`, { name: 'my-new-name' }, { cookie: mine.cookie, headers: json });
+  assert.equal(stolen.status, 409);
+  assert.match((await stolen.json()).error, /already taken/);
+});
+
+test('deleting a link retires its name and its old names', async () => {
+  const owner = await createLink({ url: 'https://example.com/gone', name: 'gone-first' });
+  const json = { Accept: 'application/json' };
+  assert.equal(
+    (await post('/links/gone-first/rename', { name: 'gone-second' }, { cookie: owner.cookie, headers: json })).status,
+    200
+  );
+  assert.equal(
+    (await post('/links/gone-second/rename', { name: 'gone-third' }, { cookie: owner.cookie, headers: json })).status,
+    200
+  );
+  await click('gone-third');
+  await waitForClicks('gone-third', 1);
+  const removed = await post('/links/gone-third/delete', {}, { cookie: owner.cookie });
+  assert.equal(removed.status, 303);
+
+  for (const name of ['gone-first', 'gone-second', 'gone-third']) {
+    const res = await click(name);
+    assert.equal(res.status, 404, name);
+    assert.match(await res.text(), /Link not found/);
+    const row = await db.prepare('SELECT link_code FROM retired_names WHERE code = ?').bind(name).first();
+    assert.equal(row.link_code, null, name);
+  }
+  assert.equal(await count('SELECT COUNT(*) AS n FROM clicks WHERE code = ?', 'gone-third'), 0);
+
+  const stranger = await createLink({ url: 'https://example.com/stranger', name: 'gone-first' });
+  assert.match(stranger.code, /^gone-first-[a-z2-9]{2}$/);
+  const strangerRename = await post(`/links/${stranger.code}/rename`, { name: 'gone-second' }, {
+    cookie: stranger.cookie,
+    headers: json,
+  });
+  assert.equal(strangerRename.status, 409);
+  assert.match((await strangerRename.json()).error, /already taken/);
+
+  const again = await createLink({ url: 'https://example.com/owner-again', name: 'gone-third', cookie: owner.cookie });
+  assert.match(again.code, /^gone-third-[a-z2-9]{2}$/);
+  const reclaim = await post(`/links/${again.code}/rename`, { name: 'gone-first' }, { cookie: owner.cookie, headers: json });
+  assert.equal(reclaim.status, 409);
+  assert.match((await reclaim.json()).error, /already taken/);
+  assert.equal((await click('gone-first')).status, 404);
+});
+
+test('random codes skip retired names', async () => {
+  const alphabet = 'abcdefghjkmnpqrstuvwxyz23456789';
+  const base = 'skip-retired';
+  await createLink({ url: 'https://example.com/skip-base', name: base });
+  const now = Math.floor(Date.now() / 1000);
+  const ownerId = 'f'.repeat(32);
+  const values = [];
+  for (const a of alphabet) {
+    for (const b of alphabet) values.push(`('${base}-${a}${b}',NULL,'${ownerId}',${now})`);
+  }
+  for (let i = 0; i < values.length; i += 200) {
+    await db.exec(
+      `INSERT INTO retired_names (code, link_code, owner_id, retired_at) VALUES ${values.slice(i, i + 200).join(',')}`
+    );
+  }
+  const made = await createLink({ url: 'https://example.com/skip-next', name: base });
+  assert.match(made.code, new RegExp(`^${base}-[a-z2-9]{4}$`));
+  assert.equal(await count('SELECT COUNT(*) AS n FROM retired_names WHERE code = ?', made.code), 0);
+  assert.equal((await request(`/${made.code}`)).headers.get('Location'), 'https://example.com/skip-next');
+  assert.equal((await request(`/${base}`)).headers.get('Location'), 'https://example.com/skip-base');
 });
 
 test('bad destinations are refused with a clear message', async () => {

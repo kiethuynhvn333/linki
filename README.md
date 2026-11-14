@@ -12,12 +12,13 @@ Google Analytics loads on Linki's own pages from `GA_ID` at the top of `src/inde
 - Paste a long URL to get a short link.
 - Custom names are free: type a name after `linki.ing/` and the link becomes `linki.ing/your-name`. Names use letters, numbers and hyphens, 3 to 40 characters. Spaces, capitals and accents are converted (`Khuyến mãi Tết` becomes `khuyen-mai-tet`), and short links ignore capitals.
 - A link address can only lead to one place, so a name goes to whoever takes it first. If the name is taken, the link is still created, with a short ending (`spring-sale-k7`), and the page says so.
-- A name can be changed later. Right after creating a link, click the name in the result box, type a new one and save; a link's own page has the same box. If the new name is taken, the page says so and you pick another one (nothing is added automatically). The old address stops working, and the click history moves to the new name. A link with more than 1,000 clicks keeps its name (`RENAME_MAX_CLICKS`).
+- A name can be changed later. Right after creating a link, click the name in the result box, type a new one and save; a link's own page has the same box. If the new name is taken, the page says so and you pick another one (nothing is added automatically). The old address keeps working and forwards to the new one, and the click history moves to the new name. A link with more than 1,000 clicks keeps its name (`RENAME_MAX_CLICKS`).
+- A name is never given out again. After a rename, the old address forwards to the current one. After a delete, that name and its older names show the not-found page, and nobody can claim them. The owner of a link can rename it back to one of that link's own old names.
 - Limits on new links: 20 an hour and 50 a day per network address on the website, and 10 an hour and 25 a day per connector for agents (`CREATE_LIMITS` in `src/index.js`).
 - Short links redirect with a 302. Bots and link previewers are filtered out of the click count.
 - The home hero shows a decorative preview card (`linki.ing/hello`, a small chart, and 128 clicks). It shows the custom name as you type it. Creating a link replaces it with the real result card.
 - "Your links" lists your links with their click counts; each link has a 30-day click chart. Days follow the browser's time zone.
-- A link's page has a "Delete link" button. Deleting stops the short link and removes its click history.
+- A link's page has a "Delete link" button. Deleting stops the short link, removes its click history, and retires the name. Older names that forwarded to it stop working too.
 - Short-link visitors aren't tracked with cookies. Unique visits are counted with a daily salted hash.
 - A browser gets its owner cookie when it creates its first link, and the cookie is renewed on every visit. Visitors who create nothing get no owner cookie.
 - Only the homepage is open to search engines. Short links and "Your links" pages are not indexed.
