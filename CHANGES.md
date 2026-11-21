@@ -1,3 +1,15 @@
+# Share cards (21 Nov 2026)
+
+A short link that points at Linki lands on the homepage with a query string. That page used to send `noindex` and nothing else, so Threads, X, Facebook and the rest drew a blank card titled "linki.ing".
+
+- The homepage sends the full share tags with or without a query. A query still sets `noindex`. `og:url` and the canonical URL are the homepage with the query removed.
+- Other HTML pages (Your links, a missing page) send `og:site_name`, `og:title` and `og:image` as well, so they are not blank cards either. They stay `noindex`.
+- `/og.png` is a 1200×630 PNG (variant C in `assets/og-c.svg`: the blue hero field, a paper card, the cursor logo and the wordmark). X does not accept SVG. It is cached for 30 days, answers GET and HEAD, and is not a click. `assets/og-a.svg` and `assets/og-b.svg` are the other studies. `./scripts/render-og.sh` rebuilds the PNGs. The wordmark is Bricolage Grotesque ExtraBold, subsetted under the SIL OFL (`assets/font/`).
+- `/apple-touch-icon.png` and `/icon-512.png` are the logo, linked from every page.
+- `robots.txt` allows those images. A crawler that honours robots.txt will not fetch a picture the file disallows, and the card would stay blank.
+- The PNGs are imported as binary modules (`[[rules]]` type `Data` in `wrangler.toml`). No build step. `img-src 'self'` already covers them, so the content security policy is unchanged.
+- No database change.
+
 # Unlimited owners (21 Nov 2026)
 
 `UNLIMITED_OWNERS` is an optional Worker secret: a comma-separated list of owner IDs. Those owners skip the hourly and daily create limits on the website and through `create_link`, because both go through `makeLink`. Destination checks, name rules, retired names, and uniqueness are unchanged. Everyone else keeps `CREATE_LIMITS`. An unset or empty secret leaves behaviour unchanged. The list is not a `[vars]` entry, and it is not shown on a page, in an MCP reply, or in a log. No database change.
