@@ -471,6 +471,21 @@ function jsonResponse(body, status) {
   });
 }
 
+// Drop one leading "www." so www.linki.ing and the bare host are the same site.
+function bareHost(hostname) {
+  const host = String(hostname || '').toLowerCase();
+  return host.startsWith('www.') ? host.slice(4) : host;
+}
+
+// The request host, linki.ing, and the workers.dev fallback are all this site.
+// A short link must not chain through any of them.
+function isOwnHost(hostname, ownHost) {
+  const host = bareHost(hostname);
+  if (!host) return false;
+  if (host === bareHost(ownHost) || host === 'linki.ing') return true;
+  return host.endsWith('.linki-app.workers.dev');
+}
+
 function checkDestination(raw, ownHost) {
   if (!raw) return { error: 'Paste a URL first.' };
   if (raw.length > MAX_URL_LENGTH) return { error: 'That URL is too long.' };
@@ -492,7 +507,10 @@ function checkDestination(raw, ownHost) {
   if (!parsed.hostname.includes('.')) {
     return { error: 'That does not look like a valid URL.' };
   }
-  if (parsed.hostname === ownHost) {
+  // The home page is allowed, so a launch link can carry UTM tags. Any other
+  // path could be another short link. parsed.pathname is the path the browser
+  // requests: /%68ello and // are not home, and "." / ".." are already folded.
+  if (isOwnHost(parsed.hostname, ownHost) && parsed.pathname !== '/') {
     return { error: 'A short link cannot point back to this site.' };
   }
   if (parsed.href.length > MAX_URL_LENGTH) return { error: 'That URL is too long.' };
@@ -1032,7 +1050,11 @@ const MCP_TOOLS = [
     inputSchema: {
       type: 'object',
       properties: {
-        url: { type: 'string', description: 'Where the short link goes. http or https.' },
+        url: {
+          type: 'string',
+          description:
+            'Where the short link goes. http or https. The home page of this site is allowed, and its query string and hash are kept. Any other path on this site is not.',
+        },
         name: {
           type: 'string',
           description: `Optional custom name: letters, numbers and hyphens, ${NAME_MIN_LENGTH} to ${NAME_MAX_LENGTH} characters. Leave it out for a random code.`,

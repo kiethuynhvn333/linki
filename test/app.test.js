@@ -123,6 +123,10 @@ function linkRow(code) {
   return db.prepare('SELECT click_count, unique_count FROM links WHERE code = ?').bind(code).first();
 }
 
+async function storedDestination(code) {
+  return (await db.prepare('SELECT destination FROM links WHERE code = ?').bind(code).first()).destination;
+}
+
 async function count(sql, ...params) {
   return (await db.prepare(sql).bind(...params).first()).n;
 }
@@ -660,6 +664,104 @@ test('bad destinations are refused with a clear message', async () => {
     assert.match(await res.text(), message, url);
   }
   assert.equal(await count('SELECT COUNT(*) AS n FROM links WHERE destination LIKE ?', '%evil.example%'), 0);
+});
+
+// The form and create_link both call makeLink, which calls checkDestination.
+test('a short link may point at the home page and keeps the UTM query', async () => {
+  const destination =
+    'https://linki.ing/?utm_source=threads&utm_medium=social&utm_campaign=launch&utm_content=a1h1-vn';
+  const { code } = await createLink({ url: destination, name: 'launch-utm' });
+  assert.equal(code, 'launch-utm');
+  assert.equal(await storedDestination(code), destination);
+
+  const gone = await click(code);
+  assert.equal(gone.status, 302);
+  assert.equal(gone.headers.get('Location'), destination);
+  await waitForClicks(code, 1);
+
+  const linksBefore = await count('SELECT COUNT(*) AS n FROM links');
+  const clicksBefore = await count('SELECT COUNT(*) AS n FROM clicks');
+  const tokensBefore = await count('SELECT COUNT(*) AS n FROM mcp_tokens');
+  const homePath = '/?utm_source=threads&utm_medium=social&utm_campaign=launch&utm_content=a1h1-vn';
+  const home = await request(homePath, { origin: 'https://linki.ing' });
+  assert.equal(home.status, 200);
+  assert.equal(home.headers.get('Location'), null);
+  const html = await home.text();
+  assert.match(html, /<h1>a very good alternative to /);
+  assert.match(html, />linki\.ing\/</);
+  assert.doesNotMatch(html, /Your short link is ready/);
+  assert.doesNotMatch(html, /utm_source/);
+  assert.deepEqual(home.headers.getSetCookie(), []);
+
+  // www still redirects to the bare host, and the query stays on the URL.
+  const www = await request(homePath, { origin: 'https://www.linki.ing' });
+  assert.equal(www.status, 301);
+  assert.equal(www.headers.get('Location'), destination);
+
+  await new Promise((resolve) => setTimeout(resolve, 300));
+  assert.equal(await count('SELECT COUNT(*) AS n FROM links'), linksBefore);
+  assert.equal(await count('SELECT COUNT(*) AS n FROM clicks'), clicksBefore);
+  assert.equal(await count('SELECT COUNT(*) AS n FROM mcp_tokens'), tokensBefore);
+  assert.equal((await linkRow(code)).click_count, 1);
+
+  const allowed = [
+    ['https://linki.ing', 'https://linki.ing/'],
+    ['https://linki.ing/', 'https://linki.ing/'],
+    ['https://linki.test', 'https://linki.test/'],
+    ['https://linki.test/', 'https://linki.test/'],
+    ['https://linki.test/?utm_content=a1h1-vn#top', 'https://linki.test/?utm_content=a1h1-vn#top'],
+    ['https://www.linki.test/', 'https://www.linki.test/'],
+    ['https://www.linki.ing/', 'https://www.linki.ing/'],
+    ['https://linki.linki-app.workers.dev/', 'https://linki.linki-app.workers.dev/'],
+    ['https://notlinki-app.workers.dev/hello', 'https://notlinki-app.workers.dev/hello'],
+    ['https://linki.ing.evil.com/hello', 'https://linki.ing.evil.com/hello'],
+  ];
+  for (const [url, stored] of allowed) {
+    const made = await createLink({ url });
+    assert.equal(await storedDestination(made.code), stored, url);
+  }
+
+  const { cookie } = await createLink();
+  const token = setCookies(await request('/links', { cookie })).mcp.value;
+  const made = await toolCall(token, 'create_link', { url: destination, name: 'mcp-home-utm' });
+  assert.equal(made.isError, undefined);
+  assert.deepEqual(JSON.parse(made.content[0].text), {
+    slug: 'mcp-home-utm',
+    short_url: `${ORIGIN}/mcp-home-utm`,
+    destination,
+  });
+  assert.equal(await goesTo('mcp-home-utm'), destination);
+  const refused = await toolCall(token, 'create_link', { url: 'https://linki.ing/hello' });
+  assert.equal(refused.isError, true);
+  assert.match(refused.content[0].text, /cannot point back/);
+});
+
+test('paths on this site other than the home page are still refused', async () => {
+  const blocked = [
+    'https://linki.test/hello',
+    'https://linki.test/abc?x=1',
+    'https://linki.test/links',
+    'https://linki.test/mcp/x',
+    'https://linki.test/r/abc',
+    'https://linki.test/index.html',
+    'https://linki.test//',
+    'https://linki.test/%68ello',
+    'https://www.linki.test/hello',
+    'https://www.linki.test/abc?x=1',
+    'https://linki.ing/hello',
+    'https://www.linki.ing/links',
+    'https://www.linki.ing/mcp/x',
+    'https://linki.linki-app.workers.dev/hello',
+    'https://linki-staging.linki-app.workers.dev/mcp/x',
+    'https://linki.linki-app.workers.dev/%68ello',
+  ];
+  const before = await count('SELECT COUNT(*) AS n FROM links');
+  for (const url of blocked) {
+    const res = await post('/create', { url });
+    assert.equal(res.status, 400, url);
+    assert.match(await res.text(), /cannot point back/, url);
+  }
+  assert.equal(await count('SELECT COUNT(*) AS n FROM links'), before);
 });
 
 test('a request body that is not a form gets a 400, not a server error', async () => {
