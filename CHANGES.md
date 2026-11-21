@@ -1,3 +1,9 @@
+# Unlimited owners (21 Nov 2026)
+
+`UNLIMITED_OWNERS` is an optional Worker secret: a comma-separated list of owner IDs. Those owners skip the hourly and daily create limits on the website and through `create_link`, because both go through `makeLink`. Destination checks, name rules, retired names, and uniqueness are unchanged. Everyone else keeps `CREATE_LIMITS`. An unset or empty secret leaves behaviour unchanged. The list is not a `[vars]` entry, and it is not shown on a page, in an MCP reply, or in a log. No database change.
+
+Set it with `npx wrangler secret put UNLIMITED_OWNERS`.
+
 # Retired names (14 Nov 2026)
 
 A short name is never given to someone else after it has been used.
