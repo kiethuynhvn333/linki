@@ -41,8 +41,10 @@ const CHART_DAYS = 30;
 const OWNER_COOKIE_MAX_AGE = 31536000; // one year, renewed on every visit
 const CLICK_RETENTION_DAYS = 400; // raw click rows; totals live on the links row
 const PRUNE_BATCH = 10000;
+// "bot" does not match meta-externalfetcher/1.1 or Iframely/1.3.1. The copy of
+// meta-externalfetcher that includes a docs URL also says "crawler"; the short one does not.
 const BOT_RE =
-  /bot|crawl|spider|slurp|facebookexternalhit|meta-externalagent|whatsapp\/|preview|curl|wget|python|headless|pingdom|uptime|monitor|go-http-client|okhttp|axios|node-fetch|undici|java\/|dalvik|libwww|httpclient|scrapy|postman|insomnia|google-inspectiontool|googleother|lighthouse|embedly|vkshare|validator|feedfetcher|mediapartners/i;
+  /bot|crawl|spider|slurp|facebookexternalhit|meta-externalfetcher|meta-externalagent|whatsapp\/|preview|curl|wget|python|headless|pingdom|uptime|monitor|go-http-client|okhttp|axios|node-fetch|undici|java\/|dalvik|libwww|httpclient|scrapy|postman|insomnia|google-inspectiontool|googleother|lighthouse|embedly|iframely|vkshare|validator|feedfetcher|mediapartners/i;
 const HOME_TITLE = 'Linki — a very good alternative to bitly';
 const HOME_DESCRIPTION =
   'Paste a long URL, give the short link your own name for free, and see how many people click it. No sign-up.';
@@ -65,6 +67,49 @@ const REVIEW_WORKFLOW = [
 // The Linki mark: a white cursor on a cobalt tile, with the pink and mustard
 // shapes of the hero card. The header logo and the favicon are this one SVG.
 const LOGO_SVG = '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 32 32"><defs><clipPath id="lt"><rect width="32" height="32" rx="9"/></clipPath></defs><g clip-path="url(#lt)"><rect width="32" height="32" fill="#2665D6"/><circle cx="9" cy="32.5" r="6.5" fill="#D2A72A"/><rect x="20" y="21" width="18" height="18" rx="5" fill="#E9C0E9" transform="rotate(18 29 30)"/></g><path d="M9 7.5 23.5 14l-6.8 2.4-2.5 6.8z" fill="#fff" stroke="#fff" stroke-width="2.6" stroke-linejoin="round"/></svg>';
+
+// Search engines may read the homepage, with or without a query, and the share
+// images. Short links stay closed. Link-preview crawlers may read short links
+// and the homepage. Private routes stay closed. A crawler matches its own
+// product token, so this list does not cover training crawlers (GPTBot,
+// meta-externalagent, CCBot, Iframely-Training, Applebot-Extended): they keep
+// the first group. Disallow comes before Allow: / so a reader that stops at
+// the first match still blocks private routes.
+const ROBOTS_TXT = [
+  'User-agent: *',
+  'Allow: /$',
+  'Allow: /?',
+  'Allow: /og.png',
+  'Allow: /apple-touch-icon.png',
+  'Allow: /icon-512.png',
+  'Allow: /favicon.svg',
+  'Allow: /favicon.ico',
+  'Disallow: /',
+  '',
+  'User-agent: facebookexternalhit',
+  'User-agent: Facebot',
+  'User-agent: meta-externalfetcher',
+  'User-agent: Twitterbot',
+  'User-agent: LinkedInBot',
+  'User-agent: Slackbot',
+  'User-agent: Slackbot-LinkExpanding',
+  'User-agent: TelegramBot',
+  'User-agent: WhatsApp',
+  'User-agent: Discordbot',
+  'User-agent: Applebot',
+  'User-agent: Pinterestbot',
+  'User-agent: redditbot',
+  'User-agent: SkypeUriPreview',
+  'User-agent: Iframely',
+  'User-agent: Embedly',
+  'User-agent: ZaloBot',
+  'Disallow: /links',
+  'Disallow: /mcp',
+  'Disallow: /mcp-review',
+  'Disallow: /create',
+  'Disallow: /review',
+  'Allow: /',
+].join('\n');
 
 const worker = {
   async fetch(request, env, ctx) {
@@ -100,13 +145,7 @@ const worker = {
       if (path === '/favicon.svg' || path === '/favicon.ico') return new Response(LOGO_SVG, { headers: { 'Content-Type': 'image/svg+xml', 'Cache-Control': 'public, max-age=86400' } });
       // Brand images. These are not short links, so a fetch is never counted as a click.
       if (PNG_ASSETS[path] && method === 'GET') return pngResponse(PNG_ASSETS[path]);
-      // Only the homepage is open to search engines. Short links and account pages are not.
-      // The share image and icons stay allowed: preview crawlers skip a picture robots.txt blocks.
-      if (path === '/robots.txt') {
-        return new Response(
-          'User-agent: *\nAllow: /$\nAllow: /og.png\nAllow: /apple-touch-icon.png\nAllow: /icon-512.png\nAllow: /favicon.svg\nAllow: /favicon.ico\nDisallow: /\n'
-        );
-      }
+      if (path === '/robots.txt') return new Response(ROBOTS_TXT);
       const detail = path.match(DETAIL_RE);
       if (detail && method === 'GET') return detailPage(request, env, url, detail[1]);
       const del = path.match(DELETE_RE);
