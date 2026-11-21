@@ -70,11 +70,16 @@ const LOGO_SVG = '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 32 32"><d
 
 // Search engines may read the homepage, with or without a query, and the share
 // images. Short links stay closed. Link-preview crawlers may read short links
-// and the homepage. Private routes stay closed. A crawler matches its own
-// product token, so this list does not cover training crawlers (GPTBot,
-// meta-externalagent, CCBot, Iframely-Training, Applebot-Extended): they keep
-// the first group. Disallow comes before Allow: / so a reader that stops at
-// the first match still blocks private routes.
+// and the homepage. Private routes stay closed. A rule is a prefix, so each
+// private route ends with `$` (the URL ends there) and has a `?` line for that
+// same path with a query. `$` does not match a query. Routes with subpaths
+// (/links/:code, /mcp/:token, /review/..., /mcp-review/...) also disallow a
+// trailing slash. /create is only POST /create, so it has no slash line.
+// RESERVED refuses only the exact name, so /links must not hide /links-news.
+// A crawler matches its own product token, so this list does not cover training
+// crawlers (GPTBot, meta-externalagent, CCBot, Iframely-Training,
+// Applebot-Extended): they keep the first group. Disallow comes before
+// Allow: / so a reader that stops at the first match still blocks private routes.
 const ROBOTS_TXT = [
   'User-agent: *',
   'Allow: /$',
@@ -103,11 +108,20 @@ const ROBOTS_TXT = [
   'User-agent: Iframely',
   'User-agent: Embedly',
   'User-agent: ZaloBot',
-  'Disallow: /links',
-  'Disallow: /mcp',
-  'Disallow: /mcp-review',
-  'Disallow: /create',
-  'Disallow: /review',
+  'Disallow: /links$',
+  'Disallow: /links?',
+  'Disallow: /links/',
+  'Disallow: /mcp$',
+  'Disallow: /mcp?',
+  'Disallow: /mcp/',
+  'Disallow: /mcp-review$',
+  'Disallow: /mcp-review?',
+  'Disallow: /mcp-review/',
+  'Disallow: /create$',
+  'Disallow: /create?',
+  'Disallow: /review$',
+  'Disallow: /review?',
+  'Disallow: /review/',
   'Allow: /',
 ].join('\n');
 

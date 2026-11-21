@@ -454,11 +454,20 @@ test('robots.txt lets preview crawlers read short links and a homepage query', a
       'User-agent: Iframely',
       'User-agent: Embedly',
       'User-agent: ZaloBot',
-      'Disallow: /links',
-      'Disallow: /mcp',
-      'Disallow: /mcp-review',
-      'Disallow: /create',
-      'Disallow: /review',
+      'Disallow: /links$',
+      'Disallow: /links?',
+      'Disallow: /links/',
+      'Disallow: /mcp$',
+      'Disallow: /mcp?',
+      'Disallow: /mcp/',
+      'Disallow: /mcp-review$',
+      'Disallow: /mcp-review?',
+      'Disallow: /mcp-review/',
+      'Disallow: /create$',
+      'Disallow: /create?',
+      'Disallow: /review$',
+      'Disallow: /review?',
+      'Disallow: /review/',
       'Allow: /',
     ].join('\n')
   );
@@ -468,10 +477,13 @@ test('robots.txt lets preview crawlers read short links and a homepage query', a
 
   const cases = [
     ['*', '/?utm_source=x', true],
+    ['*', '/?utm', true],
     ['Googlebot', '/?utm_source=x', true],
     ['*', '/', true],
     ['*', '/og.png', true],
     ['*', '/r2-vn', false],
+    ['*', '/some-slug', false],
+    ['*', '/links-news', false],
     ['Googlebot', '/r2-vn', false],
     ['GPTBot', '/r2-vn', false],
     ['meta-externalagent', '/r2-vn', false],
@@ -480,20 +492,78 @@ test('robots.txt lets preview crawlers read short links and a homepage query', a
     ['facebookexternalhit', '/r2-vn', true],
     ['Twitterbot', '/links', false],
     ['facebookexternalhit', '/links', false],
+    ['Twitterbot', '/links?x=1', false],
+    ['facebookexternalhit', '/links?x=1', false],
     ['Twitterbot', '/links/abcd', false],
     ['Twitterbot', '/mcp', false],
     ['facebookexternalhit', '/mcp', false],
     ['Twitterbot', '/mcp/secret', false],
+    ['Twitterbot', '/mcp/sometoken', false],
+    ['facebookexternalhit', '/mcp/sometoken', false],
     ['facebookexternalhit', '/mcp-review/secret', false],
+    ['Twitterbot', '/mcp-review/sometoken', false],
+    ['facebookexternalhit', '/mcp-review/sometoken', false],
     ['Twitterbot', '/create', false],
+    ['facebookexternalhit', '/create', false],
     ['Twitterbot', '/review', false],
+    ['facebookexternalhit', '/review', false],
     ['Twitterbot', '/', true],
+    ['facebookexternalhit', '/', true],
     ['facebookexternalhit', '/?utm_source=x', true],
+    ['Twitterbot', '/?utm_source=x', true],
     ['Twitterbot', '/og.png', true],
+    ['facebookexternalhit', '/og.png', true],
+    ['Twitterbot', '/a2h2-image-facebook-vn', true],
+    ['facebookexternalhit', '/a2h2-image-facebook-vn', true],
+    ['Twitterbot', '/links-news', true],
+    ['facebookexternalhit', '/links-news', true],
+    ['Twitterbot', '/review-2026', true],
+    ['facebookexternalhit', '/review-2026', true],
+    ['Twitterbot', '/mcp-guide', true],
+    ['facebookexternalhit', '/mcp-guide', true],
+    ['Twitterbot', '/create-x', true],
+    ['facebookexternalhit', '/create-x', true],
   ];
   for (const [ua, path, allowed] of cases) {
     assert.equal(robotsAllows(robots, ua, path), allowed, `${ua} ${path}`);
   }
+});
+
+test('preview rules close a reserved route and leave a longer short link open', async () => {
+  const robots = await (await request('/robots.txt')).text();
+  // Same words as RESERVED in src/index.js. The check is the whole name, so
+  // links-ab is a legal code and /links is not. Other reserved words are not
+  // routes; robots.txt does not mention them.
+  const reserved = [
+    'links', 'create', 'api', 'admin', 'static', 'mcp', 'mcp-review', 'review', 'new', 'app',
+    'www', 'about', 'help', 'login', 'signup', 'account', 'settings', 'terms', 'privacy', 'linki',
+  ];
+  const routed = new Set(['links', 'create', 'mcp', 'mcp-review', 'review']);
+  // What fetch() actually serves. /create has no subpath. The others do.
+  const closed = [
+    '/links', '/links?x=1', '/links/abcd', '/links/abcd/delete', '/links/abcd/rename',
+    '/create', '/create?x=1',
+    '/mcp', '/mcp?x=1', '/mcp/sometoken', '/mcp/reset',
+    '/mcp-review', '/mcp-review?x=1', '/mcp-review/sometoken',
+    '/review', '/review?x=1', '/review/comments', '/review/agent/secret',
+  ];
+  for (const ua of ['facebookexternalhit', 'Twitterbot']) {
+    for (const name of reserved) {
+      assert.equal(robotsAllows(robots, ua, `/${name}-news`), true, `${ua} /${name}-news`);
+      assert.equal(robotsAllows(robots, ua, `/${name}x`), true, `${ua} /${name}x`);
+      if (!routed.has(name)) {
+        assert.equal(robotsAllows(robots, ua, `/${name}`), true, `${ua} /${name}`);
+      }
+    }
+    for (const path of closed) {
+      assert.equal(robotsAllows(robots, ua, path), false, `${ua} ${path}`);
+    }
+    assert.equal(robotsAllows(robots, ua, '/create/'), true, `${ua} /create/`);
+  }
+  assert.equal(robotsAllows(robots, '*', '/og.png'), true);
+  assert.equal(robotsAllows(robots, '*', '/?utm'), true);
+  assert.equal(robotsAllows(robots, '*', '/some-slug'), false);
+  assert.equal(robotsAllows(robots, '*', '/links-news'), false);
 });
 
 test('share cards keep the branded image, including on a homepage with a query', async () => {
