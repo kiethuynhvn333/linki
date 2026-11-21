@@ -24,7 +24,8 @@ Google Analytics loads on Linki's own pages from `GA_ID` at the top of `src/inde
 - Only the homepage is open to search engines. Short links and "Your links" pages are not indexed.
 - `http://` and `www.` addresses redirect to the `https://` bare domain.
 - Raw click rows are deleted after 400 days by a daily cron. Total and unique counts are kept on the link.
-- The header logo and the favicon are the same SVG (`LOGO_SVG` in `src/index.js`), served at `/favicon.svg` and `/favicon.ico`.
+- The header logo and the favicon are the same SVG (`LOGO_SVG` in `src/index.js`), served at `/favicon.svg` and `/favicon.ico`. The same mark is a PNG at `/apple-touch-icon.png` (180×180) and `/icon-512.png`.
+- Sharing a Linki page, including the homepage with a query string, shows a preview card. The graphic is `/og.png` (1200×630). `og:url` and the canonical URL stay on the homepage without the query. Rebuild the PNGs with `./scripts/render-og.sh` after editing `assets/og.svg`.
 - The home hero is animated: the click count ticks up, the shapes in the blue card float and follow the mouse, and example chips scroll under it. All of it stops under `prefers-reduced-motion`.
 - Under the hero, the homepage lists what Linki offers in four short points (`USPS` in `src/index.js`).
 
@@ -112,6 +113,7 @@ To try it locally, put a throwaway `REVIEW_KEY` in `.dev.vars` (that file stays 
 
 ## Files
 - `src/index.js`: the whole app (routes, HTML, CSS, favicon, MCP).
+- `assets/`: the share image (`og.svg`, `og.png`), the PNG icons, and the Bricolage Grotesque subset used to draw the wordmark. `scripts/render-og.sh` rebuilds the PNGs.
 - `migrations/`: the D1 tables, applied in order by `wrangler d1 migrations apply`.
 - `test/app.test.js`: end-to-end tests.
 - `wrangler.toml`: Worker, custom domains, daily cron, logs, and database config.

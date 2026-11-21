@@ -1,6 +1,17 @@
 // Link tracker: create short links, redirect, count clicks.
 // One Cloudflare Worker + one D1 database. No framework.
 
+// Share card and home-screen icons. Wrangler loads these as Data (see [[rules]]).
+import ogImage from '../assets/og.png';
+import appleTouchIcon from '../assets/apple-touch-icon.png';
+import icon512 from '../assets/icon-512.png';
+
+const PNG_ASSETS = {
+  '/og.png': ogImage,
+  '/apple-touch-icon.png': appleTouchIcon,
+  '/icon-512.png': icon512,
+};
+
 const GA_ID = 'G-MEBVJJ00K8'; // set to '' to disable Google Analytics on Linki's pages
 const ALPHABET = 'abcdefghjkmnpqrstuvwxyz23456789'; // no i, l, o, 0, 1
 const CODE_LENGTH = 6;
@@ -87,8 +98,15 @@ const worker = {
       if (path === '/mcp/reset') return resetMcp(request, env, url);
       if (path.startsWith('/mcp/')) return mcpEndpoint(request, env, url);
       if (path === '/favicon.svg' || path === '/favicon.ico') return new Response(LOGO_SVG, { headers: { 'Content-Type': 'image/svg+xml', 'Cache-Control': 'public, max-age=86400' } });
+      // Brand images. These are not short links, so a fetch is never counted as a click.
+      if (PNG_ASSETS[path] && method === 'GET') return pngResponse(PNG_ASSETS[path]);
       // Only the homepage is open to search engines. Short links and account pages are not.
-      if (path === '/robots.txt') return new Response('User-agent: *\nAllow: /$\nDisallow: /\n');
+      // The share image and icons stay allowed: preview crawlers skip a picture robots.txt blocks.
+      if (path === '/robots.txt') {
+        return new Response(
+          'User-agent: *\nAllow: /$\nAllow: /og.png\nAllow: /apple-touch-icon.png\nAllow: /icon-512.png\nAllow: /favicon.svg\nAllow: /favicon.ico\nDisallow: /\n'
+        );
+      }
       const detail = path.match(DETAIL_RE);
       if (detail && method === 'GET') return detailPage(request, env, url, detail[1]);
       const del = path.match(DELETE_RE);
@@ -872,8 +890,19 @@ function linkList(links, origin, offset = 0) {
 }
 
 async function messagePage(request, env, status, title, text) {
+  const url = new URL(request.url);
   const body = `<section class="msg"><p class="status">${status}</p><h1>${esc(title)}</h1><p class="muted">${esc(noOrphan(text))}</p><a class="button secondary" href="/">Go to the homepage</a></section>`;
-  return page(title, body, { status, review: await reviewOn(request, env) });
+  return page(title, body, { status, url, review: await reviewOn(request, env) });
+}
+
+function pngResponse(body) {
+  return new Response(body, {
+    headers: {
+      'Content-Type': 'image/png',
+      'Cache-Control': 'public, max-age=2592000',
+      'X-Content-Type-Options': 'nosniff',
+    },
+  });
 }
 
 function gaHead(linkCreated, nonce) {
@@ -889,18 +918,33 @@ function gaHead(linkCreated, nonce) {
 `;
 }
 
-// Only the plain homepage is indexable. Everything else stays out of search engines.
-function seoHead(index, url) {
-  if (!index || !url) return '<meta name="robots" content="noindex">';
-  const home = `${url.origin}/`;
-  return `<meta name="description" content="${esc(HOME_DESCRIPTION)}">
-<link rel="canonical" href="${esc(home)}">
-<meta property="og:type" content="website">
+// The plain homepage is the only indexable page. A homepage with a query string
+// (a short link that points at Linki lands here) stays noindex, but still sends
+// the share tags. Without them, Threads and the rest draw a blank card.
+// og:url and canonical always drop the query.
+function seoHead(title, url, { home = false, index = false } = {}) {
+  const origin = url ? url.origin : 'https://linki.ing';
+  const homeUrl = `${origin}/`;
+  const image = `${origin}/og.png`;
+  const pageUrl = home || !url ? homeUrl : `${origin}${url.pathname}`;
+  const robots = index ? '' : '<meta name="robots" content="noindex">\n';
+  const homeTags = home
+    ? `<meta name="description" content="${esc(HOME_DESCRIPTION)}">\n<link rel="canonical" href="${esc(homeUrl)}">\n`
+    : '';
+  return `${robots}${homeTags}<meta property="og:type" content="website">
 <meta property="og:site_name" content="Linki">
-<meta property="og:title" content="${esc(HOME_TITLE)}">
+<meta property="og:title" content="${esc(title)}">
 <meta property="og:description" content="${esc(HOME_DESCRIPTION)}">
-<meta property="og:url" content="${esc(home)}">
-<meta name="twitter:card" content="summary">`;
+<meta property="og:url" content="${esc(pageUrl)}">
+<meta property="og:image" content="${esc(image)}">
+<meta property="og:image:width" content="1200">
+<meta property="og:image:height" content="630">
+<meta property="og:image:alt" content="${esc(HOME_TITLE)}">
+<meta property="og:image:type" content="image/png">
+<meta name="twitter:card" content="summary_large_image">
+<meta name="twitter:title" content="${esc(title)}">
+<meta name="twitter:description" content="${esc(HOME_DESCRIPTION)}">
+<meta name="twitter:image" content="${esc(image)}">`;
 }
 
 function contentSecurityPolicy(nonce) {
@@ -925,9 +969,11 @@ function page(title, body, { owner, url, status = 200, linkCreated = false, mcpT
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-${seoHead(index, url)}
+${seoHead(fullTitle, url, { home: Boolean(url && url.pathname === '/'), index })}
 <title>${esc(fullTitle)}</title>
 <link rel="icon" href="/favicon.svg" type="image/svg+xml">
+<link rel="icon" href="/icon-512.png" type="image/png" sizes="512x512">
+<link rel="apple-touch-icon" href="/apple-touch-icon.png" sizes="180x180">
 ${gaHead(linkCreated, nonce)}<link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
 <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Bricolage+Grotesque:opsz,wght@12..96,700;12..96,800&family=Inter:wght@400;500;600;700&family=Space+Mono:wght@400;700&display=swap">

@@ -10,6 +10,8 @@ import { Miniflare } from 'miniflare';
 
 const ROOT = fileURLToPath(new URL('..', import.meta.url));
 const ORIGIN = 'https://linki.test';
+// Same rule as wrangler.toml: PNG imports are binary Data modules.
+const MODULE_RULES = [{ type: 'Data', include: ['**/*.png'], fallthrough: true }];
 const BROWSER_UA = 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 Chrome/130.0 Safari/537.36';
 // Obviously fake. Production never has this binding.
 const REVIEW_KEY = 'test-review-key';
@@ -34,6 +36,7 @@ before(async () => {
   mf = new Miniflare({
     modules: true,
     scriptPath: `${ROOT}src/index.js`,
+    modulesRules: MODULE_RULES,
     compatibilityDate: '2025-01-01',
     d1Databases: { DB: 'linki-test' },
     bindings: { HASH_SECRET: 'test-secret' },
@@ -43,6 +46,7 @@ before(async () => {
   reviewMf = new Miniflare({
     modules: true,
     scriptPath: `${ROOT}src/index.js`,
+    modulesRules: MODULE_RULES,
     compatibilityDate: '2025-01-01',
     d1Databases: { DB: 'linki-review-test' },
     bindings: { HASH_SECRET: 'test-secret', REVIEW_KEY, NOINDEX: '1' },
@@ -202,6 +206,7 @@ async function withWorker(bindings, run) {
   const worker = new Miniflare({
     modules: true,
     scriptPath: `${ROOT}src/index.js`,
+    modulesRules: MODULE_RULES,
     compatibilityDate: '2025-01-01',
     d1Databases: { DB: `linki-extra-${++ipCounter}` },
     bindings: { HASH_SECRET: 'test-secret', ...bindings },
@@ -365,7 +370,86 @@ test('every other page stays out of search engines', async () => {
     assert.match(html, /<meta name="robots" content="noindex">/, path);
   }
   const robots = await (await request('/robots.txt')).text();
-  assert.equal(robots, 'User-agent: *\nAllow: /$\nDisallow: /\n');
+  assert.equal(
+    robots,
+    'User-agent: *\nAllow: /$\nAllow: /og.png\nAllow: /apple-touch-icon.png\nAllow: /icon-512.png\nAllow: /favicon.svg\nAllow: /favicon.ico\nDisallow: /\n'
+  );
+});
+
+test('share cards keep the branded image, including on a homepage with a query', async () => {
+  const image = 'https://linki.test/og.png';
+  for (const path of ['/', '/?utm_source=threads&utm_content=r1-vn', '/?new=anything']) {
+    const html = await (await request(path)).text();
+    assert.match(html, /property="og:image" content="https:\/\/linki\.test\/og\.png"/, path);
+    assert.match(html, /property="og:image:width" content="1200"/, path);
+    assert.match(html, /property="og:image:height" content="630"/, path);
+    assert.match(html, /property="og:image:alt" content="Linki — a very good alternative to bitly"/, path);
+    assert.match(html, /property="og:image:type" content="image\/png"/, path);
+    assert.match(html, /property="og:site_name" content="Linki"/, path);
+    assert.match(html, /property="og:url" content="https:\/\/linki\.test\/"/, path);
+    assert.match(html, /name="twitter:card" content="summary_large_image"/, path);
+    assert.match(html, /name="twitter:image" content="https:\/\/linki\.test\/og\.png"/, path);
+    assert.match(html, /name="twitter:title" content="Linki — a very good alternative to bitly"/, path);
+    assert.match(html, /name="twitter:description" content="[^"]+"/, path);
+    assert.match(html, /<link rel="canonical" href="https:\/\/linki\.test\/">/, path);
+    assert.ok(html.includes(`content="${image}"`), path);
+    assert.match(html, /rel="apple-touch-icon" href="\/apple-touch-icon\.png"/, path);
+    assert.match(html, /rel="icon" href="\/icon-512\.png"/, path);
+  }
+  assert.doesNotMatch(await (await request('/')).text(), /name="robots"/);
+  assert.match(await (await request('/?utm_source=threads')).text(), /name="robots" content="noindex"/);
+
+  const links = await (await request('/links')).text();
+  assert.match(links, /property="og:site_name" content="Linki"/);
+  assert.match(links, /property="og:title" content="Your links — Linki"/);
+  assert.match(links, /property="og:image" content="https:\/\/linki\.test\/og\.png"/);
+  assert.match(links, /name="robots" content="noindex"/);
+
+  const missing = await (await request('/no/such/page')).text();
+  assert.match(missing, /property="og:site_name" content="Linki"/);
+  assert.match(missing, /property="og:title" content="Page not found — Linki"/);
+  assert.match(missing, /property="og:image" content="https:\/\/linki\.test\/og\.png"/);
+  assert.match(missing, /name="twitter:card" content="summary_large_image"/);
+});
+
+function pngSize(bytes) {
+  const buf = Buffer.from(bytes);
+  assert.equal(buf.subarray(0, 8).toString('hex'), '89504e470d0a1a0a');
+  return { width: buf.readUInt32BE(16), height: buf.readUInt32BE(20) };
+}
+
+test('the share image and icons are cached PNGs and are not clicks', async () => {
+  const clicksBefore = await count('SELECT COUNT(*) AS n FROM clicks');
+  const og = await request('/og.png');
+  assert.equal(og.status, 200);
+  assert.equal(og.headers.get('Content-Type'), 'image/png');
+  assert.match(og.headers.get('Cache-Control'), /public, max-age=2592000/);
+  assert.deepEqual(pngSize(await og.arrayBuffer()), { width: 1200, height: 630 });
+
+  const head = await request('/og.png', { method: 'HEAD' });
+  assert.equal(head.status, 200);
+  assert.equal(head.headers.get('Content-Type'), 'image/png');
+  assert.equal(await head.text(), '');
+
+  const touch = await request('/apple-touch-icon.png');
+  assert.equal(touch.headers.get('Content-Type'), 'image/png');
+  assert.deepEqual(pngSize(await touch.arrayBuffer()), { width: 180, height: 180 });
+  const icon = await request('/icon-512.png');
+  assert.equal(icon.status, 200);
+  assert.equal(icon.headers.get('Content-Type'), 'image/png');
+  assert.deepEqual(pngSize(await icon.arrayBuffer()), { width: 512, height: 512 });
+  const iconHead = await request('/icon-512.png', { method: 'HEAD' });
+  assert.equal(iconHead.status, 200);
+  assert.equal(iconHead.headers.get('Content-Type'), 'image/png');
+  assert.equal(await iconHead.text(), '');
+
+  assert.equal(await count('SELECT COUNT(*) AS n FROM clicks'), clicksBefore);
+
+  const { code } = await createLink({ url: 'https://example.com/still-redirects' });
+  const redirect = await request(`/${code}`);
+  assert.equal(redirect.status, 302);
+  assert.equal(redirect.headers.get('Location'), 'https://example.com/still-redirects');
+  assert.equal(redirect.headers.get('Cache-Control'), 'no-store');
 });
 
 test('pages send security headers, and the script nonce matches the policy', async () => {
@@ -464,6 +548,7 @@ test('a staging copy (NOINDEX set) tells search engines to stay away', async () 
   const staging = new Miniflare({
     modules: true,
     scriptPath: `${ROOT}src/index.js`,
+    modulesRules: MODULE_RULES,
     compatibilityDate: '2025-01-01',
     d1Databases: { DB: 'linki-staging-test' },
     bindings: { HASH_SECRET: 'test-secret', NOINDEX: '1' },
