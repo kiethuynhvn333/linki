@@ -369,11 +369,131 @@ test('every other page stays out of search engines', async () => {
     const html = await (await request(path, { cookie })).text();
     assert.match(html, /<meta name="robots" content="noindex">/, path);
   }
+});
+
+// A crawler matches its product token exactly. Rules match path + query.
+// The longest matching rule wins, and an equal Allow beats Disallow.
+function robotsGroups(body) {
+  const groups = [];
+  let group = null;
+  for (const raw of body.split('\n')) {
+    const line = raw.split('#')[0].trim();
+    if (!line) continue;
+    const sep = line.indexOf(':');
+    const field = line.slice(0, sep).trim().toLowerCase();
+    const value = line.slice(sep + 1).trim();
+    if (field === 'user-agent') {
+      if (!group || group.rules.length) {
+        group = { agents: [], rules: [] };
+        groups.push(group);
+      }
+      group.agents.push(value.toLowerCase());
+    } else if (field === 'allow' || field === 'disallow') {
+      group.rules.push({ allow: field === 'allow', pattern: value });
+    }
+  }
+  return groups;
+}
+
+function robotsRuleMatches(pattern, path) {
+  let source = '^';
+  for (const char of pattern) {
+    if (char === '*') source += '.*';
+    else if (char === '$') source += '$';
+    else source += char.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  }
+  return new RegExp(source).test(path);
+}
+
+function robotsAllows(body, ua, path) {
+  const groups = robotsGroups(body);
+  const token = ua.toLowerCase();
+  const named = groups.filter((group) => group.agents.includes(token));
+  const rules = (named.length ? named : groups.filter((group) => group.agents.includes('*'))).flatMap(
+    (group) => group.rules
+  );
+  let winner = null;
+  for (const rule of rules) {
+    if (!robotsRuleMatches(rule.pattern, path)) continue;
+    const longer = !winner || rule.pattern.length > winner.pattern.length;
+    const tieAllow = winner && rule.pattern.length === winner.pattern.length && rule.allow;
+    if (longer || tieAllow) winner = rule;
+  }
+  return winner ? winner.allow : true;
+}
+
+test('robots.txt lets preview crawlers read short links and a homepage query', async () => {
   const robots = await (await request('/robots.txt')).text();
   assert.equal(
     robots,
-    'User-agent: *\nAllow: /$\nAllow: /og.png\nAllow: /apple-touch-icon.png\nAllow: /icon-512.png\nAllow: /favicon.svg\nAllow: /favicon.ico\nDisallow: /\n'
+    [
+      'User-agent: *',
+      'Allow: /$',
+      'Allow: /?',
+      'Allow: /og.png',
+      'Allow: /apple-touch-icon.png',
+      'Allow: /icon-512.png',
+      'Allow: /favicon.svg',
+      'Allow: /favicon.ico',
+      'Disallow: /',
+      '',
+      'User-agent: facebookexternalhit',
+      'User-agent: Facebot',
+      'User-agent: meta-externalfetcher',
+      'User-agent: Twitterbot',
+      'User-agent: LinkedInBot',
+      'User-agent: Slackbot',
+      'User-agent: Slackbot-LinkExpanding',
+      'User-agent: TelegramBot',
+      'User-agent: WhatsApp',
+      'User-agent: Discordbot',
+      'User-agent: Applebot',
+      'User-agent: Pinterestbot',
+      'User-agent: redditbot',
+      'User-agent: SkypeUriPreview',
+      'User-agent: Iframely',
+      'User-agent: Embedly',
+      'User-agent: ZaloBot',
+      'Disallow: /links',
+      'Disallow: /mcp',
+      'Disallow: /mcp-review',
+      'Disallow: /create',
+      'Disallow: /review',
+      'Allow: /',
+    ].join('\n')
   );
+  for (const name of ['GPTBot', 'meta-externalagent', 'CCBot', 'Iframely-Training', 'Applebot-Extended']) {
+    assert.equal(robots.includes(`User-agent: ${name}`), false, name);
+  }
+
+  const cases = [
+    ['*', '/?utm_source=x', true],
+    ['Googlebot', '/?utm_source=x', true],
+    ['*', '/', true],
+    ['*', '/og.png', true],
+    ['*', '/r2-vn', false],
+    ['Googlebot', '/r2-vn', false],
+    ['GPTBot', '/r2-vn', false],
+    ['meta-externalagent', '/r2-vn', false],
+    ['CCBot', '/r2-vn', false],
+    ['Twitterbot', '/r2-vn', true],
+    ['facebookexternalhit', '/r2-vn', true],
+    ['Twitterbot', '/links', false],
+    ['facebookexternalhit', '/links', false],
+    ['Twitterbot', '/links/abcd', false],
+    ['Twitterbot', '/mcp', false],
+    ['facebookexternalhit', '/mcp', false],
+    ['Twitterbot', '/mcp/secret', false],
+    ['facebookexternalhit', '/mcp-review/secret', false],
+    ['Twitterbot', '/create', false],
+    ['Twitterbot', '/review', false],
+    ['Twitterbot', '/', true],
+    ['facebookexternalhit', '/?utm_source=x', true],
+    ['Twitterbot', '/og.png', true],
+  ];
+  for (const [ua, path, allowed] of cases) {
+    assert.equal(robotsAllows(robots, ua, path), allowed, `${ua} ${path}`);
+  }
 });
 
 test('share cards keep the branded image, including on a homepage with a query', async () => {
@@ -1076,6 +1196,39 @@ test('bots, link previews, HEAD requests and prefetches are not counted', async 
   await click(code, { method: 'HEAD' });
   await click(code, { headers: { 'Sec-Purpose': 'prefetch;prerender' } });
   await click(code); // one real click, so we know the writes have landed
+  await waitForClicks(code, 1);
+  assert.deepEqual(await linkRow(code), { click_count: 1, unique_count: 1 });
+});
+
+test('preview crawlers get the normal redirect and are not counted', async () => {
+  const destination = 'https://example.com/preview-card';
+  const { code } = await createLink({ url: destination });
+  const previews = [
+    'facebookexternalhit/1.1 (+http://www.facebook.com/externalhit_uatext.php)',
+    'Facebot',
+    'meta-externalfetcher/1.1',
+    'Twitterbot/1.0',
+    'LinkedInBot/1.0 (compatible; Mozilla/5.0; Apache-HttpClient +http://www.linkedin.com)',
+    'Slackbot 1.0 (+https://api.slack.com/robots)',
+    'Slackbot-LinkExpanding 1.0 (+https://api.slack.com/robots)',
+    'TelegramBot (like TwitterBot)',
+    'WhatsApp/2.23.20.0',
+    'Mozilla/5.0 (compatible; Discordbot/2.0; +https://discordapp.com)',
+    'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_5) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/13.1.1 Safari/605.1.15 (Applebot/0.1; +http://www.apple.com/go/applebot)',
+    'Mozilla/5.0 (compatible; Pinterestbot/1.0; +https://www.pinterest.com/bot.html)',
+    'Mozilla/5.0 (compatible; redditbot/1.0; +http://www.reddit.com/feedback)',
+    'Mozilla/5.0 (Windows NT 6.1; WOW64) SkypeUriPreview Preview/0.5',
+    'Iframely/1.3.1 (+https://iframely.com/docs/about)',
+    'Mozilla/5.0 (compatible; Embedly/0.2; +http://support.embed.ly/)',
+    'ZaloBot/1.0',
+  ];
+  for (const ua of previews) {
+    const res = await click(code, { ua });
+    assert.equal(res.status, 302, ua);
+    assert.equal(res.headers.get('Location'), destination, ua);
+    assert.equal(res.headers.get('Cache-Control'), 'no-store', ua);
+  }
+  await click(code, { ip: '198.51.100.77' });
   await waitForClicks(code, 1);
   assert.deepEqual(await linkRow(code), { click_count: 1, unique_count: 1 });
 });

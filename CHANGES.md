@@ -1,3 +1,12 @@
+# Preview crawlers (21 Nov 2026)
+
+`robots.txt` disallowed short links, and `Allow: /$` does not match a homepage with a query. Twitterbot, facebookexternalhit and the other preview crawlers that obey the file never fetched the share tags or `/og.png`, so Threads and X showed a bare card.
+
+- `User-agent: *` still blocks short links. `Allow: /?` opens the homepage with any query. The share images stay allowed.
+- Preview crawlers have their own group and may fetch short links and the homepage. `/links`, `/mcp`, `/mcp-review`, `/create` and `/review` stay closed. Training crawlers (GPTBot, meta-externalagent, CCBot, and the rest) are not in that group, so they keep the `*` rules.
+- A fetch by those crawlers is still not a click, and the answer is still a 302. `meta-externalfetcher/1.1` and `Iframely/1.3.1` did not match the old filter; they do now.
+- No database change.
+
 # Share cards (21 Nov 2026)
 
 A short link that points at Linki lands on the homepage with a query string. That page used to send `noindex` and nothing else, so Threads, X, Facebook and the rest drew a blank card titled "linki.ing".
