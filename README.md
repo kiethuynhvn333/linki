@@ -69,6 +69,8 @@ npx wrangler deploy
 
 For later releases, `npm run release` runs the tests, applies any new migrations, and deploys. Apply migrations before deploying: new code expects the new columns. Without `HASH_SECRET` the Worker still runs, but it logs an error and visitor hashes use a public fallback.
 
+Owners named in the `UNLIMITED_OWNERS` secret skip the hourly and daily limits, on the website and through the connector. Everyone else keeps the limits above. Set it with `npx wrangler secret put UNLIMITED_OWNERS`. The value is a comma-separated list of owner IDs (the same values stored in `links.owner_id` and `mcp_tokens`). Spaces around each ID are ignored, and empty entries are ignored. Leave the secret unset or empty and behaviour is unchanged. Do not add it under `[vars]` in `wrangler.toml`.
+
 Self-hosters get their own `<name>.<subdomain>.workers.dev` URL from that deploy. To add a custom domain, put this in `wrangler.toml`:
 
 ```

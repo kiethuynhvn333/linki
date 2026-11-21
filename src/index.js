@@ -23,7 +23,8 @@ const RENAME_RE = new RegExp(`^/links/(${CODE})/rename$`);
 // A rename rewrites the link's click rows, so a link with more clicks than this keeps its name.
 const RENAME_MAX_CLICKS = 1000;
 // New links per rolling hour and per rolling day. The website counts per network
-// address. An agent counts per connector, and gets less.
+// address. An agent counts per connector, and gets less. Owner IDs listed in the
+// UNLIMITED_OWNERS secret skip these checks. Everyone else keeps them.
 const CREATE_LIMITS = { web: { hour: 20, day: 50 }, mcp: { hour: 10, day: 25 } };
 const CHART_DAYS = 30;
 const OWNER_COOKIE_MAX_AGE = 31536000; // one year, renewed on every visit
@@ -275,7 +276,8 @@ async function createLink(request, env, url) {
 
 // Creates a link for the website and for the connector. Returns { code,
 // destination, taken } or { error, status }. taken is the name that was asked
-// for when someone else already had it and an ending was added.
+// for when someone else already had it and an ending was added. Owners listed
+// in UNLIMITED_OWNERS skip the hour and day limits. Every other check stays.
 async function makeLink(env, { ownerId, rawUrl, rawName, ownHost, creatorHash, limit }) {
   const checked = checkDestination(rawUrl, ownHost);
   if (checked.error) return { error: checked.error, status: 400 };
@@ -283,17 +285,19 @@ async function makeLink(env, { ownerId, rawUrl, rawName, ownHost, creatorHash, l
   if (named.error) return { error: named.error, status: 400 };
 
   const now = Math.floor(Date.now() / 1000);
-  const recent = await env.DB.prepare(
-    `SELECT COUNT(*) AS day, COALESCE(SUM(created_at > ?), 0) AS hour
-     FROM links WHERE creator_hash = ? AND created_at > ?`
-  )
-    .bind(now - 3600, creatorHash, now - 86400)
-    .first();
-  if (recent.hour >= limit.hour) {
-    return { error: 'You have created a lot of links in the last hour. Please try again later.', status: 429 };
-  }
-  if (recent.day >= limit.day) {
-    return { error: 'You have reached the daily limit for new links. Please try again tomorrow.', status: 429 };
+  if (!isUnlimitedOwner(env, ownerId)) {
+    const recent = await env.DB.prepare(
+      `SELECT COUNT(*) AS day, COALESCE(SUM(created_at > ?), 0) AS hour
+       FROM links WHERE creator_hash = ? AND created_at > ?`
+    )
+      .bind(now - 3600, creatorHash, now - 86400)
+      .first();
+    if (recent.hour >= limit.hour) {
+      return { error: 'You have created a lot of links in the last hour. Please try again later.', status: 429 };
+    }
+    if (recent.day >= limit.day) {
+      return { error: 'You have reached the daily limit for new links. Please try again tomorrow.', status: 429 };
+    }
   }
 
   // A link address can only lead to one place, so a name is first come, first
@@ -319,6 +323,19 @@ async function makeLink(env, { ownerId, rawUrl, rawName, ownHost, creatorHash, l
     }
   }
   throw new Error('Could not generate a unique code');
+}
+
+// UNLIMITED_OWNERS is an optional secret: a comma-separated list of owner IDs
+// (the same values stored in links.owner_id). Listed owners skip the new-link
+// limits. Unset, empty, or blank means everyone is limited. Never log this list.
+function isUnlimitedOwner(env, ownerId) {
+  const raw = env.UNLIMITED_OWNERS;
+  if (typeof raw !== 'string' || !ownerId) return false;
+  for (const part of raw.split(',')) {
+    const id = part.trim();
+    if (id && id === ownerId) return true;
+  }
+  return false;
 }
 
 // Turns what was typed into a link name: "Khuyến mãi Tết!" becomes "khuyen-mai-tet".

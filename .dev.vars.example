@@ -1,3 +1,5 @@
 HASH_SECRET=local-development-only
 # Optional, for `wrangler dev --env staging` only. Leave this unset to match production.
 # REVIEW_KEY=
+# Optional. Comma-separated owner IDs that skip the new-link limits. Leave unset to limit everyone.
+# UNLIMITED_OWNERS=

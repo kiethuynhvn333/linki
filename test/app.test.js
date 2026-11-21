@@ -3,7 +3,7 @@
 
 import { test, before, after } from 'node:test';
 import assert from 'node:assert/strict';
-import { createHash } from 'node:crypto';
+import { createHash, randomBytes } from 'node:crypto';
 import { readFileSync, readdirSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import { Miniflare } from 'miniflare';
@@ -186,6 +186,153 @@ async function reviewCookie() {
 
 async function reviewCount(sql, ...params) {
   return (await reviewDb.prepare(sql).bind(...params).first()).n;
+}
+
+function randomOwnerId() {
+  return randomBytes(16).toString('hex');
+}
+
+function sha(text) {
+  return createHash('sha256').update(text).digest('hex');
+}
+
+// A Worker with its own database, so UNLIMITED_OWNERS can be set without
+// changing the suite's main Worker, which leaves that secret unset.
+async function withWorker(bindings, run) {
+  const worker = new Miniflare({
+    modules: true,
+    scriptPath: `${ROOT}src/index.js`,
+    compatibilityDate: '2025-01-01',
+    d1Databases: { DB: `linki-extra-${++ipCounter}` },
+    bindings: { HASH_SECRET: 'test-secret', ...bindings },
+  });
+  try {
+    const database = await worker.getD1Database('DB');
+    await applyMigrations(database);
+    await run(worker, database);
+  } finally {
+    await worker.dispose();
+  }
+}
+
+function workerPost(worker, fields, { cookie, ip } = {}) {
+  return worker.dispatchFetch(`${ORIGIN}/create`, {
+    method: 'POST',
+    redirect: 'manual',
+    body: new URLSearchParams(fields).toString(),
+    headers: {
+      'User-Agent': BROWSER_UA,
+      'Content-Type': 'application/x-www-form-urlencoded',
+      Origin: ORIGIN,
+      ...(cookie ? { Cookie: cookie } : {}),
+      ...(ip ? { 'CF-Connecting-IP': ip } : {}),
+    },
+  });
+}
+
+async function workerRpc(worker, token, method, params) {
+  const res = await worker.dispatchFetch(`${ORIGIN}/mcp/${token}`, {
+    method: 'POST',
+    redirect: 'manual',
+    body: JSON.stringify({ jsonrpc: '2.0', id: 1, method, params }),
+    headers: { 'User-Agent': BROWSER_UA, 'Content-Type': 'application/json' },
+  });
+  return { status: res.status, json: await res.json() };
+}
+
+let limitCase = 0;
+
+// Puts an owner at the hour limit and at the day limit, then checks the
+// existing refusal. Web limits are per network address; connector limits are
+// per owner. hidden strings must not appear in the refusal (the owner list).
+async function assertStillLimited(worker, database, ownerId, hidden = []) {
+  const n = ++limitCase;
+  const hourIp = freshIp();
+  await seedCreations(database, {
+    prefix: `lim${n}h`,
+    ownerId,
+    creator: sha(`test-secret|creator|${hourIp}`).slice(0, 32),
+    count: 20,
+    ageSeconds: 30,
+  });
+  const hour = await workerPost(worker, { url: 'https://example.com/over-hour' }, { cookie: `owner=${ownerId}`, ip: hourIp });
+  assert.equal(hour.status, 429);
+  const hourText = await hour.text();
+  assert.match(hourText, /in the last hour/);
+  assertNoSecret(hourText, hidden);
+
+  const dayIp = freshIp();
+  await seedCreations(database, {
+    prefix: `lim${n}d`,
+    ownerId,
+    creator: sha(`test-secret|creator|${dayIp}`).slice(0, 32),
+    count: 50,
+    ageSeconds: 2 * 3600,
+  });
+  const day = await workerPost(worker, { url: 'https://example.com/over-day' }, { cookie: `owner=${ownerId}`, ip: dayIp });
+  assert.equal(day.status, 429);
+  const dayText = await day.text();
+  assert.match(dayText, /daily limit/);
+  assertNoSecret(dayText, hidden);
+
+  const token = `limit-token-${n}-abcdefghij`;
+  // The limit page belongs to an owner who already has links, so it may have
+  // issued a connector. Replace that row with a token this test knows.
+  await database.prepare('DELETE FROM mcp_tokens WHERE owner_id = ?').bind(ownerId).run();
+  await database
+    .prepare('INSERT INTO mcp_tokens (token_hash, owner_id, created_at) VALUES (?, ?, ?)')
+    .bind(sha(token), ownerId, Math.floor(Date.now() / 1000))
+    .run();
+  // Day first: these rows are outside the hour window, so only the daily check fires.
+  await seedCreations(database, {
+    prefix: `lim${n}md`,
+    ownerId,
+    creator: sha(`test-secret|mcp|${ownerId}`).slice(0, 32),
+    count: 25,
+    ageSeconds: 2 * 3600,
+  });
+  const mcpDay = await workerRpc(worker, token, 'tools/call', {
+    name: 'create_link',
+    arguments: { url: 'https://example.com/mcp-day' },
+  });
+  assert.equal(mcpDay.json.result.isError, true);
+  assert.match(mcpDay.json.result.content[0].text, /daily limit/);
+  assert.match(mcpDay.json.result.content[0].text, /10 links an hour and 25 a day/);
+  assertNoSecret(mcpDay.json.result.content[0].text, hidden);
+
+  await seedCreations(database, {
+    prefix: `lim${n}mh`,
+    ownerId,
+    creator: sha(`test-secret|mcp|${ownerId}`).slice(0, 32),
+    count: 10,
+    ageSeconds: 30,
+  });
+  const mcpHour = await workerRpc(worker, token, 'tools/call', {
+    name: 'create_link',
+    arguments: { url: 'https://example.com/mcp-hour' },
+  });
+  assert.equal(mcpHour.json.result.isError, true);
+  assert.match(mcpHour.json.result.content[0].text, /in the last hour/);
+  assert.match(mcpHour.json.result.content[0].text, /10 links an hour and 25 a day/);
+  assertNoSecret(mcpHour.json.result.content[0].text, hidden);
+}
+
+function assertNoSecret(text, hidden) {
+  assert.equal(text.includes('UNLIMITED_OWNERS'), false);
+  for (const id of hidden) assert.equal(text.includes(id), false, id);
+}
+
+async function seedCreations(database, { prefix, ownerId, creator, count, ageSeconds }) {
+  const created = Math.floor(Date.now() / 1000) - ageSeconds;
+  const rows = [];
+  for (let i = 0; i < count; i++) {
+    rows.push(
+      database
+        .prepare('INSERT INTO links (code, owner_id, destination, created_at, creator_hash) VALUES (?, ?, ?, ?, ?)')
+        .bind(`${prefix}-${i}`, ownerId, 'https://example.com/seed', created, creator)
+    );
+  }
+  await database.batch(rows);
 }
 
 const SAMPLE_COMMENT = {
@@ -959,6 +1106,107 @@ test('an agent can create links through the connector, with its own smaller limi
   assert.match(refused.content[0].text, /10 links an hour and 25 a day/);
   // The website limit is counted separately, per network address.
   await createLink({ cookie, ip });
+});
+
+test('an owner in UNLIMITED_OWNERS can pass the hour and day limits, and spaces in the list are ignored', async () => {
+  const listed = randomOwnerId();
+  const other = randomOwnerId();
+  // Spaces, a tab, and an empty entry. The id matches only after trimming.
+  const secret = ` \t${listed} \t, , ${other} , `;
+  await withWorker({ UNLIMITED_OWNERS: secret }, async (worker, database) => {
+    const home = await worker.dispatchFetch(`${ORIGIN}/`, {
+      redirect: 'manual',
+      headers: { 'User-Agent': BROWSER_UA },
+    });
+    const homeHtml = await home.text();
+    assertNoSecret(homeHtml, [listed, other, secret]);
+
+    const ip = freshIp();
+    const creator = sha(`test-secret|creator|${ip}`).slice(0, 32);
+    // 20 in the last hour and 50 in the last day: the next create would be refused.
+    await seedCreations(database, { prefix: 'ulwebh', ownerId: listed, creator, count: 20, ageSeconds: 30 });
+    await seedCreations(database, { prefix: 'ulwebd', ownerId: listed, creator, count: 30, ageSeconds: 2 * 3600 });
+    for (const name of ['launch-one', 'launch-two']) {
+      const res = await workerPost(
+        worker,
+        { url: 'https://example.com/launch', name },
+        { cookie: `owner=${listed}`, ip }
+      );
+      assert.equal(res.status, 303, name);
+      assert.equal(res.headers.get('Location'), `/?new=${name}`);
+      const page = await worker.dispatchFetch(`${ORIGIN}/?new=${name}`, {
+        redirect: 'manual',
+        headers: { 'User-Agent': BROWSER_UA, Cookie: `owner=${listed}` },
+      });
+      const html = await page.text();
+      assert.match(html, new RegExp(name));
+      assertNoSecret(html, [other, secret]);
+    }
+
+    const bad = await workerPost(
+      worker,
+      { url: 'javascript:alert(1)', name: 'nope' },
+      { cookie: `owner=${listed}`, ip }
+    );
+    assert.equal(bad.status, 400);
+    const badHtml = await bad.text();
+    assert.match(badHtml, /Only http and https/);
+    assertNoSecret(badHtml, [other, secret]);
+    assert.equal(
+      (await database.prepare('SELECT COUNT(*) AS n FROM links WHERE destination = ?').bind('https://example.com/launch').first()).n,
+      2
+    );
+
+    const token = 'listed-owner-connector-token';
+    // Opening the result page issued a connector. Swap it for a token this test knows.
+    await database.prepare('DELETE FROM mcp_tokens WHERE owner_id = ?').bind(listed).run();
+    await database
+      .prepare('INSERT INTO mcp_tokens (token_hash, owner_id, created_at) VALUES (?, ?, ?)')
+      .bind(sha(token), listed, Math.floor(Date.now() / 1000))
+      .run();
+    const mcpCreator = sha(`test-secret|mcp|${listed}`).slice(0, 32);
+    await seedCreations(database, { prefix: 'ulmcph', ownerId: listed, creator: mcpCreator, count: 10, ageSeconds: 30 });
+    await seedCreations(database, { prefix: 'ulmcpd', ownerId: listed, creator: mcpCreator, count: 15, ageSeconds: 2 * 3600 });
+    const tools = await workerRpc(worker, token, 'tools/list');
+    const toolsText = JSON.stringify(tools.json);
+    assert.match(toolsText, /10 links an hour and 25 a day/);
+    assertNoSecret(toolsText, [listed, other, secret]);
+    for (const name of ['agent-one', 'agent-two']) {
+      const made = await workerRpc(worker, token, 'tools/call', {
+        name: 'create_link',
+        arguments: { url: 'https://example.com/agent-launch', name },
+      });
+      assert.equal(made.json.result.isError, undefined, name);
+      assert.equal(JSON.parse(made.json.result.content[0].text).slug, name);
+      assertNoSecret(made.json.result.content[0].text, [listed, other, secret]);
+    }
+    const refused = await workerRpc(worker, token, 'tools/call', {
+      name: 'create_link',
+      arguments: { url: 'javascript:alert(1)' },
+    });
+    assert.equal(refused.json.result.isError, true);
+    assert.match(refused.json.result.content[0].text, /Only http and https/);
+    assertNoSecret(refused.json.result.content[0].text, [listed, other, secret]);
+  });
+});
+
+test('an owner who is not in UNLIMITED_OWNERS is still limited', async () => {
+  const listed = randomOwnerId();
+  const other = randomOwnerId();
+  const secret = ` ${listed} , , ${other} `;
+  await withWorker({ UNLIMITED_OWNERS: secret }, async (worker, database) => {
+    await assertStillLimited(worker, database, randomOwnerId(), [listed, other, secret]);
+  });
+});
+
+test('an unset or empty UNLIMITED_OWNERS keeps the usual limits', async () => {
+  // The suite Worker has no UNLIMITED_OWNERS binding.
+  await assertStillLimited(mf, db, randomOwnerId());
+  for (const value of ['', '   ,  ']) {
+    await withWorker({ UNLIMITED_OWNERS: value }, async (worker, database) => {
+      await assertStillLimited(worker, database, randomOwnerId());
+    });
+  }
 });
 
 // ---------- link detail, time zone, delete ----------
