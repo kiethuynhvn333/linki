@@ -45,6 +45,33 @@ const PRUNE_BATCH = 10000;
 // meta-externalfetcher that includes a docs URL also says "crawler"; the short one does not.
 const BOT_RE =
   /bot|crawl|spider|slurp|facebookexternalhit|meta-externalfetcher|meta-externalagent|whatsapp\/|preview|curl|wget|python|headless|pingdom|uptime|monitor|go-http-client|okhttp|axios|node-fetch|undici|java\/|dalvik|libwww|httpclient|scrapy|postman|insomnia|google-inspectiontool|googleother|lighthouse|embedly|iframely|vkshare|validator|feedfetcher|mediapartners/i;
+// Cloud and hosting networks. A visitor from one of these is a machine, not
+// someone at home. asn is matched exactly. orgs is a lowercase substring of
+// request.cf.asOrganization, so a new ASN from the same company still matches.
+// "google" on its own is also matched (see isDatacenter): that is Google's
+// network, and it does not match Google Fiber. Cloudflare's ASN is included
+// because Workers egress from it. The free plan cannot tell Workers apart
+// from WARP, which uses the same network. Bot Management is not in this list:
+// the free plan does not send it.
+const DATACENTERS = [
+  { name: 'Amazon / AWS', asns: [16509, 14618, 7224], orgs: ['amazon'] },
+  { name: 'Google / Google Cloud', asns: [15169, 396982], orgs: ['google llc', 'google cloud', 'google, inc'] },
+  { name: 'Microsoft / Azure', asns: [8075, 8068], orgs: ['microsoft', 'azure'] },
+  { name: 'DigitalOcean', asns: [14061], orgs: ['digitalocean'] },
+  { name: 'Hetzner', asns: [24940, 213230], orgs: ['hetzner'] },
+  { name: 'OVH', asns: [16276], orgs: ['ovh'] },
+  { name: 'Linode / Akamai', asns: [63949, 20940, 16625], orgs: ['linode', 'akamai'] },
+  { name: 'Oracle', asns: [31898], orgs: ['oracle'] },
+  { name: 'Alibaba', asns: [45102, 37963], orgs: ['alibaba'] },
+  { name: 'Tencent', asns: [132203, 45090], orgs: ['tencent'] },
+  { name: 'Cloudflare', asns: [13335], orgs: ['cloudflare'] },
+  { name: 'Vultr', asns: [20473], orgs: ['vultr', 'choopa'] },
+  { name: 'Contabo', asns: [51167], orgs: ['contabo'] },
+  { name: 'Scaleway', asns: [12876], orgs: ['scaleway'] },
+  { name: 'IBM Cloud', asns: [36351], orgs: ['softlayer', 'ibm cloud'] },
+];
+const DATACENTER_ASNS = new Set(DATACENTERS.flatMap((row) => row.asns));
+const DATACENTER_ORGS = DATACENTERS.flatMap((row) => row.orgs);
 const HOME_TITLE = 'Linki — a very good alternative to bitly';
 const HOME_DESCRIPTION =
   'Paste a long URL, give the short link your own name for free, and see how many people click it. No sign-up.';
@@ -268,17 +295,63 @@ async function redirect(request, env, ctx, code) {
   });
 }
 
-function shouldCount(request) {
-  if (request.method !== 'GET') return false;
+// One label for the request. Internal wins, so Kiet's own browser is never
+// mixed in with a cloud network he happens to be using. Then a bot (user
+// agent, HEAD, prefetch, or a verified-bot flag). Then a data center. Then a person.
+function classifyTraffic(request, env) {
+  const owner = getOwner(request);
+  if (!owner.isNew && isUnlimitedOwner(env, owner.id)) return 'internal';
+  if (isAutomated(request)) return 'bot';
+  if (isDatacenter(request)) return 'datacenter';
+  return 'human';
+}
+
+// The same checks that already keep a fetch out of the click count.
+function isAutomated(request) {
+  if (request.method === 'HEAD') return true;
   const ua = request.headers.get('User-Agent') || '';
-  if (!ua || BOT_RE.test(ua)) return false;
-  const purpose =
-    (request.headers.get('Sec-Purpose') || '') + (request.headers.get('Purpose') || '');
-  if (/prefetch|preview/i.test(purpose)) return false;
-  return true;
+  if (!ua || BOT_RE.test(ua)) return true;
+  const purpose = (request.headers.get('Sec-Purpose') || '') + (request.headers.get('Purpose') || '');
+  if (/prefetch|preview/i.test(purpose)) return true;
+  return verifiedBot(request);
+}
+
+// Paid Bot Management only. On the free plan request.cf.botManagement is missing
+// and this returns false. A score of 1 is the signal Cloudflare calls automated.
+// Any other score is left alone: a cutoff would mark real people.
+function verifiedBot(request) {
+  const bot = request.cf && request.cf.botManagement;
+  if (!bot || typeof bot !== 'object') return false;
+  if (bot.verifiedBot === true) return true;
+  return bot.score === 1;
+}
+
+function isDatacenter(request) {
+  const cf = request.cf;
+  if (!cf || typeof cf !== 'object') return false;
+  const asn = Number(cf.asn);
+  if (Number.isInteger(asn) && DATACENTER_ASNS.has(asn)) return true;
+  const org = String(cf.asOrganization || '').trim().toLowerCase();
+  if (!org) return false;
+  if (org === 'google') return true;
+  return DATACENTER_ORGS.some((name) => org.includes(name));
+}
+
+// Older click rows have no label. Reports count those with people.
+function humanClicks(alias) {
+  const column = alias ? `${alias}.traffic` : 'traffic';
+  return `(${column} = 'human' OR ${column} IS NULL)`;
+}
+
+function shouldCount(request) {
+  // Bots and previews stay out of the table. A data-center or internal visit
+  // is stored, with a label, so a report can leave it out.
+  return request.method === 'GET' && !isAutomated(request);
 }
 
 async function recordClick(request, env, code) {
+  if (isAutomated(request)) return;
+  const traffic = classifyTraffic(request, env);
   const now = Math.floor(Date.now() / 1000);
   const day = new Date().toISOString().slice(0, 10);
   const ip = request.headers.get('CF-Connecting-IP') || 'unknown';
@@ -287,7 +360,8 @@ async function recordClick(request, env, code) {
   // cannot be followed across days.
   const visitor = (await sha256(`${secret(env)}|${day}|${code}|${ip}|${ua}`)).slice(0, 32);
   // The hash already includes the day, so "not seen before" means "first click today".
-  // The counter update must run before the insert.
+  // The counter update must run before the insert. click_count is every stored
+  // click. Pages and reports count people from the traffic label instead.
   await env.DB.batch([
     env.DB.prepare(
       `UPDATE links SET click_count = click_count + 1,
@@ -295,8 +369,8 @@ async function recordClick(request, env, code) {
        WHERE code = ?`
     ).bind(code, visitor, code),
     env.DB.prepare(
-      'INSERT INTO clicks (code, ts, visitor_hash) SELECT ?, ?, ? WHERE EXISTS (SELECT 1 FROM links WHERE code = ?)'
-    ).bind(code, now, visitor, code),
+      'INSERT INTO clicks (code, ts, visitor_hash, traffic) SELECT ?, ?, ?, ? WHERE EXISTS (SELECT 1 FROM links WHERE code = ?)'
+    ).bind(code, now, visitor, traffic, code),
   ]);
 }
 
@@ -334,6 +408,8 @@ async function createLink(request, env, url) {
     ownHost: url.hostname,
     creatorHash: (await sha256(`${secret(env)}|creator|${ip}`)).slice(0, 32),
     limit: CREATE_LIMITS.web,
+    via: 'web',
+    traffic: classifyTraffic(request, env),
   });
   if (made.error) {
     return homePage(request, env, url, { error: made.error, rawUrl, name: rawName, status: made.status });
@@ -353,7 +429,7 @@ async function createLink(request, env, url) {
 // and the checked destination and returns { destination } or { error }. It runs
 // before the insert, so a taken name is retried with the slug that was stored.
 // The website does not pass decorate.
-async function makeLink(env, { ownerId, rawUrl, rawName, ownHost, creatorHash, limit, decorate }) {
+async function makeLink(env, { ownerId, rawUrl, rawName, ownHost, creatorHash, limit, decorate, via, traffic }) {
   const checked = checkDestination(rawUrl, ownHost);
   if (checked.error) return { error: checked.error, status: 400 };
   const named = checkName(rawName);
@@ -393,11 +469,20 @@ async function makeLink(env, { ownerId, rawUrl, rawName, ownHost, creatorHash, l
     }
     try {
       const inserted = await env.DB.prepare(
-        `INSERT INTO links (code, owner_id, destination, created_at, creator_hash)
-         SELECT ?, ?, ?, ?, ?
+        `INSERT INTO links (code, owner_id, destination, created_at, creator_hash, created_via, traffic)
+         SELECT ?, ?, ?, ?, ?, ?, ?
          WHERE NOT EXISTS (SELECT 1 FROM retired_names WHERE code = ?)`
       )
-        .bind(candidate, ownerId, destination, now, creatorHash, candidate)
+        .bind(
+          candidate,
+          ownerId,
+          destination,
+          now,
+          creatorHash,
+          via === 'mcp' ? 'mcp' : 'web',
+          traffic || 'human',
+          candidate
+        )
         .run();
       if (!inserted.meta.changes) continue;
       return { code: candidate, destination, taken: name && candidate !== name ? name : '' };
@@ -749,6 +834,8 @@ async function homePage(request, env, url, state = {}) {
     mcpToken: (mcp && mcp.token) || undefined,
     index: status === 200 && !url.search,
     review: await reviewOn(request, env),
+    request,
+    env,
   });
 }
 
@@ -774,6 +861,8 @@ async function linksPage(request, env, url) {
     url,
     mcpToken: mcp.token || undefined,
     review: await reviewOn(request, env),
+    request,
+    env,
   });
 }
 
@@ -850,14 +939,22 @@ async function detailPage(request, env, url, code) {
     return await messagePage(request, env, 404, 'Link not found', 'This link is not in your list.');
   }
 
-  // Days are counted in the visitor's time zone (see tzOffset). The query only
-  // reads the chart window, and the all-time totals come from the links row.
+  // Days are counted in the visitor's time zone (see tzOffset). The chart and
+  // the totals count people: a human click, and an older click with no label.
+  // The rename limit still uses links.click_count, every stored click, because
+  // a rename rewrites every click row.
   const offset = tzOffset(request);
   const today = localDay(Math.floor(Date.now() / 1000), offset);
   const since = (today - (CHART_DAYS - 1)) * 86400 - offset;
+  const people = await env.DB.prepare(
+    `SELECT COUNT(*) AS clicks, COUNT(DISTINCT visitor_hash) AS uniques
+     FROM clicks WHERE code = ? AND ${humanClicks()}`
+  )
+    .bind(code)
+    .first();
   const daily = await env.DB.prepare(
     `SELECT CAST((ts + ?) / 86400 AS INTEGER) AS day, COUNT(*) AS clicks, COUNT(DISTINCT visitor_hash) AS uniques
-     FROM clicks WHERE code = ? AND ts >= ? GROUP BY day`
+     FROM clicks WHERE code = ? AND ts >= ? AND ${humanClicks()} GROUP BY day`
   )
     .bind(offset, code, since)
     .all();
@@ -869,6 +966,8 @@ async function detailPage(request, env, url, code) {
   }
   const last30 = days.reduce((sum, d) => sum + d.clicks, 0);
   const max = Math.max(1, ...days.map((d) => d.clicks));
+  const totalClicks = Number(people.clicks);
+  const uniqueClicks = Number(people.uniques);
   const shortUrl = `${url.origin}/${link.code}`;
 
   const bars = days
@@ -894,8 +993,8 @@ async function detailPage(request, env, url, code) {
     </div>
 
     <div class="stats">
-      <div class="stat t1"><span class="label">Total&nbsp;clicks</span><span class="num">${link.click_count.toLocaleString('en-US')}</span></div>
-      <div class="stat t2"><span class="label">Unique&nbsp;clicks</span><span class="num">${link.unique_count.toLocaleString('en-US')}</span></div>
+      <div class="stat t1"><span class="label">Total&nbsp;clicks</span><span class="num">${totalClicks.toLocaleString('en-US')}</span></div>
+      <div class="stat t2"><span class="label">Unique&nbsp;clicks</span><span class="num">${uniqueClicks.toLocaleString('en-US')}</span></div>
       <div class="stat t3"><span class="label">Last&nbsp;${CHART_DAYS}&nbsp;days</span><span class="num">${last30.toLocaleString('en-US')}</span></div>
     </div>
 
@@ -904,7 +1003,7 @@ async function detailPage(request, env, url, code) {
       <div class="chart" role="img" aria-label="Clicks per day for the last ${CHART_DAYS} days, ${last30} in total">${bars}</div>
       <div class="axis"><span>${formatDay(days[0].day)}</span><span>Today · ${days[days.length - 1].clicks}</span></div>
     </section>
-    <p class="note">${noOrphan(`${offset ? `Days follow your time zone (${utcLabel(offset)}).` : 'Days are in UTC.'} Unique clicks count each visitor once per day; link previews and known bots are not counted.`)}</p>
+    <p class="note">${noOrphan(`${offset ? `Days follow your time zone (${utcLabel(offset)}).` : 'Days are in UTC.'} Unique clicks count each visitor once per day. Link previews, known bots, data-center networks and Linki's own checks are not included.`)}</p>
     <div class="rnz">
       <p>${link.click_count > RENAME_MAX_CLICKS ? esc(noOrphan(RENAME_LOCKED)) : noOrphan('Change the name. The old address keeps working and forwards to the new one.')}</p>
       ${link.click_count > RENAME_MAX_CLICKS ? '' : `<div class="rnw">${renameForm(link, url, 'detail')}</div>`}
@@ -913,16 +1012,23 @@ async function detailPage(request, env, url, code) {
       <p>${noOrphan('Deleting stops the short link and removes its click history.')}</p>
       <button class="secondary danger" type="submit">Delete link</button>
     </form>`;
-  return page(link.label || link.code, body, { owner, url, review: await reviewOn(request, env) });
+  return page(link.label || link.code, body, { owner, url, request, env, review: await reviewOn(request, env) });
 }
 
 async function listLinks(env, ownerId, limit) {
   const { results } = await env.DB.prepare(
-    'SELECT code, destination, label, status, click_count, created_at FROM links WHERE owner_id = ? ORDER BY created_at DESC, rowid DESC LIMIT ?'
+    `SELECT l.code, l.destination, l.label, l.status, l.created_at,
+            COUNT(c.id) AS click_count
+     FROM links l
+     LEFT JOIN clicks c ON c.code = l.code AND ${humanClicks('c')}
+     WHERE l.owner_id = ?
+     GROUP BY l.code
+     ORDER BY l.created_at DESC, l.rowid DESC
+     LIMIT ?`
   )
     .bind(ownerId, limit)
     .all();
-  return results;
+  return results.map((row) => ({ ...row, click_count: Number(row.click_count) }));
 }
 
 function linkList(links, origin, offset = 0) {
@@ -957,7 +1063,7 @@ function linkList(links, origin, offset = 0) {
 async function messagePage(request, env, status, title, text) {
   const url = new URL(request.url);
   const body = `<section class="msg"><p class="status">${status}</p><h1>${esc(title)}</h1><p class="muted">${esc(noOrphan(text))}</p><a class="button secondary" href="/">Go to the homepage</a></section>`;
-  return page(title, body, { status, url, review: await reviewOn(request, env) });
+  return page(title, body, { status, url, request, env, review: await reviewOn(request, env) });
 }
 
 function pngResponse(body) {
@@ -970,15 +1076,22 @@ function pngResponse(body) {
   });
 }
 
-function gaHead(linkCreated, nonce) {
-  if (!GA_ID) return '';
+function gaHead(linkCreated, nonce, traffic) {
+  // A data-center request never loads Analytics, so a cloud IP cannot send
+  // link_created. An internal browser still loads it, tagged so GA4's Internal
+  // Traffic filter can drop Kiet. Everyone else is unchanged.
+  if (!GA_ID || traffic === 'datacenter') return '';
   const event = linkCreated ? "\n  gtag('event', 'link_created');" : '';
+  const config =
+    traffic === 'internal'
+      ? `gtag('config', '${GA_ID}', { traffic_type: 'internal' });`
+      : `gtag('config', '${GA_ID}');`;
   return `<script async nonce="${nonce}" src="https://www.googletagmanager.com/gtag/js?id=${GA_ID}"></script>
 <script nonce="${nonce}">
   window.dataLayer = window.dataLayer || [];
   function gtag(){dataLayer.push(arguments);}
   gtag('js', new Date());
-  gtag('config', '${GA_ID}');${event}
+  ${config}${event}
 </script>
 `;
 }
@@ -1026,8 +1139,9 @@ function contentSecurityPolicy(nonce) {
   ].join('; ');
 }
 
-function page(title, body, { owner, url, status = 200, linkCreated = false, mcpToken, index = false, review = false } = {}) {
+function page(title, body, { owner, url, status = 200, linkCreated = false, mcpToken, index = false, review = false, request, env } = {}) {
   const nonce = base64url(crypto.getRandomValues(new Uint8Array(16)));
+  const traffic = request ? classifyTraffic(request, env || {}) : 'human';
   const fullTitle = title.startsWith('Linki —') ? title : `${title} — Linki`;
   const html = `<!doctype html>
 <html lang="en">
@@ -1039,7 +1153,7 @@ ${seoHead(fullTitle, url, { home: Boolean(url && url.pathname === '/'), index })
 <link rel="icon" href="/favicon.svg" type="image/svg+xml">
 <link rel="icon" href="/icon-512.png" type="image/png" sizes="512x512">
 <link rel="apple-touch-icon" href="/apple-touch-icon.png" sizes="180x180">
-${gaHead(linkCreated, nonce)}<link rel="preconnect" href="https://fonts.googleapis.com">
+${gaHead(linkCreated, nonce, traffic)}<link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
 <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Bricolage+Grotesque:opsz,wght@12..96,700;12..96,800&family=Inter:wght@400;500;600;700&family=Space+Mono:wght@400;700&display=swap">
 <style>${CSS}${review ? REVIEW_CSS : ''}</style>
@@ -1158,14 +1272,14 @@ const MCP_TOOLS = [
   {
     name: 'list_links',
     description:
-      "List this connector's short links: slug, short URL, destination, label, created date, total clicks, and unique visitors. Unique visitors are counted once per link per day.",
+      "List this connector's short links: slug, short URL, destination, label, created date, total clicks, and unique visitors. Clicks and unique visitors count people only: a click labeled human, and an older click with no label. Bot, data-center and internal clicks are left out. Unique visitors are counted once per link per day.",
     inputSchema: { type: 'object', properties: {} },
     annotations: { readOnlyHint: true, destructiveHint: false, openWorldHint: false },
   },
   {
     name: 'link_report',
     description:
-      'Clicks and unique visitors per UTC day for one link. days defaults to 30 (max 365). Referrers and countries are not stored.',
+      'Clicks and unique visitors per UTC day for one link. days defaults to 30 (max 365). Counts are people only: a click labeled human, and an older click with no label. excluded shows how many clicks were left out as bot, datacenter or internal. include_all also returns a total for each label. Referrers and countries are not stored.',
     inputSchema: {
       type: 'object',
       properties: {
@@ -1176,6 +1290,11 @@ const MCP_TOOLS = [
           maximum: 365,
           description: 'UTC days to include, ending today. Default 30.',
         },
+        include_all: {
+          type: 'boolean',
+          description:
+            'When true, also return by_traffic: click totals for human, unknown, bot, datacenter and internal. clicks stays people-only either way.',
+        },
       },
       required: ['slug'],
     },
@@ -1184,7 +1303,7 @@ const MCP_TOOLS = [
   {
     name: 'clicks_summary',
     description:
-      "Click and unique-visitor totals for all of this connector's links over a UTC range, plus a per-link breakdown. days defaults to 7 (max 365).",
+      "Click and unique-visitor totals for all of this connector's links over a UTC range, plus a per-link breakdown. days defaults to 7 (max 365). Counts are people only: a click labeled human, and an older click with no label. excluded shows how many clicks were left out as bot, datacenter or internal. include_all also returns a total for each label.",
     inputSchema: {
       type: 'object',
       properties: {
@@ -1193,6 +1312,11 @@ const MCP_TOOLS = [
           minimum: 1,
           maximum: 365,
           description: 'UTC days to include, ending today. Default 7.',
+        },
+        include_all: {
+          type: 'boolean',
+          description:
+            'When true, also return by_traffic: click totals for human, unknown, bot, datacenter and internal. clicks stays people-only either way.',
         },
       },
     },
@@ -1403,7 +1527,7 @@ async function mcpPost(request, env, url, ownerId, cors) {
   if (msg.method === 'ping') return rpcResult(id, {}, cors);
   if (msg.method === 'tools/list') return rpcResult(id, { tools: MCP_TOOLS }, cors);
   if (msg.method === 'tools/call') {
-    const result = await callTool(env, url, ownerId, msg.params);
+    const result = await callTool(request, env, url, ownerId, msg.params);
     if (result.rpcError) return rpcError(id, result.rpcError.code, result.rpcError.message, cors);
     return rpcResult(id, result, cors);
   }
@@ -1462,7 +1586,7 @@ function readToolCall(params) {
   return { name: params.name, args: params.arguments || {} };
 }
 
-async function callTool(env, url, ownerId, params) {
+async function callTool(request, env, url, ownerId, params) {
   const call = readToolCall(params);
   if (call.rpcError) return call;
   const origin = url.origin;
@@ -1470,7 +1594,7 @@ async function callTool(env, url, ownerId, params) {
   if (call.name === 'list_links') return toolText(await reportLinks(env, origin, ownerId));
   if (call.name === 'link_report') return reportLink(env, origin, ownerId, args);
   if (call.name === 'clicks_summary') return reportSummary(env, origin, ownerId, args);
-  if (call.name === 'create_link') return createFromAgent(env, url, ownerId, args);
+  if (call.name === 'create_link') return createFromAgent(request, env, url, ownerId, args);
   if (call.name === 'save_campaign') return saveCampaign(env, ownerId, args);
   if (call.name === 'list_campaigns') return listCampaigns(env, ownerId);
   if (call.name === 'get_campaign') return getCampaign(env, ownerId, args);
@@ -1480,7 +1604,7 @@ async function callTool(env, url, ownerId, params) {
 // Agents reach Linki from their vendor's servers, so their limit is counted per
 // connector, not per network address. With no UTM arguments and no campaign,
 // the destination is stored exactly as it is for the website.
-async function createFromAgent(env, url, ownerId, args) {
+async function createFromAgent(request, env, url, ownerId, args) {
   if (typeof args.url !== 'string') return toolError('url is required.');
   if (args.name !== undefined && args.name !== null && typeof args.name !== 'string') {
     return toolError('name must be text.');
@@ -1496,6 +1620,8 @@ async function createFromAgent(env, url, ownerId, args) {
     creatorHash: (await sha256(`${secret(env)}|mcp|${ownerId}`)).slice(0, 32),
     limit,
     decorate: tracking.decorate || undefined,
+    via: 'mcp',
+    traffic: classifyTraffic(request, env),
   });
   if (made.error) {
     const rule = ` A connector can create ${limit.hour} links an hour and ${limit.day} a day.`;
@@ -1803,10 +1929,14 @@ async function getCampaign(env, ownerId, args) {
 
 async function reportLinks(env, origin, ownerId) {
   const { results } = await env.DB.prepare(
-    `SELECT code, destination, label, click_count, created_at, unique_count AS uniques
-     FROM links
-     WHERE owner_id = ?
-     ORDER BY created_at DESC, rowid DESC
+    `SELECT l.code, l.destination, l.label, l.created_at,
+            COUNT(c.id) AS click_count,
+            COUNT(DISTINCT c.visitor_hash) AS uniques
+     FROM links l
+     LEFT JOIN clicks c ON c.code = l.code AND ${humanClicks('c')}
+     WHERE l.owner_id = ?
+     GROUP BY l.code
+     ORDER BY l.created_at DESC, l.rowid DESC
      LIMIT 201`
   )
     .bind(ownerId)
@@ -1818,9 +1948,14 @@ async function reportLinks(env, origin, ownerId) {
   };
 }
 
+const PEOPLE_NOTE =
+  'Clicks count people only: human, plus older clicks with no label. excluded is how many clicks were left out as bot, datacenter or internal.';
+
 async function reportLink(env, origin, ownerId, args) {
   const daysResult = readDays(args.days, 30);
   if (daysResult.error) return toolError(daysResult.error);
+  const include = readIncludeAll(args.include_all);
+  if (include.error) return toolError(include.error);
   const slug = typeof args.slug === 'string' ? args.slug.toLowerCase() : '';
   if (!CODE_RE.test(slug)) return toolError('Link not found.');
   const link = await env.DB.prepare(
@@ -1832,7 +1967,7 @@ async function reportLink(env, origin, ownerId, args) {
   const range = dayRange(daysResult.days);
   const { results } = await env.DB.prepare(
     `SELECT ts / 86400 AS day, COUNT(*) AS clicks, COUNT(DISTINCT visitor_hash) AS uniques
-     FROM clicks WHERE code = ? AND ts >= ? GROUP BY day`
+     FROM clicks WHERE code = ? AND ts >= ? AND ${humanClicks()} GROUP BY day`
   )
     .bind(slug, range.since)
     .all();
@@ -1846,6 +1981,12 @@ async function reportLink(env, origin, ownerId, args) {
       unique_visitors: row ? Number(row.uniques) : 0,
     });
   }
+  const counts = await trafficCounts(
+    env,
+    `SELECT COALESCE(traffic, 'unknown') AS label, COUNT(*) AS clicks
+     FROM clicks WHERE code = ? AND ts >= ? GROUP BY COALESCE(traffic, 'unknown')`,
+    [slug, range.since]
+  );
   return toolText({
     slug: link.code,
     short_url: `${origin}/${link.code}`,
@@ -1857,20 +1998,24 @@ async function reportLink(env, origin, ownerId, args) {
     clicks: daily.reduce((sum, day) => sum + day.clicks, 0),
     unique_visitors: daily.reduce((sum, day) => sum + day.unique_visitors, 0),
     daily,
-    note: 'Unique visitors are counted once per day. Referrers and countries are not stored.',
+    excluded: excludedClicks(counts),
+    ...(include.includeAll ? { by_traffic: counts } : {}),
+    note: `Unique visitors are counted once per day. ${PEOPLE_NOTE} Referrers and countries are not stored.`,
   });
 }
 
 async function reportSummary(env, origin, ownerId, args) {
   const daysResult = readDays(args.days, 7);
   if (daysResult.error) return toolError(daysResult.error);
+  const include = readIncludeAll(args.include_all);
+  if (include.error) return toolError(include.error);
   const range = dayRange(daysResult.days);
   const { results } = await env.DB.prepare(
     `SELECT l.code, l.destination, l.label, l.created_at,
             COUNT(c.id) AS clicks,
             COUNT(DISTINCT c.visitor_hash) AS uniques
      FROM links l
-     LEFT JOIN clicks c ON c.code = l.code AND c.ts >= ?
+     LEFT JOIN clicks c ON c.code = l.code AND c.ts >= ? AND ${humanClicks('c')}
      WHERE l.owner_id = ?
      GROUP BY l.code
      ORDER BY clicks DESC, l.created_at DESC`
@@ -1878,6 +2023,15 @@ async function reportSummary(env, origin, ownerId, args) {
     .bind(range.since, ownerId)
     .all();
   const links = results.map((row) => linkSummary(row, origin, false));
+  const counts = await trafficCounts(
+    env,
+    `SELECT COALESCE(c.traffic, 'unknown') AS label, COUNT(*) AS clicks
+     FROM clicks c
+     JOIN links l ON l.code = c.code
+     WHERE l.owner_id = ? AND c.ts >= ?
+     GROUP BY COALESCE(c.traffic, 'unknown')`,
+    [ownerId, range.since]
+  );
   return toolText({
     days: daysResult.days,
     from: isoFromDay(range.start),
@@ -1885,8 +2039,32 @@ async function reportSummary(env, origin, ownerId, args) {
     clicks: links.reduce((sum, link) => sum + link.clicks, 0),
     unique_visitors: links.reduce((sum, link) => sum + link.unique_visitors, 0),
     links,
-    note: 'Unique visitors are counted once per link per day, so one person who opens two links counts twice. Referrers and countries are not stored.',
+    excluded: excludedClicks(counts),
+    ...(include.includeAll ? { by_traffic: counts } : {}),
+    note: `Unique visitors are counted once per link per day, so one person who opens two links counts twice. ${PEOPLE_NOTE} Referrers and countries are not stored.`,
   });
+}
+
+const TRAFFIC_KEYS = ['human', 'unknown', 'bot', 'datacenter', 'internal'];
+
+async function trafficCounts(env, sql, binds) {
+  const { results } = await env.DB.prepare(sql).bind(...binds).all();
+  const counts = { human: 0, unknown: 0, bot: 0, datacenter: 0, internal: 0 };
+  for (const row of results) {
+    const key = TRAFFIC_KEYS.includes(row.label) ? row.label : 'unknown';
+    counts[key] += Number(row.clicks);
+  }
+  return counts;
+}
+
+function excludedClicks(counts) {
+  return { bot: counts.bot, datacenter: counts.datacenter, internal: counts.internal };
+}
+
+function readIncludeAll(value) {
+  if (value === undefined || value === false) return { includeAll: false };
+  if (value === true) return { includeAll: true };
+  return { error: 'include_all must be true or false.' };
 }
 
 function linkSummary(row, origin, allTime) {
