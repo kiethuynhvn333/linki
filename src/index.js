@@ -349,7 +349,11 @@ async function createLink(request, env, url) {
 // destination, taken } or { error, status }. taken is the name that was asked
 // for when someone else already had it and an ending was added. Owners listed
 // in UNLIMITED_OWNERS skip the hour and day limits. Every other check stays.
-async function makeLink(env, { ownerId, rawUrl, rawName, ownHost, creatorHash, limit }) {
+// decorate, when the connector is adding UTM tags, receives the candidate slug
+// and the checked destination and returns { destination } or { error }. It runs
+// before the insert, so a taken name is retried with the slug that was stored.
+// The website does not pass decorate.
+async function makeLink(env, { ownerId, rawUrl, rawName, ownHost, creatorHash, limit, decorate }) {
   const checked = checkDestination(rawUrl, ownHost);
   if (checked.error) return { error: checked.error, status: 400 };
   const named = checkName(rawName);
@@ -379,16 +383,24 @@ async function makeLink(env, { ownerId, rawUrl, rawName, ownHost, creatorHash, l
   for (let attempt = 0; attempt < 6; attempt++) {
     const candidate = !name ? randomCode() : attempt === 0 ? name : withEnding(name, attempt < 3 ? 2 : 4);
     if (RESERVED.has(candidate)) continue;
+    let destination = checked.destination;
+    if (decorate) {
+      const built = decorate(candidate, checked.destination);
+      if (!built || built.error) {
+        return { error: (built && built.error) || 'That URL is too long.', status: 400 };
+      }
+      destination = built.destination;
+    }
     try {
       const inserted = await env.DB.prepare(
         `INSERT INTO links (code, owner_id, destination, created_at, creator_hash)
          SELECT ?, ?, ?, ?, ?
          WHERE NOT EXISTS (SELECT 1 FROM retired_names WHERE code = ?)`
       )
-        .bind(candidate, ownerId, checked.destination, now, creatorHash, candidate)
+        .bind(candidate, ownerId, destination, now, creatorHash, candidate)
         .run();
       if (!inserted.meta.changes) continue;
-      return { code: candidate, destination: checked.destination, taken: name && candidate !== name ? name : '' };
+      return { code: candidate, destination, taken: name && candidate !== name ? name : '' };
     } catch (err) {
       if (!/UNIQUE|constraint/i.test(String(err && err.message))) throw err;
     }
@@ -801,7 +813,7 @@ function renameForm(link, url, back) {
 function agentSection(mcp, url) {
   const connectorUrl = mcp.token ? `${url.origin}/mcp/${mcp.token}` : '';
   const hint = mcp.token
-    ? 'Copy this MCP link and paste it into your AI tool. Your agent can then create links and tell you how they are doing. In Claude: Settings → Connectors → Add custom connector. Cursor and other MCP clients take the same link.'
+    ? 'Copy this MCP link and paste it into your AI tool. Your agent can create links, ask before it adds tracking, reuse a saved campaign, and tell you how the links are doing. In Claude: Settings → Connectors → Add custom connector. Cursor and other MCP clients take the same link.'
     : mcp.exists
       ? 'This browser no longer has your MCP link. Reset to get a new one. The old link stops working.'
       : 'Create a link first. Your MCP link will show up here.';
@@ -1116,6 +1128,32 @@ function utcLabel(offset) {
 
 // ---------- mcp ----------
 
+// The owner wants one plain question, not a form of UTM fields. These sentences
+// are the words the agent should say. They are repeated in the tool description
+// and in the initialize instructions so a client that drops one of them still asks.
+const TRACK_QUESTION = "Want to track clicks from this link? Where are you sharing it and what's it for?";
+const SAVE_OFFER = "Want me to save this setup as a campaign so next time it's one line?";
+const CAMPAIGN_OFFER = 'You have a saved campaign, spring-sale. Use that?';
+const UTM_KEYS = ['utm_source', 'utm_medium', 'utm_campaign', 'utm_content', 'utm_term'];
+const UTM_VALUE_MAX = 100;
+const UTM_VALUE_RE = /^[a-z0-9][a-z0-9 ._~+-]*$/;
+const CAMPAIGN_CAP = 50;
+const CAMPAIGN_NAME_MAX = 40;
+const CAMPAIGN_NAME_RE = /^[a-z0-9]+(?:-[a-z0-9]+)*$/;
+const PATTERN_MAX = 80;
+const PATTERN_RE = /^(?:[a-z0-9_-]|\{[a-z][a-z0-9_]{0,20}\})+$/;
+const NOTES_MAX = 400;
+// Explicit argument, then the saved campaign, then a tag already on the URL.
+const UTM_PRECEDENCE =
+  'An explicit argument overrides a saved campaign value, which overrides a tag already in the URL.';
+
+function utmArg(description) {
+  return {
+    type: 'string',
+    description: `${description} Trimmed, lowercased and URL-encoded. ${UTM_PRECEDENCE}`,
+  };
+}
+
 const MCP_TOOLS = [
   {
     name: 'list_links',
@@ -1162,9 +1200,10 @@ const MCP_TOOLS = [
   },
   {
     name: 'create_link',
-    description: `Create a short link for a destination URL. name is optional: your own ending for the short link, for example spring-sale. If someone already has that name, a short ending is added and the result says so. A connector can create ${CREATE_LIMITS.mcp.hour} links an hour and ${CREATE_LIMITS.mcp.day} a day.`,
+    description: `Create a short link for a destination URL. Before you call this, ask the user one short question, in these words: "${TRACK_QUESTION}" If they say no, call it with url and name only and ask nothing else. If they say yes, ask in plain words where it is shared, what kind of post it is, which campaign, and how to tell versions apart (for example a1h1 for angle 1 hook 1). Then pass utm_source, utm_medium, utm_campaign, utm_content, utm_term, or campaign. Never a five-field form. If a saved campaign fits, offer it in one line: "${CAMPAIGN_OFFER}" Use the real name in place of spring-sale. After a tracked link that did not come from a saved campaign, offer once: "${SAVE_OFFER}" name is optional. If that name is taken, a short ending is added and the result says so. A connector can create ${CREATE_LIMITS.mcp.hour} links an hour and ${CREATE_LIMITS.mcp.day} a day.`,
     inputSchema: {
       type: 'object',
+      description: `${UTM_PRECEDENCE} Values are trimmed, lowercased and URL-encoded. The existing query and fragment stay, and a UTM key is not written twice. If utm_content is omitted while other UTM tags or a campaign are used, and the URL does not already have utm_content, it becomes the short link's slug.`,
       properties: {
         url: {
           type: 'string',
@@ -1175,10 +1214,68 @@ const MCP_TOOLS = [
           type: 'string',
           description: `Optional custom name: letters, numbers and hyphens, ${NAME_MIN_LENGTH} to ${NAME_MAX_LENGTH} characters. Leave it out for a random code.`,
         },
+        utm_source: utmArg('Where it is shared, for example threads or newsletter.'),
+        utm_medium: utmArg('What kind of post, for example social, email or story.'),
+        utm_campaign: utmArg('Which campaign, for example spring-sale.'),
+        utm_content: utmArg(
+          'How to tell versions apart, for example a1h1. Omitted, while other tags or a campaign are used, it becomes the slug unless the URL already has utm_content.'
+        ),
+        utm_term: utmArg('Optional extra detail, for example a keyword. Leave it out if you do not need it.'),
+        campaign: {
+          type: 'string',
+          description:
+            "Name of a saved campaign. Its utm_source, utm_medium and utm_campaign are applied unless this call passes those arguments. utm_content_pattern is not written onto the link; follow it yourself when you pick the slug and utm_content.",
+        },
       },
       required: ['url'],
     },
     annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: false },
+  },
+  {
+    name: 'save_campaign',
+    description: `Create or update a saved campaign for this connector, matched on name. Stores utm_source, utm_medium, utm_campaign, an optional utm_content_pattern, and optional notes. The pattern is naming guidance only, for example a{angle}h{hook}-{lang} (angle 1, hook 1, Vietnamese becomes a1h1-vn). It is stored and returned as text. This does not create links. Campaigns are never deleted. At most ${CAMPAIGN_CAP} per connector; updating an existing name is still allowed at the cap. After you create a tracked link, you can offer: "${SAVE_OFFER}"`,
+    inputSchema: {
+      type: 'object',
+      properties: {
+        name: {
+          type: 'string',
+          description: 'Short name, letters, numbers and hyphens, like spring-sale. Trimmed and lowercased. 40 characters at most.',
+        },
+        utm_source: utmArg('Where links in this campaign are shared.'),
+        utm_medium: utmArg('What kind of post this campaign is.'),
+        utm_campaign: utmArg('Campaign tag written onto links that use this campaign.'),
+        utm_content_pattern: {
+          type: 'string',
+          description:
+            'Optional naming logic for the slug and utm_content. Example: a{angle}h{hook}-{lang}. Stored and returned as text. Leave it out on update to keep the saved pattern. Pass an empty string to clear it.',
+        },
+        notes: {
+          type: 'string',
+          description: `Optional note, ${NOTES_MAX} characters at most. Leave it out on update to keep the saved note. Pass an empty string to clear it.`,
+        },
+      },
+      required: ['name', 'utm_source', 'utm_medium', 'utm_campaign'],
+    },
+    annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: true, openWorldHint: false },
+  },
+  {
+    name: 'list_campaigns',
+    description: `List this connector's saved campaigns: name, utm_source, utm_medium, utm_campaign, utm_content_pattern and notes. At most ${CAMPAIGN_CAP}. Another connector's campaigns are not included. If one fits the link you are about to create, offer it in one line: "${CAMPAIGN_OFFER}"`,
+    inputSchema: { type: 'object', properties: {} },
+    annotations: { readOnlyHint: true, destructiveHint: false, openWorldHint: false },
+  },
+  {
+    name: 'get_campaign',
+    description:
+      'Fetch one saved campaign by name for this connector. Returns utm_content_pattern when one was saved, so you can follow it for the slug and utm_content. Example pattern: a{angle}h{hook}-{lang}.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        name: { type: 'string', description: 'Campaign name, for example spring-sale.' },
+      },
+      required: ['name'],
+    },
+    annotations: { readOnlyHint: true, destructiveHint: false, openWorldHint: false },
   },
 ];
 
@@ -1319,10 +1416,38 @@ function initializeResult(params) {
   return {
     protocolVersion,
     capabilities: { tools: {} },
-    serverInfo: { name: 'Linki', version: '0.2.0' },
-    instructions:
-      "Create short links and read click reports for the Linki links that belong to this connector. Unique visitors are counted once per link per day. Referrers and countries are not stored.",
+    serverInfo: { name: 'Linki', version: '0.3.0' },
+    instructions: mcpInstructions(clientElicitation(params)),
   };
+}
+
+// The model reads this on every client. Elicitation is optional and only a
+// different way to ask the same question: this Worker answers in one response
+// and has no session to wait on, so it does not send elicitation/create itself.
+// create_link always works from the arguments it is given.
+function mcpInstructions(elicitation) {
+  const ask = elicitation
+    ? `This client advertises elicitation. You may ask that first question with elicitation/create, and the message must be exactly "${TRACK_QUESTION}". One plain text answer, not five fields. If elicitation is declined, cancelled, or unavailable, ask the same question in chat. create_link does not wait on elicitation and works in every client: call it with the arguments the user agreed to.`
+    : 'This client did not advertise elicitation. Ask that question in the chat. create_link works from the arguments you send, in every client.';
+  return [
+    'Create short links and read click reports for the Linki links that belong to this connector. Unique visitors are counted once per link per day. Referrers and countries are not stored.',
+    `Before you create a link, ask the user ONE short question, in these words: "${TRACK_QUESTION}"`,
+    'If the user says no, create the link with create_link and only the url and the name. Ask nothing else.',
+    'If the user says yes, and they have not already said where and what, ask for the details in plain words, briefly and conversationally: where it is shared, what kind of post it is, which campaign, and how to tell versions apart (for example a1h1 for angle 1 hook 1). Never a five-field form. Do not say the utm_ field names to the user. Map the answers onto utm_source, utm_medium, utm_campaign, utm_content and utm_term yourself.',
+    `If this connector has a saved campaign that fits, offer it in one line, in this shape: "${CAMPAIGN_OFFER}" Use the real name in place of spring-sale. One line only.`,
+    `After you create a link that has tracking, and it did not already come from a saved campaign, offer in one line: "${SAVE_OFFER}"`,
+    `${UTM_PRECEDENCE} Linki trims the values, lowercases them, and URL-encodes them. The existing query and fragment stay. A UTM key is not written twice. If utm_content is omitted while other UTM tags or a campaign are used, and the URL does not already have utm_content, Linki sets it to the short link's slug.`,
+    "A saved campaign's utm_content_pattern is the user's naming logic, stored and returned as text. Example: a{angle}h{hook}-{lang} means angle 1, hook 1, Vietnamese becomes a1h1-vn. Follow it when you pick the slug and utm_content. Do not create a batch of links.",
+    `Campaigns belong to this connector only. save_campaign creates or updates. Nothing is deleted. At most ${CAMPAIGN_CAP} campaigns.`,
+    ask,
+  ].join('\n');
+}
+
+function clientElicitation(params) {
+  const caps = params && params.capabilities;
+  if (!caps || typeof caps !== 'object' || Array.isArray(caps)) return false;
+  const elicitation = caps.elicitation;
+  return !!elicitation && typeof elicitation === 'object' && !Array.isArray(elicitation);
 }
 
 function readToolCall(params) {
@@ -1346,16 +1471,22 @@ async function callTool(env, url, ownerId, params) {
   if (call.name === 'link_report') return reportLink(env, origin, ownerId, args);
   if (call.name === 'clicks_summary') return reportSummary(env, origin, ownerId, args);
   if (call.name === 'create_link') return createFromAgent(env, url, ownerId, args);
+  if (call.name === 'save_campaign') return saveCampaign(env, ownerId, args);
+  if (call.name === 'list_campaigns') return listCampaigns(env, ownerId);
+  if (call.name === 'get_campaign') return getCampaign(env, ownerId, args);
   return { rpcError: { code: -32602, message: 'Unknown tool' } };
 }
 
 // Agents reach Linki from their vendor's servers, so their limit is counted per
-// connector, not per network address.
+// connector, not per network address. With no UTM arguments and no campaign,
+// the destination is stored exactly as it is for the website.
 async function createFromAgent(env, url, ownerId, args) {
   if (typeof args.url !== 'string') return toolError('url is required.');
   if (args.name !== undefined && args.name !== null && typeof args.name !== 'string') {
     return toolError('name must be text.');
   }
+  const tracking = await resolveTracking(env, ownerId, args, url.hostname);
+  if (tracking.error) return toolError(tracking.error);
   const limit = CREATE_LIMITS.mcp;
   const made = await makeLink(env, {
     ownerId,
@@ -1364,19 +1495,310 @@ async function createFromAgent(env, url, ownerId, args) {
     ownHost: url.hostname,
     creatorHash: (await sha256(`${secret(env)}|mcp|${ownerId}`)).slice(0, 32),
     limit,
+    decorate: tracking.decorate || undefined,
   });
   if (made.error) {
     const rule = ` A connector can create ${limit.hour} links an hour and ${limit.day} a day.`;
     return toolError(made.status === 429 ? made.error + rule : made.error);
   }
-  return toolText({
+  const body = {
     slug: made.code,
     short_url: `${url.origin}/${made.code}`,
     destination: made.destination,
-    ...(made.taken
-      ? { note: `The name "${made.taken}" was already taken, so a short ending was added.` }
-      : {}),
+  };
+  if (made.taken) {
+    body.note = `The name "${made.taken}" was already taken, so a short ending was added.`;
+  }
+  if (tracking.decorate) {
+    body.utm = utmFromDestination(made.destination);
+    if (tracking.campaign) {
+      body.campaign = tracking.campaign.name;
+      if (tracking.campaign.utm_content_pattern) {
+        body.utm_content_pattern = tracking.campaign.utm_content_pattern;
+      }
+    }
+  }
+  return toolText(body);
+}
+
+// Returns { decorate, campaign } when this call adds tags, { decorate: null }
+// when it does not, or { error }. A missing campaign does not create a link.
+async function resolveTracking(env, ownerId, args, ownHost) {
+  const asked = UTM_KEYS.filter((key) => args[key] !== undefined);
+  const campaignArg = args.campaign !== undefined;
+  if (!asked.length && !campaignArg) return { decorate: null };
+
+  const explicit = {};
+  for (const key of asked) {
+    const parsed = checkUtmValue(args[key], key);
+    if (parsed.error) return parsed;
+    explicit[key] = parsed.value;
+  }
+  let campaignName = '';
+  if (campaignArg) {
+    const named = checkCampaignName(args.campaign, 'campaign');
+    if (named.error) return named;
+    campaignName = named.name;
+  }
+
+  // Same order as makeLink: a bad URL or name is reported before a campaign lookup.
+  const checked = checkDestination(args.url.trim(), ownHost);
+  if (checked.error) return checked;
+  const nameCheck = checkName(typeof args.name === 'string' ? args.name.trim() : '');
+  if (nameCheck.error) return nameCheck;
+
+  let campaign = null;
+  if (campaignName) {
+    campaign = await campaignByName(env, ownerId, campaignName);
+    if (!campaign) return { error: `No campaign named "${campaignName}".` };
+  }
+
+  // Campaign values first, then explicit arguments. A key left out of both
+  // stays on the URL. utm_content falls back to the slug only when it is still empty.
+  const tags = {};
+  if (campaign) {
+    tags.utm_source = campaign.utm_source;
+    tags.utm_medium = campaign.utm_medium;
+    tags.utm_campaign = campaign.utm_campaign;
+  }
+  for (const key of UTM_KEYS) {
+    if (Object.prototype.hasOwnProperty.call(explicit, key)) tags[key] = explicit[key];
+  }
+  const contentSet =
+    Object.prototype.hasOwnProperty.call(explicit, 'utm_content') || queryHasUtm(checked.destination, 'utm_content');
+  if (!contentSet) delete tags.utm_content;
+
+  return {
+    campaign,
+    decorate(code, base) {
+      const applied = { ...tags };
+      if (!contentSet) applied.utm_content = code;
+      const destination = mergeUtm(base, applied);
+      if (destination.length > MAX_URL_LENGTH) {
+        return { error: 'That URL is too long once the tracking tags are added.' };
+      }
+      return { destination };
+    },
+  };
+}
+
+function checkUtmValue(raw, label) {
+  if (typeof raw !== 'string') return { error: `${label} must be text.` };
+  const value = raw.trim().toLowerCase();
+  if (!value) return { error: `${label} is empty.` };
+  if (value.length > UTM_VALUE_MAX) {
+    return { error: `${label} is too long. ${UTM_VALUE_MAX} characters at most.` };
+  }
+  if (!UTM_VALUE_RE.test(value)) {
+    return { error: `${label} can use letters, numbers, spaces, and - _ . ~ + only.` };
+  }
+  return { value };
+}
+
+function checkCampaignName(raw, label) {
+  if (raw === undefined) return { error: `${label} is required.` };
+  if (typeof raw !== 'string') return { error: `${label} must be text.` };
+  const name = raw.trim().toLowerCase();
+  if (!name) return { error: `${label} is empty.` };
+  if (name.length > CAMPAIGN_NAME_MAX || !CAMPAIGN_NAME_RE.test(name)) {
+    return {
+      error: `${label} should be letters, numbers and hyphens, like spring-sale. ${CAMPAIGN_NAME_MAX} characters at most.`,
+    };
+  }
+  return { name };
+}
+
+function checkPattern(raw) {
+  if (raw === null || raw === '') return { value: null };
+  if (typeof raw !== 'string') return { error: 'utm_content_pattern must be text.' };
+  const value = raw.trim().toLowerCase();
+  if (!value) return { value: null };
+  if (value.length > PATTERN_MAX || !PATTERN_RE.test(value)) {
+    return {
+      error: 'utm_content_pattern can use letters, numbers, hyphens, underscores, and {placeholders} such as {angle}. 80 characters at most.',
+    };
+  }
+  return { value };
+}
+
+function checkNotes(raw) {
+  if (raw === null || raw === '') return { value: null };
+  if (typeof raw !== 'string') return { error: 'notes must be text.' };
+  const value = raw.trim();
+  if (!value) return { value: null };
+  if (value.length > NOTES_MAX) return { error: `notes is too long. ${NOTES_MAX} characters at most.` };
+  if (/[\u0000-\u0008\u000b\u000c\u000e-\u001f]/.test(value)) {
+    return { error: 'notes cannot include control characters.' };
+  }
+  return { value };
+}
+
+// Rebuild the query so keys we set appear once, at the end, percent-encoded.
+// Every other parameter and the fragment are copied through unchanged.
+function mergeUtm(href, tags) {
+  const url = new URL(href);
+  const hash = url.hash;
+  const query = url.search.startsWith('?') ? url.search.slice(1) : '';
+  const drop = new Set(Object.keys(tags));
+  const kept = [];
+  if (query) {
+    for (const part of query.split('&')) {
+      if (!part) continue;
+      const key = safeDecode(part.split('=')[0]).toLowerCase();
+      if (drop.has(key)) continue;
+      kept.push(part);
+    }
+  }
+  for (const key of UTM_KEYS) {
+    if (Object.prototype.hasOwnProperty.call(tags, key)) {
+      kept.push(`${key}=${encodeURIComponent(tags[key])}`);
+    }
+  }
+  const search = kept.length ? `?${kept.join('&')}` : '';
+  return `${url.origin}${url.pathname}${search}${hash}`;
+}
+
+function queryHasUtm(href, key) {
+  const url = new URL(href);
+  const query = url.search.startsWith('?') ? url.search.slice(1) : '';
+  if (!query) return false;
+  for (const part of query.split('&')) {
+    if (!part) continue;
+    if (safeDecode(part.split('=')[0]).toLowerCase() === key) return true;
+  }
+  return false;
+}
+
+function utmFromDestination(href) {
+  const url = new URL(href);
+  const out = {};
+  for (const key of UTM_KEYS) {
+    const values = url.searchParams.getAll(key);
+    if (values.length) out[key] = values[values.length - 1];
+  }
+  return out;
+}
+
+function safeDecode(text) {
+  try {
+    return decodeURIComponent(String(text).replace(/\+/g, ' '));
+  } catch {
+    return String(text);
+  }
+}
+
+const CAMPAIGN_SELECT =
+  'name, utm_source, utm_medium, utm_campaign, utm_content_pattern, notes, created_at, updated_at';
+
+function campaignByName(env, ownerId, name) {
+  return env.DB.prepare(
+    `SELECT ${CAMPAIGN_SELECT} FROM campaigns WHERE owner_id = ? AND name = ? LIMIT 1`
+  )
+    .bind(ownerId, name)
+    .first();
+}
+
+function campaignJson(row) {
+  return {
+    name: row.name,
+    utm_source: row.utm_source,
+    utm_medium: row.utm_medium,
+    utm_campaign: row.utm_campaign,
+    utm_content_pattern: row.utm_content_pattern || null,
+    notes: row.notes || null,
+    created: isoFromUnix(row.created_at),
+    updated: isoFromUnix(row.updated_at),
+  };
+}
+
+async function saveCampaign(env, ownerId, args) {
+  const named = checkCampaignName(args.name, 'name');
+  if (named.error) return toolError(named.error);
+  for (const key of ['utm_source', 'utm_medium', 'utm_campaign']) {
+    if (args[key] === undefined) return toolError(`${key} is required.`);
+    const parsed = checkUtmValue(args[key], key);
+    if (parsed.error) return toolError(parsed.error);
+    args[key] = parsed.value;
+  }
+  const existing = await campaignByName(env, ownerId, named.name);
+  let pattern;
+  if (args.utm_content_pattern === undefined) {
+    pattern = existing ? existing.utm_content_pattern : null;
+  } else {
+    const parsed = checkPattern(args.utm_content_pattern);
+    if (parsed.error) return toolError(parsed.error);
+    pattern = parsed.value;
+  }
+  let notes;
+  if (args.notes === undefined) {
+    notes = existing ? existing.notes : null;
+  } else {
+    const parsed = checkNotes(args.notes);
+    if (parsed.error) return toolError(parsed.error);
+    notes = parsed.value;
+  }
+  const now = Math.floor(Date.now() / 1000);
+  if (!existing) {
+    const count = await env.DB.prepare('SELECT COUNT(*) AS n FROM campaigns WHERE owner_id = ?')
+      .bind(ownerId)
+      .first();
+    if (Number(count.n) >= CAMPAIGN_CAP) {
+      return toolError(`You can save ${CAMPAIGN_CAP} campaigns. This connector already has ${CAMPAIGN_CAP}.`);
+    }
+    try {
+      await env.DB.prepare(
+        `INSERT INTO campaigns
+           (owner_id, name, utm_source, utm_medium, utm_campaign, utm_content_pattern, notes, created_at, updated_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`
+      )
+        .bind(ownerId, named.name, args.utm_source, args.utm_medium, args.utm_campaign, pattern, notes, now, now)
+        .run();
+    } catch (err) {
+      if (!/UNIQUE|constraint/i.test(String(err && err.message))) throw err;
+      return toolError(`A campaign named "${named.name}" was just saved. Fetch it and update it if you need to.`);
+    }
+  } else {
+    await env.DB.prepare(
+      `UPDATE campaigns
+       SET utm_source = ?, utm_medium = ?, utm_campaign = ?, utm_content_pattern = ?, notes = ?, updated_at = ?
+       WHERE owner_id = ? AND name = ?`
+    )
+      .bind(args.utm_source, args.utm_medium, args.utm_campaign, pattern, notes, now, ownerId, named.name)
+      .run();
+  }
+  return toolText({
+    saved: existing ? 'updated' : 'created',
+    ...campaignJson({
+      name: named.name,
+      utm_source: args.utm_source,
+      utm_medium: args.utm_medium,
+      utm_campaign: args.utm_campaign,
+      utm_content_pattern: pattern,
+      notes,
+      created_at: existing ? existing.created_at : now,
+      updated_at: now,
+    }),
   });
+}
+
+async function listCampaigns(env, ownerId) {
+  const { results } = await env.DB.prepare(
+    `SELECT ${CAMPAIGN_SELECT} FROM campaigns
+     WHERE owner_id = ?
+     ORDER BY updated_at DESC, name ASC
+     LIMIT ?`
+  )
+    .bind(ownerId, CAMPAIGN_CAP)
+    .all();
+  return toolText({ campaigns: results.map(campaignJson) });
+}
+
+async function getCampaign(env, ownerId, args) {
+  const named = checkCampaignName(args.name, 'name');
+  if (named.error) return toolError(named.error);
+  const row = await campaignByName(env, ownerId, named.name);
+  if (!row) return toolError(`No campaign named "${named.name}".`);
+  return toolText(campaignJson(row));
 }
 
 async function reportLinks(env, origin, ownerId) {

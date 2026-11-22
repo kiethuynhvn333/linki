@@ -35,10 +35,16 @@ Once you have a link, the home page shows one line under **Recent links** with a
 
 The connector only sees this browser's links. Its tools are:
 
-- `create_link`: make a short link (`url`, and an optional custom `name`). A connector can create 10 links an hour and 25 a day.
 - `list_links`: your links with total clicks and unique visitors.
 - `link_report`: daily clicks for one link (`days` defaults to 30, max 365).
 - `clicks_summary`: totals over a date range (`days` defaults to 7, max 365).
+- `create_link`: make a short link (`url`, optional `name`, optional UTM tags, optional `campaign`). A connector can create 10 links an hour and 25 a day.
+- `save_campaign`: save or update a named set of tags for this connector (`utm_source`, `utm_medium`, `utm_campaign`, optional `utm_content_pattern`, optional `notes`). At most 50. Nothing is deleted.
+- `list_campaigns` and `get_campaign`: read those saved campaigns.
+
+Before it creates a link, the agent asks one question: "Want to track clicks from this link? Where are you sharing it and what's it for?" No means a plain link and no further questions. Yes means a short conversation in plain words: where you are sharing it, what kind of post, which campaign, and how to tell versions apart (for example a1h1 for angle 1 hook 1). If a saved campaign fits, the agent offers it in one line. After a tracked link, it can offer to save that setup.
+
+An explicit tag wins over a saved campaign, which wins over a tag already in the URL. Values are trimmed, lowercased and URL-encoded. The rest of the query and the fragment stay, and a tag is not written twice. If `utm_content` is left out while other tags or a campaign are used, and the URL does not already have one, it becomes the short name. `utm_content_pattern` (for example `a{angle}h{hook}-{lang}`) is naming guidance the agent follows. It is stored and returned as text. Saved campaigns live in the `campaigns` table (`migrations/0005_campaigns.sql`). Apply migrations before deploying this Worker.
 
 Anyone who has the MCP link can create links in your list and read your click counts, so treat it like a password. Reset on **Your links** replaces it, and the old link stops working.
 
@@ -114,7 +120,7 @@ To try it locally, put a throwaway `REVIEW_KEY` in `.dev.vars` (that file stays 
 ## Files
 - `src/index.js`: the whole app (routes, HTML, CSS, favicon, MCP).
 - `assets/`: the share image (`og.svg`, `og.png`), the PNG icons, and the Bricolage Grotesque subset used to draw the wordmark. `scripts/render-og.sh` rebuilds the PNGs.
-- `migrations/`: the D1 tables, applied in order by `wrangler d1 migrations apply`.
+- `migrations/`: the D1 tables, applied in order by `wrangler d1 migrations apply`. `schema.sql` is the same tables, written so it can be applied more than once.
 - `test/app.test.js`: end-to-end tests.
 - `wrangler.toml`: Worker, custom domains, daily cron, logs, and database config.
 - `CHANGES.md`: notes on the current design.

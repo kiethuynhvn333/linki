@@ -1356,7 +1356,7 @@ test('the connector reports clicks, only for its own links, and reset replaces i
   assert.equal((await rpc('a'.repeat(43), 'tools/list')).status, 401);
   assert.deepEqual(
     (await rpc(token, 'tools/list')).json.result.tools.map((t) => t.name),
-    ['list_links', 'link_report', 'clicks_summary', 'create_link']
+    ['list_links', 'link_report', 'clicks_summary', 'create_link', 'save_campaign', 'list_campaigns', 'get_campaign']
   );
 
   const list = JSON.parse((await rpc(token, 'tools/call', { name: 'list_links' })).json.result.content[0].text);
@@ -1414,6 +1414,410 @@ test('an agent can create links through the connector, with its own smaller limi
   assert.match(refused.content[0].text, /10 links an hour and 25 a day/);
   // The website limit is counted separately, per network address.
   await createLink({ cookie, ip });
+});
+
+const TRACK_QUESTION = "Want to track clicks from this link? Where are you sharing it and what's it for?";
+const SAVE_OFFER = "Want me to save this setup as a campaign so next time it's one line?";
+const CAMPAIGN_OFFER = 'You have a saved campaign, spring-sale. Use that?';
+
+function toolJson(result) {
+  assert.equal(result.isError, undefined, result.content && result.content[0] && result.content[0].text);
+  return JSON.parse(result.content[0].text);
+}
+
+async function connector() {
+  const made = await createLink();
+  const token = setCookies(await request('/links', { cookie: made.cookie })).mcp.value;
+  return { ...made, token, ownerId: made.cookie.slice('owner='.length) };
+}
+
+test('initialize tells every client to ask once, and elicitation uses the same words', async () => {
+  const { token } = await connector();
+  const plain = await rpc(token, 'initialize', { protocolVersion: '2025-06-18', capabilities: {} });
+  assert.equal(plain.status, 200);
+  assert.equal(plain.json.result.protocolVersion, '2025-06-18');
+  assert.deepEqual(plain.json.result.capabilities, { tools: {} });
+  const instructions = plain.json.result.instructions;
+  assert.match(instructions, new RegExp(TRACK_QUESTION.replace(/[?]/g, '\\?')));
+  assert.ok(instructions.includes(TRACK_QUESTION));
+  assert.ok(instructions.includes(SAVE_OFFER));
+  assert.ok(instructions.includes(CAMPAIGN_OFFER));
+  assert.match(instructions, /If the user says no/);
+  assert.match(instructions, /Ask nothing else/);
+  assert.match(instructions, /a1h1 for angle 1 hook 1/);
+  assert.match(instructions, /explicit argument overrides a saved campaign value, which overrides a tag already in the URL/);
+  assert.match(instructions, /a\{angle\}h\{hook\}-\{lang\}/);
+  assert.match(instructions, /short link's slug/);
+  assert.match(instructions, /did not advertise elicitation/);
+  assert.doesNotMatch(instructions, /elicitation\/create/);
+
+  const elicited = await rpc(token, 'initialize', {
+    protocolVersion: '2025-11-25',
+    capabilities: { elicitation: {} },
+    clientInfo: { name: 'test', version: '1' },
+  });
+  const elicitedText = elicited.json.result.instructions;
+  assert.ok(elicitedText.includes(TRACK_QUESTION));
+  assert.ok(elicitedText.includes(SAVE_OFFER));
+  assert.match(elicitedText, /elicitation\/create/);
+  assert.match(elicitedText, /One plain text answer/);
+  assert.match(elicitedText, /works in every client/);
+  assert.equal(elicited.json.result.protocolVersion, '2025-11-25');
+
+  // Advertising elicitation does not change the tool. A plain call still creates.
+  const made = toolJson(await toolCall(token, 'create_link', { url: 'https://example.com/ask-plain', name: 'ask-plain' }));
+  assert.deepEqual(Object.keys(made), ['slug', 'short_url', 'destination']);
+  assert.equal(made.destination, 'https://example.com/ask-plain');
+
+  const tools = (await rpc(token, 'tools/list')).json.result.tools;
+  const create = tools.find((tool) => tool.name === 'create_link');
+  assert.ok(create.description.includes(TRACK_QUESTION));
+  assert.ok(create.description.includes(SAVE_OFFER));
+  assert.ok(create.description.includes('10 links an hour and 25 a day'));
+  assert.match(tools.find((tool) => tool.name === 'list_links').description, /Unique visitors are counted once per link per day/);
+  assert.match(tools.find((tool) => tool.name === 'link_report').description, /days defaults to 30/);
+  assert.match(tools.find((tool) => tool.name === 'clicks_summary').description, /days defaults to 7/);
+  const removed = await rpc(token, 'tools/call', { name: 'delete_campaign', arguments: { name: 'spring-sale' } });
+  assert.equal(removed.json.error.message, 'Unknown tool');
+});
+
+test('UTM tags merge in order, stay encoded, and default utm_content to the slug', async () => {
+  const { token } = await connector();
+  const saved = toolJson(await toolCall(token, 'save_campaign', {
+    name: 'Launch',
+    utm_source: ' Facebook ',
+    utm_medium: 'Social',
+    utm_campaign: 'Launch',
+    utm_content_pattern: 'A{Angle}H{Hook}-{Lang}',
+    notes: '  Launch week  ',
+  }));
+  assert.equal(saved.saved, 'created');
+  assert.equal(saved.utm_content_pattern, 'a{angle}h{hook}-{lang}');
+  assert.equal(saved.utm_source, 'facebook');
+
+  const destination = 'https://example.com/sale?ref=home&utm_source=newsletter&utm_medium=email&utm_campaign=old&utm_term=shoes#reviews';
+  const made = toolJson(await toolCall(token, 'create_link', {
+    url: destination,
+    name: 'sale-utm',
+    campaign: 'LAUNCH',
+    utm_source: ' Threads ',
+    utm_term: 'BOOTS',
+  }));
+  assert.equal(made.slug, 'sale-utm');
+  assert.equal(made.campaign, 'launch');
+  assert.equal(made.utm_content_pattern, 'a{angle}h{hook}-{lang}');
+  assert.equal(
+    made.destination,
+    'https://example.com/sale?ref=home&utm_source=threads&utm_medium=social&utm_campaign=launch&utm_content=sale-utm&utm_term=boots#reviews'
+  );
+  assert.deepEqual(made.utm, {
+    utm_source: 'threads',
+    utm_medium: 'social',
+    utm_campaign: 'launch',
+    utm_content: 'sale-utm',
+    utm_term: 'boots',
+  });
+  assert.equal(await goesTo('sale-utm'), made.destination);
+
+  const encoded = toolJson(await toolCall(token, 'create_link', {
+    url: 'https://example.com/a?ref=hello%20world#top',
+    name: 'encoded-utm',
+    utm_source: 'Spring Sale',
+    utm_campaign: 'A+B',
+  }));
+  assert.equal(
+    encoded.destination,
+    'https://example.com/a?ref=hello%20world&utm_source=spring%20sale&utm_campaign=a%2Bb&utm_content=encoded-utm#top'
+  );
+  assert.equal(encoded.utm.utm_source, 'spring sale');
+  assert.equal(encoded.utm.utm_campaign, 'a+b');
+  assert.equal(encoded.utm.utm_content, 'encoded-utm');
+  assert.equal(encoded.campaign, undefined);
+
+  const dupes = toolJson(await toolCall(token, 'create_link', {
+    url: 'https://example.com/d?UTM_Source=Newsletter&utm_source=old&y=2',
+    name: 'dedupe-utm',
+    utm_source: 'threads',
+  }));
+  assert.equal(
+    dupes.destination,
+    'https://example.com/d?y=2&utm_source=threads&utm_content=dedupe-utm'
+  );
+
+  const kept = toolJson(await toolCall(token, 'create_link', {
+    url: 'https://example.com/k?utm_content=KeepMe&z=1',
+    name: 'keep-content',
+    utm_source: 'threads',
+  }));
+  assert.equal(kept.destination, 'https://example.com/k?utm_content=KeepMe&z=1&utm_source=threads');
+  assert.equal(kept.utm.utm_content, 'KeepMe');
+
+  const chosen = toolJson(await toolCall(token, 'create_link', {
+    url: 'https://example.com/chosen?utm_content=old',
+    name: 'chosen-content',
+    utm_content: 'A1H1',
+  }));
+  assert.equal(chosen.destination, 'https://example.com/chosen?utm_content=a1h1');
+  assert.equal(chosen.utm.utm_content, 'a1h1');
+
+  await createLink({ url: 'https://example.com/taken-base', name: 'utm-taken' });
+  const taken = toolJson(await toolCall(token, 'create_link', {
+    url: 'https://example.com/taken',
+    name: 'utm-taken',
+    utm_medium: 'social',
+  }));
+  assert.match(taken.slug, /^utm-taken-[a-z2-9]{2}$/);
+  assert.match(taken.note, /already taken/);
+  assert.equal(taken.utm.utm_content, taken.slug);
+  assert.equal(taken.destination, `https://example.com/taken?utm_medium=social&utm_content=${taken.slug}`);
+
+  const random = toolJson(await toolCall(token, 'create_link', {
+    url: 'https://example.com/random-utm',
+    utm_term: 'shoes',
+  }));
+  assert.equal(random.utm.utm_content, random.slug);
+  assert.equal(random.destination, `https://example.com/random-utm?utm_content=${random.slug}&utm_term=shoes`);
+
+  const web = await createLink({ url: 'https://example.com/web-plain', name: 'web-plain-utm' });
+  assert.equal(await storedDestination(web.code), 'https://example.com/web-plain');
+});
+
+test('saved campaigns are per connector, capped, validated, and never required for the old tools', async () => {
+  const mine = await connector();
+  const theirs = await connector();
+  const pattern = 'a{angle}h{hook}-{lang}';
+  const created = toolJson(await toolCall(mine.token, 'save_campaign', {
+    name: 'spring-sale',
+    utm_source: 'threads',
+    utm_medium: 'social',
+    utm_campaign: 'spring',
+    utm_content_pattern: pattern,
+    notes: 'Stories first',
+  }));
+  assert.equal(created.saved, 'created');
+  assert.equal(created.utm_content_pattern, pattern);
+  assert.equal(created.notes, 'Stories first');
+
+  const kept = toolJson(await toolCall(mine.token, 'save_campaign', {
+    name: 'SPRING-SALE',
+    utm_source: 'newsletter',
+    utm_medium: 'email',
+    utm_campaign: 'spring',
+  }));
+  assert.equal(kept.saved, 'updated');
+  assert.equal(kept.utm_source, 'newsletter');
+  assert.equal(kept.utm_content_pattern, pattern);
+  assert.equal(kept.notes, 'Stories first');
+  assert.equal(kept.created, created.created);
+  const row = await db.prepare('SELECT created_at, updated_at, utm_source FROM campaigns WHERE owner_id = ? AND name = ?')
+    .bind(mine.ownerId, 'spring-sale')
+    .first();
+  assert.equal(row.utm_source, 'newsletter');
+  assert.ok(row.updated_at >= row.created_at);
+
+  const cleared = toolJson(await toolCall(mine.token, 'save_campaign', {
+    name: 'spring-sale',
+    utm_source: 'newsletter',
+    utm_medium: 'email',
+    utm_campaign: 'spring',
+    utm_content_pattern: '',
+    notes: '',
+  }));
+  assert.equal(cleared.utm_content_pattern, null);
+  assert.equal(cleared.notes, null);
+  // Put the pattern back for the create_link check below.
+  await toolCall(mine.token, 'save_campaign', {
+    name: 'spring-sale',
+    utm_source: 'threads',
+    utm_medium: 'social',
+    utm_campaign: 'spring',
+    utm_content_pattern: pattern,
+    notes: 'Stories first',
+  });
+
+  toolJson(await toolCall(mine.token, 'save_campaign', {
+    name: 'other',
+    utm_source: 'x',
+    utm_medium: 'y',
+    utm_campaign: 'z',
+  }));
+  await db.prepare('UPDATE campaigns SET updated_at = 1 WHERE owner_id = ?').bind(mine.ownerId).run();
+  await toolCall(mine.token, 'save_campaign', {
+    name: 'other',
+    utm_source: 'x',
+    utm_medium: 'y',
+    utm_campaign: 'z',
+    utm_content_pattern: pattern,
+  });
+  const listed = toolJson(await toolCall(mine.token, 'list_campaigns', {}));
+  assert.deepEqual(listed.campaigns.map((campaign) => campaign.name), ['other', 'spring-sale']);
+  assert.equal(listed.campaigns[0].utm_content_pattern, pattern);
+
+  const got = toolJson(await toolCall(mine.token, 'get_campaign', { name: 'Spring-Sale' }));
+  assert.equal(got.utm_source, 'threads');
+  assert.equal(got.utm_content_pattern, pattern);
+  assert.equal(got.notes, 'Stories first');
+
+  const foreign = await toolCall(theirs.token, 'get_campaign', { name: 'spring-sale' });
+  assert.equal(foreign.isError, true);
+  assert.match(foreign.content[0].text, /No campaign named "spring-sale"/);
+  const theirList = toolJson(await toolCall(theirs.token, 'list_campaigns', {}));
+  assert.deepEqual(theirList.campaigns, []);
+  toolJson(await toolCall(theirs.token, 'save_campaign', {
+    name: 'spring-sale',
+    utm_source: 'ads',
+    utm_medium: 'paid',
+    utm_campaign: 'theirs',
+  }));
+  const mineStill = toolJson(await toolCall(mine.token, 'get_campaign', { name: 'spring-sale' }));
+  assert.equal(mineStill.utm_source, 'threads');
+  const theirsSeen = toolJson(await toolCall(theirs.token, 'get_campaign', { name: 'spring-sale' }));
+  assert.equal(theirsSeen.utm_source, 'ads');
+
+  const used = toolJson(await toolCall(mine.token, 'create_link', {
+    url: 'https://example.com/from-campaign',
+    name: 'from-campaign',
+    campaign: 'spring-sale',
+  }));
+  assert.equal(used.campaign, 'spring-sale');
+  assert.equal(used.utm_content_pattern, pattern);
+  assert.equal(
+    used.destination,
+    'https://example.com/from-campaign?utm_source=threads&utm_medium=social&utm_campaign=spring&utm_content=from-campaign'
+  );
+  const linksBefore = await count('SELECT COUNT(*) AS n FROM links WHERE owner_id = ?', theirs.ownerId);
+  const missed = await toolCall(theirs.token, 'create_link', {
+    url: 'https://example.com/missing-campaign',
+    name: 'missing-campaign',
+    campaign: 'does-not-exist',
+  });
+  assert.equal(missed.isError, true);
+  assert.match(missed.content[0].text, /No campaign named "does-not-exist"/);
+  assert.equal(await count('SELECT COUNT(*) AS n FROM links WHERE owner_id = ?', theirs.ownerId), linksBefore);
+  assert.equal(await count('SELECT COUNT(*) AS n FROM links WHERE code = ?', 'missing-campaign'), 0);
+
+  const bad = [
+    [{ name: 'spring sale', utm_source: 'a', utm_medium: 'b', utm_campaign: 'c' }, /letters, numbers and hyphens/],
+    [{ name: 'ok', utm_medium: 'b', utm_campaign: 'c' }, /utm_source is required/],
+    [{ name: 'ok', utm_source: 'A B!', utm_medium: 'b', utm_campaign: 'c' }, /utm_source can use letters/],
+    [{ name: 'ok', utm_source: 'a', utm_medium: 'b', utm_campaign: 'c', utm_content_pattern: 'a{Bad Name}' }, /utm_content_pattern can use/],
+    [{ name: 'ok', utm_source: 'a', utm_medium: 'b', utm_campaign: 'c', notes: 'x'.repeat(401) }, /notes is too long/],
+    [{ name: 'ok', utm_source: 'a', utm_medium: 'b', utm_campaign: 'c', notes: 'bad\u0000note' }, /control characters/],
+    [{ name: 'x'.repeat(41), utm_source: 'a', utm_medium: 'b', utm_campaign: 'c' }, /40 characters at most/],
+    [{ name: 5, utm_source: 'a', utm_medium: 'b', utm_campaign: 'c' }, /name must be text/],
+  ];
+  for (const [args, message] of bad) {
+    const result = await toolCall(mine.token, 'save_campaign', args);
+    assert.equal(result.isError, true, JSON.stringify(args));
+    assert.match(result.content[0].text, message, JSON.stringify(args));
+  }
+  const longValue = 'a'.repeat(101);
+  const longUtm = await toolCall(mine.token, 'create_link', {
+    url: 'https://example.com/long-utm',
+    utm_source: longValue,
+  });
+  assert.equal(longUtm.isError, true);
+  assert.match(longUtm.content[0].text, /utm_source is too long/);
+  const emptyUtm = await toolCall(mine.token, 'create_link', { url: 'https://example.com/empty-utm', utm_medium: '   ' });
+  assert.equal(emptyUtm.isError, true);
+  assert.match(emptyUtm.content[0].text, /utm_medium is empty/);
+  const typed = await toolCall(mine.token, 'create_link', { url: 'https://example.com/typed', campaign: 5 });
+  assert.equal(typed.isError, true);
+  assert.match(typed.content[0].text, /campaign must be text/);
+  assert.equal(await count('SELECT COUNT(*) AS n FROM links WHERE code = ?', 'long-utm'), 0);
+
+  const tooLong = 'https://example.com/' + 'a'.repeat(2010);
+  const overflow = await toolCall(mine.token, 'create_link', { url: tooLong, name: 'overflow-utm', utm_source: 'threads' });
+  assert.equal(overflow.isError, true);
+  assert.match(overflow.content[0].text, /too long once the tracking tags are added/);
+  assert.equal(await count("SELECT COUNT(*) AS n FROM links WHERE code = 'overflow-utm' OR code LIKE 'overflow-utm-%'"), 0);
+
+  const now = Math.floor(Date.now() / 1000);
+  const seeded = [];
+  for (let i = 0; i < 48; i++) {
+    seeded.push(
+      db.prepare(
+        `INSERT INTO campaigns
+           (owner_id, name, utm_source, utm_medium, utm_campaign, utm_content_pattern, notes, created_at, updated_at)
+         VALUES (?, ?, 'src', 'med', 'camp', NULL, NULL, ?, ?)`
+      ).bind(mine.ownerId, `cap-${i}`, now, now)
+    );
+  }
+  await db.batch(seeded);
+  assert.equal(await count('SELECT COUNT(*) AS n FROM campaigns WHERE owner_id = ?', mine.ownerId), 50);
+  const capped = await toolCall(mine.token, 'save_campaign', {
+    name: 'one-more',
+    utm_source: 'a',
+    utm_medium: 'b',
+    utm_campaign: 'c',
+  });
+  assert.equal(capped.isError, true);
+  assert.match(capped.content[0].text, /already has 50/);
+  const updatedAtCap = toolJson(await toolCall(mine.token, 'save_campaign', {
+    name: 'cap-0',
+    utm_source: 'updated',
+    utm_medium: 'med',
+    utm_campaign: 'camp',
+  }));
+  assert.equal(updatedAtCap.saved, 'updated');
+  assert.equal(updatedAtCap.utm_source, 'updated');
+  assert.equal(await count('SELECT COUNT(*) AS n FROM campaigns WHERE owner_id = ?', mine.ownerId), 50);
+  const theirCap = toolJson(await toolCall(theirs.token, 'save_campaign', {
+    name: 'one-more',
+    utm_source: 'a',
+    utm_medium: 'b',
+    utm_campaign: 'c',
+  }));
+  assert.equal(theirCap.saved, 'created');
+
+  // The original tools return the same shape when campaigns exist and no tags are asked for.
+  const plain = toolJson(await toolCall(mine.token, 'create_link', { url: 'https://example.com/still-plain', name: 'still-plain' }));
+  assert.deepEqual(plain, {
+    slug: 'still-plain',
+    short_url: `${ORIGIN}/still-plain`,
+    destination: 'https://example.com/still-plain',
+  });
+  await click('still-plain', { ip: '198.51.100.40' });
+  await waitForClicks('still-plain', 1);
+  const list = toolJson(await toolCall(mine.token, 'list_links', {}));
+  const rowLink = list.links.find((link) => link.slug === 'still-plain');
+  assert.deepEqual(Object.keys(rowLink), ['slug', 'short_url', 'destination', 'label', 'created', 'clicks', 'unique_visitors']);
+  assert.equal(rowLink.clicks, 1);
+  assert.equal(rowLink.unique_visitors, 1);
+  assert.equal(list.links.some((link) => link.slug === 'from-campaign'), true);
+  const report = toolJson(await toolCall(mine.token, 'link_report', { slug: 'still-plain', days: 7 }));
+  assert.equal(report.clicks, 1);
+  assert.equal(report.daily.length, 7);
+  assert.deepEqual(Object.keys(report), [
+    'slug', 'short_url', 'destination', 'label', 'days', 'from', 'to', 'clicks', 'unique_visitors', 'daily', 'note',
+  ]);
+  const summary = toolJson(await toolCall(mine.token, 'clicks_summary', { days: 7 }));
+  assert.ok(summary.clicks >= 1);
+  assert.deepEqual(Object.keys(summary.links[0]), ['slug', 'short_url', 'destination', 'label', 'clicks', 'unique_visitors']);
+  const hidden = toolJson(await toolCall(theirs.token, 'list_links', {}));
+  assert.equal(hidden.links.some((link) => link.slug === 'still-plain'), false);
+  const yours = await (await request('/links', { cookie: `${mine.cookie}; mcp=${mine.token}` })).text();
+  assert.match(yours, /ask before it adds tracking/);
+  assert.match(yours, /reuse a saved campaign/);
+});
+
+test('the campaigns migration matches schema.sql and can run twice', async () => {
+  const migration = readFileSync(`${ROOT}migrations/0005_campaigns.sql`, 'utf8');
+  const schema = readFileSync(`${ROOT}schema.sql`, 'utf8');
+  const create = migration.slice(migration.indexOf('CREATE TABLE IF NOT EXISTS campaigns')).trim();
+  assert.ok(create.startsWith('CREATE TABLE IF NOT EXISTS campaigns'));
+  assert.ok(create.includes('CREATE INDEX IF NOT EXISTS idx_campaigns_owner'));
+  assert.ok(schema.includes(create));
+  assert.doesNotMatch(migration, /\b(DROP|ALTER)\b/i);
+  assert.doesNotMatch(schema, /\b(DROP|ALTER)\b/i);
+  const statements = (sql) => sql.replace(/^--.*$/gm, '').split(';').map((part) => part.trim()).filter(Boolean);
+  for (const statement of statements(migration)) {
+    await db.prepare(statement).run();
+    await db.prepare(statement).run();
+  }
+  for (const statement of statements(schema)) {
+    await db.prepare(statement).run();
+  }
 });
 
 test('an owner in UNLIMITED_OWNERS can pass the hour and day limits, and spaces in the list are ignored', async () => {
