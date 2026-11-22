@@ -1,7 +1,8 @@
 -- Idempotent schema for a new Linki database. Existing databases are updated
 -- by migrations/ (wrangler d1 migrations apply). Statements here only create
 -- tables and indexes if they are missing. The campaigns statements at the
--- bottom match migrations/0005_campaigns.sql.
+-- bottom match migrations/0005_campaigns.sql. created_via and traffic match
+-- the columns migrations/0006_traffic.sql adds to an existing database.
 
 CREATE TABLE IF NOT EXISTS links (
   code         TEXT PRIMARY KEY,
@@ -12,7 +13,9 @@ CREATE TABLE IF NOT EXISTS links (
   click_count  INTEGER NOT NULL DEFAULT 0,
   created_at   INTEGER NOT NULL,
   creator_hash TEXT,
-  unique_count INTEGER NOT NULL DEFAULT 0
+  unique_count INTEGER NOT NULL DEFAULT 0,
+  created_via  TEXT,
+  traffic      TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_links_owner ON links (owner_id, created_at);
 CREATE INDEX IF NOT EXISTS idx_links_creator ON links (creator_hash, created_at);
@@ -21,7 +24,8 @@ CREATE TABLE IF NOT EXISTS clicks (
   id           INTEGER PRIMARY KEY,
   code         TEXT NOT NULL,
   ts           INTEGER NOT NULL,
-  visitor_hash TEXT
+  visitor_hash TEXT,
+  traffic      TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_clicks_code_ts ON clicks (code, ts);
 CREATE INDEX IF NOT EXISTS idx_clicks_code_visitor ON clicks (code, visitor_hash);

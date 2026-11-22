@@ -1,3 +1,12 @@
+# People-only counts (22 Nov 2026)
+
+GA4 was mixing Ashburn data-center traffic and Kiet's own testing with real visitors. Each request is now labeled, and the reports count people.
+
+- A request is `internal` when its owner cookie is listed in `UNLIMITED_OWNERS`, then `bot` (the existing user-agent rules, HEAD, prefetch, or a verified-bot flag when Bot Management is present), then `datacenter` (a cloud ASN or organization name), then `human`. The free plan does not send Bot Management. The label does not require it.
+- New links store `created_via` (`web` or `mcp`) and `traffic`. New clicks store `traffic`. Bots and link previews are still not stored. Migration `0006_traffic.sql` adds the three columns. Existing rows stay NULL, and reports count those clicks with people.
+- `link_report` and `clicks_summary` count human clicks plus unlabeled older clicks. `excluded` shows how many clicks were left out as bot, datacenter or internal. `include_all: true` adds `by_traffic`. `list_links` and Your links use the same people-only counts.
+- An internal browser loads Google Analytics with `traffic_type: 'internal'`. A data-center request does not load Analytics, so it cannot send `link_created`. The event is unchanged for everyone else.
+
 # Preview crawlers (21 Nov 2026)
 
 `robots.txt` disallowed short links, and `Allow: /$` does not match a homepage with a query. Twitterbot, facebookexternalhit and the other preview crawlers that obey the file never fetched the share tags or `/og.png`, so Threads and X showed a bare card.

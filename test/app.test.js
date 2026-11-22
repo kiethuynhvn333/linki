@@ -13,6 +13,10 @@ const ORIGIN = 'https://linki.test';
 // Same rule as wrangler.toml: PNG imports are binary Data modules.
 const MODULE_RULES = [{ type: 'Data', include: ['**/*.png'], fallthrough: true }];
 const BROWSER_UA = 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 Chrome/130.0 Safari/537.36';
+// Miniflare stamps every request with a cached cloud network (Amazon, in this
+// environment) unless the test passes its own cf. A home ISP keeps the suite
+// on the human path. A test that wants a data center passes a different cf.
+const HOME_CF = { asn: 7922, asOrganization: 'Comcast Cable Communications, LLC' };
 // Obviously fake. Production never has this binding.
 const REVIEW_KEY = 'test-review-key';
 const REVIEW_HASH = createHash('sha256').update(REVIEW_KEY).digest('hex');
@@ -67,11 +71,12 @@ function freshIp() {
   return `203.0.113.${ipCounter}`;
 }
 
-function request(path, { method = 'GET', cookie, headers = {}, body, origin = ORIGIN } = {}) {
+function request(path, { method = 'GET', cookie, headers = {}, body, origin = ORIGIN, cf = HOME_CF } = {}) {
   return mf.dispatchFetch(`${origin}${path}`, {
     method,
     body,
     redirect: 'manual',
+    cf,
     headers: { 'User-Agent': BROWSER_UA, ...(cookie ? { Cookie: cookie } : {}), ...headers },
   });
 }
@@ -99,8 +104,8 @@ function setCookies(res) {
 }
 
 // Creates a link. Returns its code and the owner cookie to send on later requests.
-async function createLink({ url = 'https://example.com/page', name = '', cookie, ip = freshIp() } = {}) {
-  const res = await post('/create', { url, name }, { cookie, headers: { 'CF-Connecting-IP': ip } });
+async function createLink({ url = 'https://example.com/page', name = '', cookie, ip = freshIp(), cf, headers = {} } = {}) {
+  const res = await post('/create', { url, name }, { cookie, cf, headers: { 'CF-Connecting-IP': ip, ...headers } });
   assert.equal(res.status, 303);
   const location = res.headers.get('Location');
   const code = location.match(/^\/\?new=([a-z0-9-]+)(&asked=[a-z0-9-]+)?$/)[1];
@@ -113,8 +118,13 @@ async function toolCall(token, name, args) {
   return json.result;
 }
 
-function click(code, { ip = '198.51.100.1', ua = BROWSER_UA, method = 'GET', headers = {} } = {}) {
-  return request(`/${code}`, { method, headers: { 'User-Agent': ua, 'CF-Connecting-IP': ip, ...headers } });
+function click(code, { ip = '198.51.100.1', ua = BROWSER_UA, method = 'GET', headers = {}, cf, cookie } = {}) {
+  return request(`/${code}`, {
+    method,
+    cookie,
+    cf,
+    headers: { 'User-Agent': ua, 'CF-Connecting-IP': ip, ...headers },
+  });
 }
 
 // Where a short link leads, asked as a tool that is never counted as a click.
@@ -157,11 +167,12 @@ async function rpc(token, method, params) {
   return { status: res.status, json: await res.json() };
 }
 
-function reviewRequest(path, { method = 'GET', cookie, headers = {}, body, origin = ORIGIN } = {}) {
+function reviewRequest(path, { method = 'GET', cookie, headers = {}, body, origin = ORIGIN, cf = HOME_CF } = {}) {
   return reviewMf.dispatchFetch(`${origin}${path}`, {
     method,
     body,
     redirect: 'manual',
+    cf,
     headers: { 'User-Agent': BROWSER_UA, ...(cookie ? { Cookie: cookie } : {}), ...headers },
   });
 }
@@ -220,10 +231,11 @@ async function withWorker(bindings, run) {
   }
 }
 
-function workerPost(worker, fields, { cookie, ip } = {}) {
+function workerPost(worker, fields, { cookie, ip, cf = HOME_CF } = {}) {
   return worker.dispatchFetch(`${ORIGIN}/create`, {
     method: 'POST',
     redirect: 'manual',
+    cf,
     body: new URLSearchParams(fields).toString(),
     headers: {
       'User-Agent': BROWSER_UA,
@@ -239,6 +251,7 @@ async function workerRpc(worker, token, method, params) {
   const res = await worker.dispatchFetch(`${ORIGIN}/mcp/${token}`, {
     method: 'POST',
     redirect: 'manual',
+    cf: HOME_CF,
     body: JSON.stringify({ jsonrpc: '2.0', id: 1, method, params }),
     headers: { 'User-Agent': BROWSER_UA, 'Content-Type': 'application/json' },
   });
@@ -1303,6 +1316,240 @@ test('preview crawlers get the normal redirect and are not counted', async () =>
   assert.deepEqual(await linkRow(code), { click_count: 1, unique_count: 1 });
 });
 
+test('each request is labeled human, bot, datacenter or internal', async () => {
+  const human = await createLink({ name: 'plain-human-label' });
+  assert.equal(human.code, 'plain-human-label');
+  assert.deepEqual(await db.prepare('SELECT created_via, traffic FROM links WHERE code = ?').bind(human.code).first(), {
+    created_via: 'web',
+    traffic: 'human',
+  });
+  await click(human.code, { ip: '198.51.100.20' });
+  await waitFor(async () => {
+    const row = await db.prepare('SELECT traffic FROM clicks WHERE code = ?').bind(human.code).first();
+    return row && row.traffic === 'human';
+  }, 'human click label');
+
+  // No bot score at all: the free plan does not send Bot Management.
+  const plain = await createLink({
+    name: 'no-bot-score',
+    cf: { asn: 7922, asOrganization: 'Comcast Cable Communications, LLC', botManagement: null },
+  });
+  assert.equal((await db.prepare('SELECT traffic FROM links WHERE code = ?').bind(plain.code).first()).traffic, 'human');
+
+  const fiber = await createLink({
+    name: 'google-fiber',
+    cf: { asn: 16591, asOrganization: 'Google Fiber Inc.' },
+  });
+  assert.equal((await db.prepare('SELECT traffic FROM links WHERE code = ?').bind(fiber.code).first()).traffic, 'human');
+
+  const bot = await createLink({ name: 'curl-made-label', headers: { 'User-Agent': 'curl/8.4.0' } });
+  assert.equal((await db.prepare('SELECT created_via, traffic FROM links WHERE code = ?').bind(bot.code).first()).traffic, 'bot');
+  await click(bot.code, { ua: 'curl/8.4.0' });
+  await click(bot.code, { ip: '198.51.100.21' });
+  await waitForClicks(bot.code, 1);
+  assert.equal(await count("SELECT COUNT(*) AS n FROM clicks WHERE code = ? AND traffic = 'bot'", bot.code), 0);
+
+  const aws = await createLink({
+    name: 'from-aws',
+    cf: { asn: 16509, asOrganization: 'Amazon.com, Inc.' },
+  });
+  assert.equal((await db.prepare('SELECT traffic FROM links WHERE code = ?').bind(aws.code).first()).traffic, 'datacenter');
+  const hetzner = await createLink({
+    name: 'from-hetzner',
+    cf: { asn: 999999, asOrganization: 'Hetzner Online GmbH' },
+  });
+  assert.equal((await db.prepare('SELECT traffic FROM links WHERE code = ?').bind(hetzner.code).first()).traffic, 'datacenter');
+  const google = await createLink({
+    name: 'from-google',
+    cf: { asn: 1, asOrganization: 'GOOGLE' },
+  });
+  assert.equal((await db.prepare('SELECT traffic FROM links WHERE code = ?').bind(google.code).first()).traffic, 'datacenter');
+
+  // A verified bot wins over a cloud ASN. A score of 1 does too. A high score does not.
+  const verified = await createLink({
+    name: 'verified-bot',
+    cf: { asn: 16509, asOrganization: 'Amazon.com, Inc.', botManagement: { verifiedBot: true, score: 99 } },
+  });
+  assert.equal((await db.prepare('SELECT traffic FROM links WHERE code = ?').bind(verified.code).first()).traffic, 'bot');
+  const scored = await createLink({
+    name: 'score-one',
+    cf: { asn: 7922, asOrganization: 'Comcast Cable Communications, LLC', botManagement: { score: 1 } },
+  });
+  assert.equal((await db.prepare('SELECT traffic FROM links WHERE code = ?').bind(scored.code).first()).traffic, 'bot');
+
+  const token = setCookies(await request('/links', { cookie: human.cookie })).mcp.value;
+  const made = toolJson(await toolCall(token, 'create_link', { url: 'https://example.com/mcp-label', name: 'mcp-human-label' }));
+  assert.deepEqual(await db.prepare('SELECT created_via, traffic FROM links WHERE code = ?').bind(made.slug).first(), {
+    created_via: 'mcp',
+    traffic: 'human',
+  });
+  const mcpAws = await mf.dispatchFetch(`${ORIGIN}/mcp/${token}`, {
+    method: 'POST',
+    redirect: 'manual',
+    cf: { asn: 16509, asOrganization: 'Amazon.com, Inc.' },
+    headers: { 'User-Agent': BROWSER_UA, 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      jsonrpc: '2.0',
+      id: 1,
+      method: 'tools/call',
+      params: { name: 'create_link', arguments: { url: 'https://example.com/mcp-aws', name: 'mcp-aws-label' } },
+    }),
+  });
+  assert.equal(mcpAws.status, 200);
+  assert.deepEqual(await db.prepare('SELECT created_via, traffic FROM links WHERE code = ?').bind('mcp-aws-label').first(), {
+    created_via: 'mcp',
+    traffic: 'datacenter',
+  });
+
+  const owner = randomOwnerId();
+  await withWorker({ UNLIMITED_OWNERS: owner }, async (worker, database) => {
+    const res = await worker.dispatchFetch(`${ORIGIN}/create`, {
+      method: 'POST',
+      redirect: 'manual',
+      cf: { asn: 16509, asOrganization: 'Amazon.com, Inc.' },
+      body: new URLSearchParams({ url: 'https://example.com/internal', name: 'owner-made' }).toString(),
+      headers: {
+        'User-Agent': BROWSER_UA,
+        'Content-Type': 'application/x-www-form-urlencoded',
+        Origin: ORIGIN,
+        Cookie: `owner=${owner}`,
+      },
+    });
+    assert.equal(res.status, 303);
+    assert.deepEqual(await database.prepare('SELECT created_via, traffic FROM links WHERE code = ?').bind('owner-made').first(), {
+      created_via: 'web',
+      traffic: 'internal',
+    });
+    // Curl is still not a click. The browser click is, and it stays internal on a cloud IP.
+    await worker.dispatchFetch(`${ORIGIN}/owner-made`, {
+      method: 'GET',
+      redirect: 'manual',
+      headers: { 'User-Agent': 'curl/8.4.0', Cookie: `owner=${owner}` },
+    });
+    const visit = await worker.dispatchFetch(`${ORIGIN}/owner-made`, {
+      method: 'GET',
+      redirect: 'manual',
+      cf: { asn: 16509, asOrganization: 'Amazon.com, Inc.' },
+      headers: { 'User-Agent': BROWSER_UA, Cookie: `owner=${owner}` },
+    });
+    assert.equal(visit.status, 302);
+    await waitFor(async () => {
+      const row = await database.prepare('SELECT traffic FROM clicks WHERE code = ?').bind('owner-made').first();
+      return row && row.traffic === 'internal';
+    }, 'internal click');
+    assert.equal(
+      Number((await database.prepare('SELECT COUNT(*) AS n FROM clicks WHERE code = ?').bind('owner-made').first()).n),
+      1
+    );
+  });
+});
+
+test('reports and Your links count people, and old unlabeled clicks still count', async () => {
+  const { code, cookie } = await createLink({ name: 'people-only' });
+  const token = setCookies(await request('/links', { cookie })).mcp.value;
+  await click(code, { ip: '198.51.100.31' });
+  await waitForClicks(code, 1);
+  await click(code, { ip: '198.51.100.32', cf: { asn: 16509, asOrganization: 'Amazon.com, Inc.' } });
+  await waitFor(
+    async () => (await count('SELECT COUNT(*) AS n FROM clicks WHERE code = ?', code)) === 2,
+    'datacenter click stored'
+  );
+  const now = Math.floor(Date.now() / 1000);
+  await db.batch([
+    db.prepare('INSERT INTO clicks (code, ts, visitor_hash) VALUES (?, ?, ?)').bind(code, now, 'old-a'),
+    db.prepare('INSERT INTO clicks (code, ts, visitor_hash) VALUES (?, ?, ?)').bind(code, now, 'old-b'),
+    db.prepare("INSERT INTO clicks (code, ts, visitor_hash, traffic) VALUES (?, ?, ?, 'bot')").bind(code, now, 'stored-bot'),
+  ]);
+  // The stored counter includes the data-center click. The page must not use it.
+  assert.equal((await linkRow(code)).click_count, 2);
+
+  const report = toolJson(await toolCall(token, 'link_report', { slug: code, days: 7 }));
+  assert.equal(report.clicks, 3);
+  assert.equal(report.daily.reduce((sum, day) => sum + day.clicks, 0), 3);
+  assert.deepEqual(report.excluded, { bot: 1, datacenter: 1, internal: 0 });
+  assert.equal(report.by_traffic, undefined);
+
+  const all = toolJson(await toolCall(token, 'link_report', { slug: code, days: 7, include_all: true }));
+  assert.equal(all.clicks, 3);
+  assert.deepEqual(all.by_traffic, { human: 1, unknown: 2, bot: 1, datacenter: 1, internal: 0 });
+  assert.deepEqual(all.excluded, report.excluded);
+
+  const bad = await toolCall(token, 'clicks_summary', { include_all: 'yes' });
+  assert.equal(bad.isError, true);
+
+  const summary = toolJson(await toolCall(token, 'clicks_summary', { days: 7 }));
+  assert.equal(summary.clicks, 3);
+  assert.equal(summary.links.find((link) => link.slug === code).clicks, 3);
+  assert.deepEqual(summary.excluded, { bot: 1, datacenter: 1, internal: 0 });
+  const summaryAll = toolJson(await toolCall(token, 'clicks_summary', { days: 7, include_all: true }));
+  assert.deepEqual(summaryAll.by_traffic, all.by_traffic);
+
+  const listed = toolJson(await toolCall(token, 'list_links', {})).links.find((link) => link.slug === code);
+  assert.equal(listed.clicks, 3);
+  assert.equal(listed.unique_visitors, 3);
+
+  const yours = await (await request('/links', { cookie })).text();
+  assert.match(yours, new RegExp(`/${code}[\\s\\S]*?<span class="num">3</span>`));
+  const detail = await (await request(`/links/${code}`, { cookie })).text();
+  assert.match(detail, /Total(?:&nbsp;|\s)clicks<\/span><span class="num">3/);
+  assert.match(detail, /Unique(?:&nbsp;|\s)clicks<\/span><span class="num">3/);
+  assert.match(detail, /Today · 3</);
+});
+
+test('Analytics tags an internal browser and skips a data-center request', async () => {
+  const humanHtml = await (await request('/')).text();
+  assert.match(humanHtml, /gtag\('config', 'G-MEBVJJ00K8'\);/);
+  assert.doesNotMatch(humanHtml, /traffic_type/);
+
+  const made = await createLink({ name: 'ga-human' });
+  const after = await (await request(`/?new=${made.code}`, { cookie: made.cookie })).text();
+  assert.match(after, /gtag\('event', 'link_created'\)/);
+  assert.doesNotMatch(after, /traffic_type/);
+
+  const dcHtml = await (await request('/', { cf: { asn: 16509, asOrganization: 'Amazon.com, Inc.' } })).text();
+  assert.match(dcHtml, /a very good alternative/);
+  assert.doesNotMatch(dcHtml, /gtag\(|googletagmanager/);
+  const dcMade = await createLink({ name: 'ga-datacenter', cf: { asn: 16509, asOrganization: 'Amazon.com, Inc.' } });
+  const dcAfter = await (
+    await request(`/?new=${dcMade.code}`, { cf: { asn: 16509, asOrganization: 'Amazon.com, Inc.' } })
+  ).text();
+  assert.doesNotMatch(dcAfter, /gtag\(|link_created/);
+
+  const owner = randomOwnerId();
+  await withWorker({ UNLIMITED_OWNERS: owner }, async (worker) => {
+    const home = await worker.dispatchFetch(`${ORIGIN}/`, {
+      redirect: 'manual',
+      cf: { asn: 14061, asOrganization: 'DigitalOcean, LLC' },
+      headers: { 'User-Agent': BROWSER_UA, Cookie: `owner=${owner}` },
+    });
+    const homeHtml = await home.text();
+    assert.match(homeHtml, /gtag\('config', 'G-MEBVJJ00K8', \{ traffic_type: 'internal' \}\);/);
+    assert.doesNotMatch(homeHtml, /link_created/);
+
+    const res = await worker.dispatchFetch(`${ORIGIN}/create`, {
+      method: 'POST',
+      redirect: 'manual',
+      cf: { asn: 14061, asOrganization: 'DigitalOcean, LLC' },
+      body: new URLSearchParams({ url: 'https://example.com/ga-internal', name: 'ga-internal' }).toString(),
+      headers: {
+        'User-Agent': BROWSER_UA,
+        'Content-Type': 'application/x-www-form-urlencoded',
+        Origin: ORIGIN,
+        Cookie: `owner=${owner}`,
+      },
+    });
+    assert.equal(res.status, 303);
+    const page = await worker.dispatchFetch(`${ORIGIN}/?new=ga-internal`, {
+      redirect: 'manual',
+      cf: { asn: 14061, asOrganization: 'DigitalOcean, LLC' },
+      headers: { 'User-Agent': BROWSER_UA, Cookie: `owner=${owner}` },
+    });
+    const html = await page.text();
+    assert.match(html, /gtag\('config', 'G-MEBVJJ00K8', \{ traffic_type: 'internal' \}\);/);
+    assert.match(html, /gtag\('event', 'link_created'\)/);
+  });
+});
+
 test('an unknown short link is a 404', async () => {
   assert.equal((await click('zzzzzz')).status, 404);
 });
@@ -1789,8 +2036,9 @@ test('saved campaigns are per connector, capped, validated, and never required f
   assert.equal(report.clicks, 1);
   assert.equal(report.daily.length, 7);
   assert.deepEqual(Object.keys(report), [
-    'slug', 'short_url', 'destination', 'label', 'days', 'from', 'to', 'clicks', 'unique_visitors', 'daily', 'note',
+    'slug', 'short_url', 'destination', 'label', 'days', 'from', 'to', 'clicks', 'unique_visitors', 'daily', 'excluded', 'note',
   ]);
+  assert.deepEqual(report.excluded, { bot: 0, datacenter: 0, internal: 0 });
   const summary = toolJson(await toolCall(mine.token, 'clicks_summary', { days: 7 }));
   assert.ok(summary.clicks >= 1);
   assert.deepEqual(Object.keys(summary.links[0]), ['slug', 'short_url', 'destination', 'label', 'clicks', 'unique_visitors']);
@@ -1818,6 +2066,20 @@ test('the campaigns migration matches schema.sql and can run twice', async () =>
   for (const statement of statements(schema)) {
     await db.prepare(statement).run();
   }
+});
+
+test('the traffic migration only adds nullable columns', async () => {
+  const migration = readFileSync(`${ROOT}migrations/0006_traffic.sql`, 'utf8');
+  const schema = readFileSync(`${ROOT}schema.sql`, 'utf8');
+  assert.match(migration, /ALTER TABLE links ADD COLUMN created_via TEXT;/);
+  assert.match(migration, /ALTER TABLE links ADD COLUMN traffic TEXT;/);
+  assert.match(migration, /ALTER TABLE clicks ADD COLUMN traffic TEXT;/);
+  assert.doesNotMatch(migration, /\b(DROP|UPDATE|DELETE|CREATE)\b/i);
+  assert.match(schema, /created_via\s+TEXT/);
+  assert.match(schema, /traffic\s+TEXT/);
+  assert.doesNotMatch(schema, /\bALTER\b/);
+  const row = await db.prepare('SELECT created_via, traffic FROM links LIMIT 1').first();
+  assert.ok(row === null || Object.prototype.hasOwnProperty.call(row, 'traffic'));
 });
 
 test('an owner in UNLIMITED_OWNERS can pass the hour and day limits, and spaces in the list are ignored', async () => {
