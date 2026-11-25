@@ -21,6 +21,12 @@ type = "Data"
 globs = ["**/*.png"]
 fallthrough = true
 
+# Square icon served at /icon.svg. No build step.
+[[rules]]
+type = "Text"
+globs = ["**/*.svg"]
+fallthrough = true
+
 [[d1_databases]]
 binding = "DB"
 database_name = "linki"
