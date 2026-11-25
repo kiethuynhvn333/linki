@@ -31,7 +31,11 @@ Google Analytics loads on Linki's own pages from `GA_ID` at the top of `src/inde
 
 ## Use Linki from an AI agent (MCP)
 
-Once you have a link, the home page shows one line under **Recent links** with a **Copy MCP link** button. **Your links** shows the same link below the list. On the public site it is `https://linki.ing/mcp/<token>`. In Claude: Settings → Connectors → Add custom connector → paste the link. Cursor and other MCP clients take the same link.
+Claude and ChatGPT connect to one address, `https://linki.ing/mcp` (on another host it is that host's `/mcp`). The first request without a token answers 401 and points at the OAuth metadata. The app registers, sends you to an approval page on this site, and you choose Allow. That approves the links saved in this browser. There is no account and no password. If the browser has no links yet, the approval page says so and can create one. Connected apps are listed under **Your links**, and Revoke removes their tokens.
+
+The older per-browser address still works. Once you have a link, the home page shows one line under **Recent links** with a **Copy MCP link** button. **Your links** shows the same link below the list. On the public site it is `https://linki.ing/mcp/<token>`. In Claude: Settings → Connectors → Add custom connector → paste the link. Cursor and other MCP clients take the same link.
+
+How to connect, what each tool does, the privacy policy, and support are at `/docs/mcp`, `/privacy`, and `/support`. The square icon is `/icon.svg` and `/icon-512.png` (also `/icon.png`).
 
 The connector only sees this browser's links. Its tools are:
 
@@ -46,9 +50,11 @@ Before it creates a link, the agent asks one question: "Want to track clicks fro
 
 An explicit tag wins over a saved campaign, which wins over a tag already in the URL. Values are trimmed, lowercased and URL-encoded. The rest of the query and the fragment stay, and a tag is not written twice. If `utm_content` is left out while other tags or a campaign are used, and the URL does not already have one, it becomes the short name. `utm_content_pattern` (for example `a{angle}h{hook}-{lang}`) is naming guidance the agent follows. It is stored and returned as text. Saved campaigns live in the `campaigns` table (`migrations/0005_campaigns.sql`). `migrations/0006_traffic.sql` adds `links.created_via` (`web` or `mcp`), `links.traffic`, and `clicks.traffic`. Existing rows stay empty, which means unknown, and reports count those clicks with people. Apply migrations before deploying this Worker.
 
-Anyone who has the MCP link can create links in your list and read your click counts, so treat it like a password. Reset on **Your links** replaces it, and the old link stops working.
+Anyone who has the MCP link can create links in your list and read your click counts, so treat it like a password. Reset on **Your links** replaces it, and the old link stops working. An OAuth app is separate: revoking it does not reset the MCP link, and resetting the MCP link does not disconnect an app.
 
-Linki stores a SHA-256 hash of the token. This browser keeps the raw token in a cookie so the page can show the link again. The MCP link is created the first time you create a link or open **Your links** with a link in the list.
+Linki stores a SHA-256 hash of the connector token, and the same for OAuth codes, access tokens, and refresh tokens. This browser keeps the raw connector token in a cookie so the page can show the link again. The MCP link is created the first time you create a link or open **Your links** with a link in the list. OAuth access tokens last one hour. Refresh tokens last 90 days and are replaced on each use. Approval codes last 10 minutes.
+
+`migrations/0007_oauth.sql` adds `oauth_clients`, `oauth_consents`, `oauth_codes`, and `oauth_tokens`. It does not change existing tables. Apply it before deploying this Worker. The daily cron also deletes expired rows from those new tables.
 
 ## Run locally
 ```

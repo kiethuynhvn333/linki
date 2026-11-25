@@ -1,3 +1,14 @@
+# OAuth for the connector directory (25 Nov 2026)
+
+Claude and ChatGPT can connect to one address, `/mcp`, instead of a per-browser `/mcp/<token>` link. The old link still works.
+
+- A request to `/mcp` with no bearer token answers 401 and points at `/.well-known/oauth-protected-resource/mcp`. The resource is `<origin>/mcp`. The authorization server is the same origin, with metadata, dynamic registration, and PKCE S256.
+- The approval page uses the owner cookie. Allow creates that cookie when the browser does not have one. The owner id is never put in a URL. Cancel returns `access_denied`. Connected apps are listed on Your links, with Revoke.
+- Codes, access tokens, and refresh tokens are stored as SHA-256 hashes. Access tokens last an hour. Refresh tokens last 90 days and rotate. A reused refresh token drops that grant.
+- `create_link` is marked open-world because the short link is public. The other tools only read or write this browser's rows.
+- `/privacy`, `/support`, and `/docs/mcp` are linked from the footer. The square icon is `/icon.svg` and `/icon-512.png`.
+- Migration `0007_oauth.sql` adds four tables. It does not change existing tables or rows. Apply it before deploying. The daily cron also deletes expired rows from those tables.
+
 # People-only counts (22 Nov 2026)
 
 GA4 was mixing Ashburn data-center traffic and Kiet's own testing with real visitors. Each request is now labeled, and the reports count people.

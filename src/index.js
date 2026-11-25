@@ -5,11 +5,13 @@
 import ogImage from '../assets/og.png';
 import appleTouchIcon from '../assets/apple-touch-icon.png';
 import icon512 from '../assets/icon-512.png';
+import iconSvg from '../assets/icon.svg';
 
 const PNG_ASSETS = {
   '/og.png': ogImage,
   '/apple-touch-icon.png': appleTouchIcon,
   '/icon-512.png': icon512,
+  '/icon.png': icon512,
 };
 
 const GA_ID = 'G-MEBVJJ00K8'; // set to '' to disable Google Analytics on Linki's pages
@@ -18,7 +20,8 @@ const CODE_LENGTH = 6;
 // Names nobody can take as a custom link name: Linki's own paths, plus a few kept for later.
 const RESERVED = new Set([
   'links', 'create', 'api', 'admin', 'static', 'mcp', 'mcp-review', 'review', 'new', 'app',
-  'www', 'about', 'help', 'login', 'signup', 'account', 'settings', 'terms', 'privacy', 'linki',
+  'www', 'about', 'help', 'login', 'signup', 'account', 'settings', 'terms', 'privacy', 'support',
+  'docs', 'oauth', 'icon', 'linki',
 ]);
 const MAX_URL_LENGTH = 2048;
 const NAME_MIN_LENGTH = 3;
@@ -116,6 +119,14 @@ const ROBOTS_TXT = [
   'Allow: /icon-512.png',
   'Allow: /favicon.svg',
   'Allow: /favicon.ico',
+  'Allow: /icon.svg',
+  'Allow: /icon.png',
+  'Allow: /privacy$',
+  'Allow: /privacy?',
+  'Allow: /support$',
+  'Allow: /support?',
+  'Allow: /docs/mcp$',
+  'Allow: /docs/mcp?',
   'Disallow: /',
   '',
   'User-agent: facebookexternalhit',
@@ -166,7 +177,7 @@ const worker = {
       if (reviewEnabled(env) && isReviewKeyRoute(path)) {
         return await reviewKeyRoute(request, env, url);
       }
-      if (method === 'POST' && !isMcpApi(path) && !sameOrigin(request, url)) {
+      if (method === 'POST' && !skipsOriginCheck(path) && !sameOrigin(request, url)) {
         if (reviewEnabled(env) || !isReviewPath(path)) {
           return await messagePage(request, env, 403, 'Request blocked', 'This form was sent from another site.');
         }
@@ -178,12 +189,22 @@ const worker = {
       if (reviewEnabled(env) && isReviewBrowserRoute(path)) {
         return await reviewBrowserRoute(request, env, url, method);
       }
+      if (isOauthDiscovery(path)) return oauthDiscovery(request, url, path);
+      if (path === '/oauth/register') return oauthRegister(request, env);
+      if (path === '/oauth/token') return oauthToken(request, env, url);
+      if (path === '/oauth/authorize') return oauthAuthorize(request, env, url);
+      if (path === '/oauth/revoke' && method === 'POST') return oauthRevoke(request, env, url);
+      if (path === '/privacy' && method === 'GET') return privacyPage(request, env, url);
+      if (path === '/support' && method === 'GET') return supportPage(request, env, url);
+      if (path === '/docs/mcp' && method === 'GET') return mcpDocsPage(request, env, url);
       if (path === '/' && method === 'GET') return homePage(request, env, url);
       if (path === '/create' && method === 'POST') return createLink(request, env, url);
       if (path === '/links' && method === 'GET') return linksPage(request, env, url);
+      if (path === '/mcp') return mcpBearer(request, env, url);
       if (path === '/mcp/reset') return resetMcp(request, env, url);
       if (path.startsWith('/mcp/')) return mcpEndpoint(request, env, url);
       if (path === '/favicon.svg' || path === '/favicon.ico') return new Response(LOGO_SVG, { headers: { 'Content-Type': 'image/svg+xml', 'Cache-Control': 'public, max-age=86400' } });
+      if (path === '/icon.svg') return new Response(iconSvg, { headers: { 'Content-Type': 'image/svg+xml', 'Cache-Control': 'public, max-age=86400', 'X-Content-Type-Options': 'nosniff' } });
       // Brand images. These are not short links, so a fetch is never counted as a click.
       if (PNG_ASSETS[path] && method === 'GET') return pngResponse(PNG_ASSETS[path]);
       if (path === '/robots.txt') return new Response(ROBOTS_TXT);
@@ -248,6 +269,13 @@ function canonicalRedirect(url) {
 
 function isMcpApi(path) {
   return path.startsWith('/mcp/') && path !== '/mcp/reset';
+}
+
+// Token exchange and registration are called by the app's server, or by a
+// browser on another site. The shared /mcp endpoint is the same. The approval
+// page and the revoke button stay on this site, so they keep the Origin check.
+function skipsOriginCheck(path) {
+  return isMcpApi(path) || path === '/mcp' || path === '/oauth/token' || path === '/oauth/register';
 }
 
 // Browsers send Origin on every form POST. A POST from another site is refused.
@@ -383,6 +411,7 @@ async function pruneClicks(env) {
   )
     .bind(cutoff, PRUNE_BATCH)
     .run();
+  await pruneOauth(env);
 }
 
 // ---------- create ----------
@@ -843,19 +872,23 @@ async function linksPage(request, env, url) {
   const owner = getOwner(request);
   const links = owner.isNew ? [] : await listLinks(env, owner.id, 200);
   const mcp = await connectorForOwner(request, env, owner, links.length > 0);
+  const apps = await connectedApps(env, owner);
+  const offset = tzOffset(request);
   const notice =
     url.searchParams.get('deleted') === '1'
       ? `<p class="notice" role="status">${noOrphan('Link deleted. Its short link no longer works.')}</p>`
-      : '';
+      : url.searchParams.get('revoked') === '1'
+        ? `<p class="notice" role="status">${noOrphan('App disconnected. It can no longer see the links in this browser.')}</p>`
+        : '';
   const body = `
     <div class="sectionhead top"><h1>Your links</h1><a class="button secondary" href="/">New link</a></div>
     ${notice}
     ${
       links.length
-        ? linkList(links, url.origin, tzOffset(request))
+        ? linkList(links, url.origin, offset)
         : '<div class="empty"><p>No links yet</p><a class="button primary" href="/">Create your first link</a></div>'
     }
-    ${agentSection(mcp, url)}`;
+    ${agentSection(mcp, url, apps, offset)}`;
   return page('Your links', body, {
     owner,
     url,
@@ -874,7 +907,7 @@ function mcpLine(mcp, url) {
     : `<a class="button secondary" href="/links">${spark}Get MCP link</a>`;
   return `<aside class="mcpf" aria-label="Connect your AI agent">
               <span class="ic" aria-hidden="true"><svg viewBox="0 0 20 20">${AGENT_ICON}</svg></span>
-              <p><strong>Use your links from your AI agent.</strong> ${noOrphan('Paste your MCP link into Claude or Cursor to create links and check clicks from chat.')}</p>
+              <p><strong>Use your links from your AI agent.</strong> ${noOrphan('Paste your MCP link into Claude or Cursor, or connect this site in Claude and ChatGPT.')} <a href="/docs/mcp">How to connect</a></p>
               ${action}
             </aside>`;
 }
@@ -899,13 +932,14 @@ function renameForm(link, url, back) {
         <p class="rnmsg" role="alert" hidden></p>`;
 }
 
-function agentSection(mcp, url) {
+function agentSection(mcp, url, apps = [], offset = 0) {
   const connectorUrl = mcp.token ? `${url.origin}/mcp/${mcp.token}` : '';
+  const endpoint = `${url.origin}/mcp`;
   const hint = mcp.token
-    ? 'Copy this MCP link and paste it into your AI tool. Your agent can create links, ask before it adds tracking, reuse a saved campaign, and tell you how the links are doing. In Claude: Settings → Connectors → Add custom connector. Cursor and other MCP clients take the same link.'
+    ? `Copy this MCP link and paste it into your AI tool. Your agent can create links, ask before it adds tracking, reuse a saved campaign, and tell you how the links are doing. In Claude: Settings → Connectors → Add custom connector. Cursor and other MCP clients take the same link. Claude and ChatGPT can instead connect to ${endpoint}. You approve that in this browser.`
     : mcp.exists
       ? 'This browser no longer has your MCP link. Reset to get a new one. The old link stops working.'
-      : 'Create a link first. Your MCP link will show up here.';
+      : `Create a link first. Your MCP link will show up here. Claude and ChatGPT connect to ${endpoint} and ask in this browser.`;
   const reset = mcp.exists
     ? '<form method="post" action="/mcp/reset"><button class="secondary" type="submit">Reset</button></form>'
     : '';
@@ -921,9 +955,26 @@ function agentSection(mcp, url) {
         <h2 id="agent-h"><span class="ic" aria-hidden="true"><svg viewBox="0 0 20 20">${AGENT_ICON}</svg></span><span>Use Linki from your AI agent&nbsp;<span class="tag">MCP</span></span></h2>
         ${reset}
       </div>
-      <p class="hint">${esc(noOrphan(hint))}</p>
+      <p class="hint">${esc(noOrphan(hint))} <a href="/docs/mcp">How to connect</a></p>
       ${urlRow}
+      ${connectedAppsHtml(apps, offset)}
     </section>`;
+}
+
+function connectedAppsHtml(apps, offset) {
+  if (!apps.length) return '';
+  const rows = apps
+    .map(
+      (app) => `<li>
+        <span><strong>${esc(app.client_name)}</strong> <span class="date">${formatDate(app.connected_at + offset)}</span></span>
+        <form method="post" action="/oauth/revoke">
+          <input type="hidden" name="client_id" value="${esc(app.client_id)}">
+          <button class="secondary" type="submit">Revoke</button>
+        </form>
+      </li>`
+    )
+    .join('');
+  return `<div class="apps"><h3>Connected apps</h3><ul>${rows}</ul></div>`;
 }
 
 async function detailPage(request, env, url, code) {
@@ -1161,6 +1212,7 @@ ${gaHead(linkCreated, nonce, traffic)}<link rel="preconnect" href="https://fonts
 <body${review ? ' class="review-on"' : ''}>
 <header><a class="brand" href="/">${LOGO_SVG.replace('<svg ', '<svg aria-hidden="true" ')}Linki</a><nav><a class="pill" href="/links"${url && url.pathname.startsWith('/links') ? ' aria-current="page"' : ''}>Your links</a></nav></header>
 <main class="panel">${body}</main>
+<footer class="sitefoot"><a href="/docs/mcp">Connect an agent</a><a href="/privacy">Privacy</a><a href="/support">Support</a></footer>
 <script nonce="${nonce}">${JS}</script>
 ${review ? `<script nonce="${nonce}">${REVIEW_JS}</script>\n` : ''}</body>
 </html>`;
@@ -1271,15 +1323,25 @@ function utmArg(description) {
 const MCP_TOOLS = [
   {
     name: 'list_links',
+    title: 'List your links',
     description:
-      "List this connector's short links: slug, short URL, destination, label, created date, total clicks, and unique visitors. Clicks and unique visitors count people only: a click labeled human, and an older click with no label. Bot, data-center and internal clicks are left out. Unique visitors are counted once per link per day.",
+      "List this connector's short links: slug, short URL, destination, label, created date, total clicks, and unique visitors. Clicks and unique visitors count people only: a click labeled human, and an older click with no label. Bot, data-center and internal clicks are left out. Unique visitors are counted once per link per day. Referrers, countries and raw network addresses are not stored.",
     inputSchema: { type: 'object', properties: {} },
-    annotations: { readOnlyHint: true, destructiveHint: false, openWorldHint: false },
+    outputSchema: {
+      type: 'object',
+      properties: {
+        truncated: { type: 'boolean' },
+        links: { type: 'array', items: { type: 'object' } },
+      },
+      required: ['links'],
+    },
+    annotations: { title: 'List your links', readOnlyHint: true, destructiveHint: false, openWorldHint: false },
   },
   {
     name: 'link_report',
+    title: 'Link report',
     description:
-      'Clicks and unique visitors per UTC day for one link. days defaults to 30 (max 365). Counts are people only: a click labeled human, and an older click with no label. excluded shows how many clicks were left out as bot, datacenter or internal. include_all also returns a total for each label. Referrers and countries are not stored.',
+      'Clicks and unique visitors per UTC day for one link. days defaults to 30 (max 365). Counts are people only: a click labeled human, and an older click with no label. excluded shows how many clicks were left out as bot, datacenter or internal. include_all also returns a total for each label. Referrers, countries and raw network addresses are not stored.',
     inputSchema: {
       type: 'object',
       properties: {
@@ -1298,12 +1360,27 @@ const MCP_TOOLS = [
       },
       required: ['slug'],
     },
-    annotations: { readOnlyHint: true, destructiveHint: false, openWorldHint: false },
+    outputSchema: {
+      type: 'object',
+      properties: {
+        slug: { type: 'string' },
+        short_url: { type: 'string' },
+        destination: { type: 'string' },
+        days: { type: 'integer' },
+        clicks: { type: 'integer' },
+        unique_visitors: { type: 'integer' },
+        daily: { type: 'array' },
+        excluded: { type: 'object' },
+      },
+      required: ['slug', 'short_url', 'destination', 'clicks', 'unique_visitors', 'daily', 'excluded'],
+    },
+    annotations: { title: 'Link report', readOnlyHint: true, destructiveHint: false, openWorldHint: false },
   },
   {
     name: 'clicks_summary',
+    title: 'Clicks summary',
     description:
-      "Click and unique-visitor totals for all of this connector's links over a UTC range, plus a per-link breakdown. days defaults to 7 (max 365). Counts are people only: a click labeled human, and an older click with no label. excluded shows how many clicks were left out as bot, datacenter or internal. include_all also returns a total for each label.",
+      "Click and unique-visitor totals for all of this connector's links over a UTC range, plus a per-link breakdown. days defaults to 7 (max 365). Counts are people only: a click labeled human, and an older click with no label. excluded shows how many clicks were left out as bot, datacenter or internal. include_all also returns a total for each label. Referrers, countries and raw network addresses are not stored.",
     inputSchema: {
       type: 'object',
       properties: {
@@ -1320,11 +1397,23 @@ const MCP_TOOLS = [
         },
       },
     },
-    annotations: { readOnlyHint: true, destructiveHint: false, openWorldHint: false },
+    outputSchema: {
+      type: 'object',
+      properties: {
+        days: { type: 'integer' },
+        clicks: { type: 'integer' },
+        unique_visitors: { type: 'integer' },
+        links: { type: 'array' },
+        excluded: { type: 'object' },
+      },
+      required: ['days', 'clicks', 'unique_visitors', 'links', 'excluded'],
+    },
+    annotations: { title: 'Clicks summary', readOnlyHint: true, destructiveHint: false, openWorldHint: false },
   },
   {
     name: 'create_link',
-    description: `Create a short link for a destination URL. Before you call this, ask the user one short question, in these words: "${TRACK_QUESTION}" If they say no, call it with url and name only and ask nothing else. If they say yes, ask in plain words where it is shared, what kind of post it is, which campaign, and how to tell versions apart (for example a1h1 for angle 1 hook 1). Then pass utm_source, utm_medium, utm_campaign, utm_content, utm_term, or campaign. Never a five-field form. If a saved campaign fits, offer it in one line: "${CAMPAIGN_OFFER}" Use the real name in place of spring-sale. After a tracked link that did not come from a saved campaign, offer once: "${SAVE_OFFER}" name is optional. If that name is taken, a short ending is added and the result says so. A connector can create ${CREATE_LIMITS.mcp.hour} links an hour and ${CREATE_LIMITS.mcp.day} a day.`,
+    title: 'Create a short link',
+    description: `Create a short link for a destination URL. The short link is public: anyone who has it can open it. Before you call this, ask the user one short question, in these words: "${TRACK_QUESTION}" If they say no, call it with url and name only and ask nothing else. If they say yes, ask in plain words where it is shared, what kind of post it is, which campaign, and how to tell versions apart (for example a1h1 for angle 1 hook 1). Then pass utm_source, utm_medium, utm_campaign, utm_content, utm_term, or campaign. Never a five-field form. If a saved campaign fits, offer it in one line: "${CAMPAIGN_OFFER}" Use the real name in place of spring-sale. After a tracked link that did not come from a saved campaign, offer once: "${SAVE_OFFER}" name is optional. If that name is taken, a short ending is added and the result says so. This does not delete or change an existing link. A connector can create ${CREATE_LIMITS.mcp.hour} links an hour and ${CREATE_LIMITS.mcp.day} a day.`,
     inputSchema: {
       type: 'object',
       description: `${UTM_PRECEDENCE} Values are trimmed, lowercased and URL-encoded. The existing query and fragment stay, and a UTM key is not written twice. If utm_content is omitted while other UTM tags or a campaign are used, and the URL does not already have utm_content, it becomes the short link's slug.`,
@@ -1353,11 +1442,34 @@ const MCP_TOOLS = [
       },
       required: ['url'],
     },
-    annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: false },
+    outputSchema: {
+      type: 'object',
+      properties: {
+        slug: { type: 'string' },
+        short_url: { type: 'string' },
+        destination: { type: 'string' },
+        note: { type: 'string' },
+        campaign: { type: 'string' },
+      },
+      required: ['slug', 'short_url', 'destination'],
+    },
+    // openWorldHint is true because the new short link is a public URL. Anyone
+    // who has it can open it, and it redirects to the destination they chose.
+    // The call itself only writes this browser's row. It does not fetch the
+    // destination or call another service. destructiveHint is false: a taken
+    // name gets a new ending, and nothing is deleted or overwritten.
+    annotations: {
+      title: 'Create a short link',
+      readOnlyHint: false,
+      destructiveHint: false,
+      idempotentHint: false,
+      openWorldHint: true,
+    },
   },
   {
     name: 'save_campaign',
-    description: `Create or update a saved campaign for this connector, matched on name. Stores utm_source, utm_medium, utm_campaign, an optional utm_content_pattern, and optional notes. The pattern is naming guidance only, for example a{angle}h{hook}-{lang} (angle 1, hook 1, Vietnamese becomes a1h1-vn). It is stored and returned as text. This does not create links. Campaigns are never deleted. At most ${CAMPAIGN_CAP} per connector; updating an existing name is still allowed at the cap. After you create a tracked link, you can offer: "${SAVE_OFFER}"`,
+    title: 'Save a campaign',
+    description: `Create or update a saved campaign for this connector, matched on name. Stores utm_source, utm_medium, utm_campaign, an optional utm_content_pattern, and optional notes. The pattern is naming guidance only, for example a{angle}h{hook}-{lang} (angle 1, hook 1, Vietnamese becomes a1h1-vn). It is stored and returned as text. This does not create links and does not delete a campaign. At most ${CAMPAIGN_CAP} per connector; updating an existing name is still allowed at the cap. After you create a tracked link, you can offer: "${SAVE_OFFER}"`,
     inputSchema: {
       type: 'object',
       properties: {
@@ -1380,18 +1492,42 @@ const MCP_TOOLS = [
       },
       required: ['name', 'utm_source', 'utm_medium', 'utm_campaign'],
     },
-    annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: true, openWorldHint: false },
+    outputSchema: {
+      type: 'object',
+      properties: {
+        saved: { type: 'string' },
+        name: { type: 'string' },
+        utm_source: { type: 'string' },
+        utm_medium: { type: 'string' },
+        utm_campaign: { type: 'string' },
+      },
+      required: ['saved', 'name', 'utm_source', 'utm_medium', 'utm_campaign'],
+    },
+    annotations: {
+      title: 'Save a campaign',
+      readOnlyHint: false,
+      destructiveHint: false,
+      idempotentHint: true,
+      openWorldHint: false,
+    },
   },
   {
     name: 'list_campaigns',
+    title: 'List campaigns',
     description: `List this connector's saved campaigns: name, utm_source, utm_medium, utm_campaign, utm_content_pattern and notes. At most ${CAMPAIGN_CAP}. Another connector's campaigns are not included. If one fits the link you are about to create, offer it in one line: "${CAMPAIGN_OFFER}"`,
     inputSchema: { type: 'object', properties: {} },
-    annotations: { readOnlyHint: true, destructiveHint: false, openWorldHint: false },
+    outputSchema: {
+      type: 'object',
+      properties: { campaigns: { type: 'array' } },
+      required: ['campaigns'],
+    },
+    annotations: { title: 'List campaigns', readOnlyHint: true, destructiveHint: false, openWorldHint: false },
   },
   {
     name: 'get_campaign',
+    title: 'Get a campaign',
     description:
-      'Fetch one saved campaign by name for this connector. Returns utm_content_pattern when one was saved, so you can follow it for the slug and utm_content. Example pattern: a{angle}h{hook}-{lang}.',
+      'Fetch one saved campaign by name for this connector. Returns utm_content_pattern when one was saved, so you can follow it for the slug and utm_content. Example pattern: a{angle}h{hook}-{lang}. Another connector\'s campaign is not returned.',
     inputSchema: {
       type: 'object',
       properties: {
@@ -1399,7 +1535,17 @@ const MCP_TOOLS = [
       },
       required: ['name'],
     },
-    annotations: { readOnlyHint: true, destructiveHint: false, openWorldHint: false },
+    outputSchema: {
+      type: 'object',
+      properties: {
+        name: { type: 'string' },
+        utm_source: { type: 'string' },
+        utm_medium: { type: 'string' },
+        utm_campaign: { type: 'string' },
+      },
+      required: ['name', 'utm_source', 'utm_medium', 'utm_campaign'],
+    },
+    annotations: { title: 'Get a campaign', readOnlyHint: true, destructiveHint: false, openWorldHint: false },
   },
 ];
 
@@ -1476,7 +1622,7 @@ async function mcpEndpoint(request, env, url) {
     return await mcpPost(request, env, url, ownerId, cors);
   } catch (err) {
     console.error(err);
-    return rpcError(null, -32603, 'Internal error', cors, 500);
+    return rpcError(null, -32603, 'Linki could not complete that request. Please try again in a moment.', cors, 500);
   }
 }
 
@@ -1486,6 +1632,57 @@ async function ownerForMcpToken(env, token) {
     .bind(await sha256(token))
     .first();
   return row ? row.owner_id : null;
+}
+
+// Shared /mcp endpoint. A bearer access token is the browser that approved the
+// app. From there the tools, limits, and created_via are the legacy path's.
+async function mcpBearer(request, env, url) {
+  const cors = mcpCors(request);
+  if (request.method === 'OPTIONS') return new Response(null, { status: 204, headers: cors });
+  const header = request.headers.get('Authorization') || '';
+  const match = header.match(/^Bearer\s+(\S+)\s*$/i);
+  if (!match) return mcpUnauthorized(url, cors, false);
+  try {
+    const ownerId = await ownerForAccessToken(env, match[1], url.origin);
+    if (!ownerId) return mcpUnauthorized(url, cors, true);
+    if (request.method !== 'POST') {
+      return mcpJson({ error: 'Method not allowed' }, 405, cors, { Allow: 'POST' });
+    }
+    return await mcpPost(request, env, url, ownerId, cors);
+  } catch (err) {
+    console.error(err);
+    return rpcError(null, -32603, 'Linki could not complete that request. Please try again in a moment.', cors, 500);
+  }
+}
+
+function mcpUnauthorized(url, cors, invalidToken) {
+  const metadata = `${url.origin}/.well-known/oauth-protected-resource/mcp`;
+  const description = invalidToken
+    ? 'This access token is missing, expired, or revoked.'
+    : 'Send a bearer access token. Approve Linki in your browser, or use the MCP link on Your links.';
+  const challenge = invalidToken
+    ? `Bearer error="invalid_token", error_description="${description}", resource_metadata="${metadata}", scope="${OAUTH_SCOPE}"`
+    : `Bearer resource_metadata="${metadata}", scope="${OAUTH_SCOPE}"`;
+  return mcpJson(
+    { error: invalidToken ? 'invalid_token' : 'unauthorized', error_description: description },
+    401,
+    cors,
+    { 'WWW-Authenticate': challenge }
+  );
+}
+
+async function ownerForAccessToken(env, token, origin) {
+  if (!/^[A-Za-z0-9_-]{20,200}$/.test(token)) return null;
+  const row = await env.DB.prepare(
+    `SELECT owner_id, resource, expires_at FROM oauth_tokens
+     WHERE token_hash = ? AND kind = 'access' AND rotated_at IS NULL`
+  )
+    .bind(await sha256(token))
+    .first();
+  if (!row) return null;
+  if (row.expires_at <= Math.floor(Date.now() / 1000)) return null;
+  if (row.resource !== `${origin}/mcp`) return null;
+  return row.owner_id;
 }
 
 async function readRpcRequest(request, cors) {
@@ -1534,13 +1731,19 @@ async function mcpPost(request, env, url, ownerId, cors) {
   return rpcError(id, -32601, 'Method not found', cors);
 }
 
-function initializeResult(params) {
+const MCP_PROTOCOL_VERSIONS = ['2025-03-26', '2025-06-18', '2025-11-25', '2026-07-28'];
+const MCP_PROTOCOL_VERSION = '2026-07-28';
+
+function negotiateProtocol(params) {
   const requested = params && typeof params.protocolVersion === 'string' ? params.protocolVersion : '';
-  const protocolVersion = /^\d{4}-\d{2}-\d{2}$/.test(requested) ? requested : '2025-03-26';
+  return MCP_PROTOCOL_VERSIONS.includes(requested) ? requested : MCP_PROTOCOL_VERSION;
+}
+
+function initializeResult(params) {
   return {
-    protocolVersion,
+    protocolVersion: negotiateProtocol(params),
     capabilities: { tools: {} },
-    serverInfo: { name: 'Linki', version: '0.3.0' },
+    serverInfo: { name: 'Linki', title: 'Linki', version: '0.4.0' },
     instructions: mcpInstructions(clientElicitation(params)),
   };
 }
@@ -2104,11 +2307,15 @@ function isoFromUnix(seconds) {
 }
 
 function toolText(data) {
-  return { content: [{ type: 'text', text: JSON.stringify(data, null, 2) }] };
+  return {
+    resultType: 'complete',
+    content: [{ type: 'text', text: JSON.stringify(data, null, 2) }],
+    structuredContent: data,
+  };
 }
 
 function toolError(text) {
-  return { content: [{ type: 'text', text }], isError: true };
+  return { resultType: 'complete', content: [{ type: 'text', text }], isError: true };
 }
 
 function mcpCors(request) {
@@ -2118,7 +2325,7 @@ function mcpCors(request) {
     'Access-Control-Allow-Methods': 'POST, GET, OPTIONS',
     'Access-Control-Allow-Headers':
       'Content-Type, Accept, Authorization, MCP-Protocol-Version, Mcp-Session-Id, Mcp-Method, Mcp-Name, Last-Event-ID',
-    'Access-Control-Expose-Headers': 'Mcp-Session-Id',
+    'Access-Control-Expose-Headers': 'WWW-Authenticate, Mcp-Session-Id',
     'Access-Control-Max-Age': '86400',
     Vary: 'Origin',
   };
@@ -2199,6 +2406,896 @@ function formatDate(unixSeconds) {
 function formatDay(dayNumber) {
   const d = new Date(dayNumber * 86400000);
   return `${d.getUTCDate()} ${MONTHS[d.getUTCMonth()]}`;
+}
+
+// ---------- oauth 2.1 ----------
+
+// One shared MCP address, https://<host>/mcp. The host comes from the request,
+// so linki.ing, the workers.dev hostname, and staging all work.
+// Codes last 10 minutes. Access tokens last an hour. Refresh tokens last 90
+// days and rotate. Only SHA-256 hashes are stored, the same way mcp_tokens works.
+const OAUTH_CODE_TTL = 600;
+const OAUTH_ACCESS_TTL = 3600;
+const OAUTH_REFRESH_TTL = 90 * 86400;
+const OAUTH_CONSENT_TTL = 600;
+const OAUTH_SCOPE = 'links';
+
+function isOauthDiscovery(path) {
+  return (
+    path === '/.well-known/oauth-protected-resource' ||
+    path === '/.well-known/oauth-protected-resource/mcp' ||
+    path === '/.well-known/oauth-authorization-server'
+  );
+}
+
+function oauthVerb(request) {
+  return request.method === 'HEAD' ? 'GET' : request.method;
+}
+
+function oauthCors(cache) {
+  return {
+    'Content-Type': 'application/json',
+    'Cache-Control': cache,
+    'Access-Control-Allow-Origin': '*',
+    'Access-Control-Allow-Methods': 'GET, POST, OPTIONS',
+    'Access-Control-Allow-Headers': 'Content-Type, Authorization, Accept',
+    'Access-Control-Max-Age': '86400',
+    'X-Content-Type-Options': 'nosniff',
+  };
+}
+
+function oauthJson(body, status, extra, cache = 'no-store') {
+  const headers = new Headers(oauthCors(cache));
+  if (extra) {
+    for (const [key, value] of Object.entries(extra)) headers.set(key, value);
+  }
+  return new Response(JSON.stringify(body), { status, headers });
+}
+
+function oauthEmpty(status, extra) {
+  const headers = new Headers(oauthCors('no-store'));
+  headers.delete('Content-Type');
+  if (extra) {
+    for (const [key, value] of Object.entries(extra)) headers.set(key, value);
+  }
+  return new Response(null, { status, headers });
+}
+
+function oauthError(status, error, description, extra) {
+  return oauthJson({ error, error_description: description }, status, extra);
+}
+
+function oauthDiscovery(request, url, path) {
+  if (request.method === 'OPTIONS') return oauthEmpty(204);
+  if (oauthVerb(request) !== 'GET') {
+    return oauthError(405, 'invalid_request', 'This address only answers GET.', { Allow: 'GET' });
+  }
+  const origin = url.origin;
+  const resource = `${origin}/mcp`;
+  if (path.startsWith('/.well-known/oauth-protected-resource')) {
+    return oauthJson(
+      {
+        resource,
+        authorization_servers: [origin],
+        bearer_methods_supported: ['header'],
+        scopes_supported: [OAUTH_SCOPE],
+        resource_name: 'Linki',
+      },
+      200,
+      null,
+      'public, max-age=300'
+    );
+  }
+  return oauthJson(
+    {
+      issuer: origin,
+      authorization_endpoint: `${origin}/oauth/authorize`,
+      token_endpoint: `${origin}/oauth/token`,
+      registration_endpoint: `${origin}/oauth/register`,
+      response_types_supported: ['code'],
+      grant_types_supported: ['authorization_code', 'refresh_token'],
+      code_challenge_methods_supported: ['S256'],
+      token_endpoint_auth_methods_supported: ['none'],
+      client_id_metadata_document_supported: true,
+      scopes_supported: [OAUTH_SCOPE],
+    },
+    200,
+    null,
+    'public, max-age=300'
+  );
+}
+
+function redirectAllowed(raw) {
+  if (typeof raw !== 'string' || raw.length < 8 || raw.length > 500) return false;
+  if (raw !== raw.trim() || /\s/.test(raw)) return false;
+  let parsed;
+  try {
+    parsed = new URL(raw);
+  } catch {
+    return false;
+  }
+  if (parsed.hash || parsed.username || parsed.password) return false;
+  if (parsed.protocol === 'https:') return true;
+  if (parsed.protocol !== 'http:') return false;
+  const host = parsed.hostname;
+  return host === 'localhost' || host === '127.0.0.1' || host === '[::1]' || host === '::1';
+}
+
+function cleanClientName(raw) {
+  const name = typeof raw === 'string' ? raw.replace(/[\u0000-\u001f\u007f]/g, '').trim() : '';
+  return name ? name.slice(0, 80) : 'An app';
+}
+
+function grantsOk(value) {
+  return Array.isArray(value) && value.length > 0 && value.every((item) => item === 'authorization_code' || item === 'refresh_token');
+}
+
+function responsesOk(value) {
+  return Array.isArray(value) && value.length > 0 && value.every((item) => item === 'code');
+}
+
+async function oauthRegister(request, env) {
+  if (request.method === 'OPTIONS') return oauthEmpty(204);
+  if (request.method !== 'POST') {
+    return oauthError(405, 'invalid_request', 'Send a POST with the app registration.', { Allow: 'POST' });
+  }
+  try {
+    const declared = Number(request.headers.get('Content-Length') || 0);
+    if (declared > 16384) return oauthError(400, 'invalid_client_metadata', 'That registration is too large.');
+    const raw = await request.text();
+    if (raw.length > 16384) return oauthError(400, 'invalid_client_metadata', 'That registration is too large.');
+    let body;
+    try {
+      body = JSON.parse(raw);
+    } catch {
+      return oauthError(400, 'invalid_client_metadata', 'Registration must be JSON.');
+    }
+    if (!body || typeof body !== 'object' || Array.isArray(body)) {
+      return oauthError(400, 'invalid_client_metadata', 'Registration must be a JSON object.');
+    }
+    if (body.client_secret) {
+      return oauthError(400, 'invalid_client_metadata', 'Linki does not use client secrets. Register a public app.');
+    }
+    if (body.token_endpoint_auth_method !== undefined && body.token_endpoint_auth_method !== 'none') {
+      return oauthError(400, 'invalid_client_metadata', 'Linki only registers public apps. token_endpoint_auth_method must be none.');
+    }
+    if (body.grant_types !== undefined && !grantsOk(body.grant_types)) {
+      return oauthError(400, 'invalid_client_metadata', 'grant_types can only include authorization_code and refresh_token.');
+    }
+    if (body.response_types !== undefined && !responsesOk(body.response_types)) {
+      return oauthError(400, 'invalid_client_metadata', 'response_types can only include code.');
+    }
+    if (!Array.isArray(body.redirect_uris) || body.redirect_uris.length < 1 || body.redirect_uris.length > 10) {
+      return oauthError(400, 'invalid_redirect_uri', 'redirect_uris must list 1 to 10 https addresses, or http on localhost or 127.0.0.1.');
+    }
+    for (const uri of body.redirect_uris) {
+      if (!redirectAllowed(uri)) {
+        return oauthError(400, 'invalid_redirect_uri', 'Each redirect URI must be https, or http on localhost or 127.0.0.1. Fragments are not allowed.');
+      }
+    }
+    const name = cleanClientName(body.client_name);
+    const clientId = base64url(crypto.getRandomValues(new Uint8Array(16)));
+    const now = Math.floor(Date.now() / 1000);
+    await env.DB.prepare(
+      'INSERT INTO oauth_clients (client_id, client_name, redirect_uris, created_at) VALUES (?, ?, ?, ?)'
+    )
+      .bind(clientId, name, JSON.stringify(body.redirect_uris), now)
+      .run();
+    return oauthJson(
+      {
+        client_id: clientId,
+        client_name: name,
+        redirect_uris: body.redirect_uris,
+        grant_types: ['authorization_code', 'refresh_token'],
+        response_types: ['code'],
+        token_endpoint_auth_method: 'none',
+      },
+      201
+    );
+  } catch (err) {
+    console.error(err);
+    return oauthError(500, 'server_error', 'Linki could not register that app. Please try again in a moment.');
+  }
+}
+
+function metadataUrlAllowed(raw) {
+  let parsed;
+  try {
+    parsed = new URL(raw);
+  } catch {
+    return false;
+  }
+  if (parsed.protocol !== 'https:' || parsed.username || parsed.password || parsed.hash) return false;
+  if (!parsed.pathname || parsed.pathname === '/') return false;
+  const host = parsed.hostname.toLowerCase();
+  if (
+    host === 'localhost' ||
+    host.endsWith('.localhost') ||
+    host.endsWith('.local') ||
+    host.endsWith('.internal') ||
+    host === 'metadata.google.internal'
+  ) {
+    return false;
+  }
+  return !isBlockedAddress(host);
+}
+
+function isBlockedAddress(host) {
+  const bare = host.startsWith('[') && host.endsWith(']') ? host.slice(1, -1) : host;
+  if (bare === '::1' || bare === '0.0.0.0') return true;
+  const parts = bare.split('.');
+  if (parts.length !== 4 || parts.some((part) => !/^\d{1,3}$/.test(part))) return false;
+  const nums = parts.map(Number);
+  if (nums.some((part) => part > 255)) return true;
+  const [a, b] = nums;
+  if (a === 0 || a === 10 || a === 127) return true;
+  if (a === 169 && b === 254) return true;
+  if (a === 172 && b >= 16 && b <= 31) return true;
+  if (a === 192 && b === 168) return true;
+  if (a === 100 && b >= 64 && b <= 127) return true;
+  return false;
+}
+
+async function readStoredClient(env, clientId) {
+  const row = await env.DB.prepare(
+    'SELECT client_id, client_name, redirect_uris FROM oauth_clients WHERE client_id = ?'
+  )
+    .bind(clientId)
+    .first();
+  if (!row) return null;
+  let uris;
+  try {
+    uris = JSON.parse(row.redirect_uris);
+  } catch {
+    return null;
+  }
+  if (!Array.isArray(uris)) return null;
+  return { client_id: row.client_id, client_name: row.client_name, redirect_uris: uris };
+}
+
+// client_id may be an https URL whose JSON lists redirect_uris (Client ID
+// Metadata Documents). The document's client_id must equal that URL.
+async function fetchClientMetadata(env, clientId) {
+  if (!metadataUrlAllowed(clientId)) return null;
+  let response;
+  try {
+    response = await fetch(clientId, {
+      method: 'GET',
+      redirect: 'manual',
+      headers: { Accept: 'application/json', 'User-Agent': 'Linki' },
+      signal: AbortSignal.timeout(5000),
+    });
+  } catch (err) {
+    console.error('client metadata fetch failed');
+    return null;
+  }
+  if (!response || response.status !== 200) return null;
+  const type = (response.headers.get('Content-Type') || '').toLowerCase();
+  if (!type.includes('application/json')) return null;
+  const length = Number(response.headers.get('Content-Length') || 0);
+  if (length > 65536) return null;
+  const raw = await response.text();
+  if (raw.length > 65536) return null;
+  let doc;
+  try {
+    doc = JSON.parse(raw);
+  } catch {
+    return null;
+  }
+  if (!doc || typeof doc !== 'object' || Array.isArray(doc) || doc.client_id !== clientId) return null;
+  if (!Array.isArray(doc.redirect_uris)) return null;
+  const redirectUris = [];
+  for (const uri of doc.redirect_uris) {
+    if (redirectAllowed(uri) && !redirectUris.includes(uri)) redirectUris.push(uri);
+    if (redirectUris.length >= 10) break;
+  }
+  if (!redirectUris.length) return null;
+  const name = cleanClientName(doc.client_name);
+  const now = Math.floor(Date.now() / 1000);
+  await env.DB.prepare(
+    `INSERT INTO oauth_clients (client_id, client_name, redirect_uris, created_at)
+     VALUES (?, ?, ?, ?)
+     ON CONFLICT(client_id) DO UPDATE SET
+       client_name = excluded.client_name,
+       redirect_uris = excluded.redirect_uris,
+       created_at = excluded.created_at`
+  )
+    .bind(clientId, name, JSON.stringify(redirectUris), now)
+    .run();
+  return { client_id: clientId, client_name: name, redirect_uris: redirectUris };
+}
+
+async function resolveClient(env, clientId) {
+  if (typeof clientId !== 'string' || clientId.length < 8 || clientId.length > 512) return null;
+  if (clientId.startsWith('https://')) return fetchClientMetadata(env, clientId);
+  if (!/^[A-Za-z0-9_-]{16,128}$/.test(clientId)) return null;
+  return readStoredClient(env, clientId);
+}
+
+function readState(raw) {
+  if (raw === null || raw === undefined || raw === '') return { state: null };
+  if (typeof raw !== 'string' || raw.length > 1024 || /[\u0000-\u001f\u007f]/.test(raw)) return { error: true };
+  return { state: raw };
+}
+
+function redirectWithParams(uri, params) {
+  const target = new URL(uri);
+  for (const [key, value] of Object.entries(params)) {
+    if (value !== undefined && value !== null && value !== '') target.searchParams.set(key, value);
+  }
+  return target.toString();
+}
+
+function oauthRedirectError(redirectUri, state, error, description) {
+  const headers = new Headers({
+    Location: redirectWithParams(redirectUri, { error, error_description: description, state: state || undefined }),
+    'Cache-Control': 'no-store',
+    'Referrer-Policy': 'no-referrer',
+  });
+  return new Response(null, { status: 302, headers });
+}
+
+function setOauthCsrf(headers, token, url) {
+  const secure = url.protocol === 'https:' ? '; Secure' : '';
+  headers.append(
+    'Set-Cookie',
+    `oauth_csrf=${token}; Path=/oauth/authorize; Max-Age=${OAUTH_CONSENT_TTL}; HttpOnly; SameSite=Lax${secure}`
+  );
+}
+
+function clearOauthCsrf(headers, url) {
+  const secure = url.protocol === 'https:' ? '; Secure' : '';
+  headers.append(
+    'Set-Cookie',
+    `oauth_csrf=; Path=/oauth/authorize; Max-Age=0; HttpOnly; SameSite=Lax${secure}`
+  );
+}
+
+async function startConsent(env, fields) {
+  const token = base64url(crypto.getRandomValues(new Uint8Array(32)));
+  const now = Math.floor(Date.now() / 1000);
+  await env.DB.prepare(
+    `INSERT INTO oauth_consents
+       (token_hash, client_id, redirect_uri, code_challenge, state, resource, scope, expires_at, created_at)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`
+  )
+    .bind(
+      await sha256(token),
+      fields.client_id,
+      fields.redirect_uri,
+      fields.code_challenge,
+      fields.state,
+      fields.resource,
+      fields.scope,
+      now + OAUTH_CONSENT_TTL,
+      now
+    )
+    .run();
+  return token;
+}
+
+async function loadConsent(env, tokenHash) {
+  const row = await env.DB.prepare(
+    `SELECT client_id, redirect_uri, code_challenge, state, resource, scope, expires_at
+     FROM oauth_consents WHERE token_hash = ?`
+  )
+    .bind(tokenHash)
+    .first();
+  if (!row || row.expires_at <= Math.floor(Date.now() / 1000)) return null;
+  return row;
+}
+
+async function consumeConsent(env, tokenHash) {
+  return env.DB.prepare(
+    `DELETE FROM oauth_consents WHERE token_hash = ? AND expires_at > ?
+     RETURNING client_id, redirect_uri, code_challenge, state, resource, scope`
+  )
+    .bind(tokenHash, Math.floor(Date.now() / 1000))
+    .first();
+}
+
+function authorizeQuery(row) {
+  const params = new URLSearchParams();
+  params.set('response_type', 'code');
+  params.set('client_id', row.client_id);
+  params.set('redirect_uri', row.redirect_uri);
+  params.set('code_challenge', row.code_challenge);
+  params.set('code_challenge_method', 'S256');
+  if (row.state) params.set('state', row.state);
+  params.set('resource', row.resource);
+  params.set('scope', row.scope);
+  return `/oauth/authorize?${params.toString()}`;
+}
+
+async function renderConsent(request, env, url, client, token, owner, linkCount, state = {}) {
+  const name = client.client_name;
+  const error = state.error ? `<p class="error" role="alert">${esc(state.error)}</p>` : '';
+  const emptyNote =
+    linkCount === 0
+      ? `<p>This browser has no links yet. Allow still connects it, and ${esc(name)} can create links for you. Or create one here. That uses the same saved-in-this-browser identity as the homepage.</p>`
+      : `<p>This only covers the links saved in this browser. You can revoke ${esc(name)} later on Your links.</p>`;
+  const createForm =
+    linkCount === 0
+      ? `<form method="post" action="/oauth/authorize" class="create">
+          <input type="hidden" name="csrf" value="${esc(token)}">
+          <input type="hidden" name="decision" value="create">
+          <label class="sr" for="oauth-url">Destination URL</label>
+          <input id="oauth-url" name="url" type="text" inputmode="url" autocomplete="off" required placeholder="Paste a long URL" maxlength="${MAX_URL_LENGTH}" value="${esc(state.rawUrl || '')}">
+          <label class="sr" for="oauth-name">Custom name (optional)</label>
+          <input id="oauth-name" name="name" type="text" autocomplete="off" autocapitalize="none" spellcheck="false" maxlength="60" placeholder="your-name (optional)" value="${esc(state.rawName || '')}">
+          <button class="secondary" type="submit">Create a link</button>
+        </form>`
+      : '';
+  const body = `<section class="doc">
+      <h1>Connect ${esc(name)}</h1>
+      <p class="lede">Let ${esc(name)} see and create the links saved in this browser?</p>
+      ${emptyNote}
+      ${error}
+      <form method="post" action="/oauth/authorize" class="consentf">
+        <input type="hidden" name="csrf" value="${esc(token)}">
+        <button class="primary" type="submit" name="decision" value="allow">Allow</button>
+        <button class="secondary" type="submit" name="decision" value="deny">Cancel</button>
+      </form>
+      ${createForm}
+    </section>`;
+  const response = page(`Connect ${name}`, body, {
+    owner,
+    url,
+    request,
+    env,
+    review: await reviewOn(request, env),
+  });
+  setOauthCsrf(response.headers, token, url);
+  return response;
+}
+
+async function oauthAuthorize(request, env, url) {
+  try {
+    if (oauthVerb(request) === 'GET') return oauthAuthorizeGet(request, env, url);
+    if (request.method === 'POST') return oauthAuthorizePost(request, env, url);
+    return new Response(null, { status: 405, headers: { Allow: 'GET, POST', 'Cache-Control': 'no-store' } });
+  } catch (err) {
+    console.error(err);
+    return messagePage(request, env, 500, 'Something went wrong', 'Linki could not open the approval page. Please try again.');
+  }
+}
+
+async function oauthAuthorizeGet(request, env, url) {
+  const params = url.searchParams;
+  const clientId = params.get('client_id');
+  const redirectUri = params.get('redirect_uri');
+  const client = await resolveClient(env, clientId);
+  if (!client) {
+    return messagePage(request, env, 400, 'Unknown app', 'Linki does not recognize this app. It needs to register, or its client address needs a metadata document.');
+  }
+  if (!redirectAllowed(redirectUri) || !client.redirect_uris.includes(redirectUri)) {
+    return messagePage(request, env, 400, 'Redirect not allowed', 'This app asked to return to an address it did not register.');
+  }
+  const state = readState(params.get('state'));
+  if (state.error) {
+    return messagePage(request, env, 400, 'Connection incomplete', 'The state value on this approval link cannot be used. Start again from your app.');
+  }
+  const resourceParam = params.get('resource');
+  const resource = `${url.origin}/mcp`;
+  if (resourceParam && resourceParam !== resource) {
+    return oauthRedirectError(redirectUri, state.state, 'invalid_target', 'The resource must be this site\'s /mcp address.');
+  }
+  if (params.get('response_type') !== 'code') {
+    return oauthRedirectError(redirectUri, state.state, 'unsupported_response_type', 'Linki only supports response_type=code.');
+  }
+  const method = params.get('code_challenge_method');
+  const challenge = params.get('code_challenge');
+  if (method !== 'S256' || !/^[A-Za-z0-9_-]{43,128}$/.test(challenge || '')) {
+    return oauthRedirectError(redirectUri, state.state, 'invalid_request', 'PKCE S256 is required. Send code_challenge and code_challenge_method=S256.');
+  }
+  const scope = params.get('scope');
+  if (scope && (scope.length > 200 || /[\u0000-\u001f\u007f]/.test(scope))) {
+    return oauthRedirectError(redirectUri, state.state, 'invalid_scope', 'That scope value cannot be used.');
+  }
+  const token = await startConsent(env, {
+    client_id: client.client_id,
+    redirect_uri: redirectUri,
+    code_challenge: challenge,
+    state: state.state,
+    resource,
+    scope: OAUTH_SCOPE,
+  });
+  const owner = getOwner(request);
+  const linkCount = owner.isNew ? 0 : await countOwnerLinks(env, owner.id);
+  return renderConsent(request, env, url, client, token, owner, linkCount);
+}
+
+async function countOwnerLinks(env, ownerId) {
+  const row = await env.DB.prepare('SELECT COUNT(*) AS n FROM links WHERE owner_id = ?').bind(ownerId).first();
+  return Number(row.n);
+}
+
+async function oauthAuthorizePost(request, env, url) {
+  let form;
+  try {
+    form = await request.formData();
+  } catch {
+    return messagePage(request, env, 400, 'Request could not be read', 'Please start the connection again from your app.');
+  }
+  const field = String(form.get('csrf') || '');
+  const cookie = cookieValue(request, 'oauth_csrf');
+  if (!field || !cookie || field.length > 200 || !timingSafeEqual(field, cookie)) {
+    return messagePage(request, env, 403, 'Approval not confirmed', 'Start the connection again from your app.');
+  }
+  const tokenHash = await sha256(field);
+  const decision = String(form.get('decision') || '');
+  if (decision === 'create') return oauthConsentCreate(request, env, url, form, tokenHash, field);
+  if (decision !== 'allow' && decision !== 'deny') {
+    return messagePage(request, env, 400, 'Approval not confirmed', 'Start the connection again from your app.');
+  }
+  const consent = await consumeConsent(env, tokenHash);
+  if (!consent) {
+    return messagePage(request, env, 400, 'Approval expired', 'This approval page has expired. Start the connection again from your app.');
+  }
+  const owner = getOwner(request);
+  if (decision === 'deny') {
+    const headers = new Headers({
+      Location: redirectWithParams(consent.redirect_uri, {
+        error: 'access_denied',
+        error_description: 'The approval was cancelled.',
+        state: consent.state || undefined,
+      }),
+      'Cache-Control': 'no-store',
+      'Referrer-Policy': 'no-referrer',
+    });
+    clearOauthCsrf(headers, url);
+    if (!owner.isNew) setOwnerCookie(headers, owner, url);
+    return new Response(null, { status: 302, headers });
+  }
+  const client = await readStoredClient(env, consent.client_id);
+  if (!client || !client.redirect_uris.includes(consent.redirect_uri)) {
+    return messagePage(request, env, 400, 'Unknown app', 'This app is no longer registered. Start the connection again.');
+  }
+  const code = base64url(crypto.getRandomValues(new Uint8Array(32)));
+  const now = Math.floor(Date.now() / 1000);
+  await env.DB.prepare(
+    `INSERT INTO oauth_codes
+       (code_hash, client_id, owner_id, redirect_uri, code_challenge, resource, scope, expires_at, created_at)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`
+  )
+    .bind(
+      await sha256(code),
+      consent.client_id,
+      owner.id,
+      consent.redirect_uri,
+      consent.code_challenge,
+      consent.resource,
+      consent.scope,
+      now + OAUTH_CODE_TTL,
+      now
+    )
+    .run();
+  // The owner id stays in the cookie and the database. It is never put on the URL.
+  const headers = new Headers({
+    Location: redirectWithParams(consent.redirect_uri, { code, state: consent.state || undefined }),
+    'Cache-Control': 'no-store',
+    'Referrer-Policy': 'no-referrer',
+  });
+  setOwnerCookie(headers, owner, url);
+  clearOauthCsrf(headers, url);
+  return new Response(null, { status: 302, headers });
+}
+
+async function oauthConsentCreate(request, env, url, form, tokenHash, csrf) {
+  const consent = await loadConsent(env, tokenHash);
+  if (!consent) {
+    return messagePage(request, env, 400, 'Approval expired', 'This approval page has expired. Start the connection again from your app.');
+  }
+  const client = await readStoredClient(env, consent.client_id);
+  if (!client) {
+    return messagePage(request, env, 400, 'Unknown app', 'This app is no longer registered. Start the connection again.');
+  }
+  const owner = getOwner(request);
+  const rawUrl = String(form.get('url') || '').trim();
+  const rawName = String(form.get('name') || '').trim();
+  const ip = request.headers.get('CF-Connecting-IP') || 'unknown';
+  const made = await makeLink(env, {
+    ownerId: owner.id,
+    rawUrl,
+    rawName,
+    ownHost: url.hostname,
+    creatorHash: (await sha256(`${secret(env)}|creator|${ip}`)).slice(0, 32),
+    limit: CREATE_LIMITS.web,
+    via: 'web',
+    traffic: classifyTraffic(request, env),
+  });
+  if (made.error) {
+    const linkCount = owner.isNew ? 0 : await countOwnerLinks(env, owner.id);
+    return renderConsent(request, env, url, client, csrf, owner, linkCount, { error: made.error, rawUrl, rawName });
+  }
+  await env.DB.prepare('DELETE FROM oauth_consents WHERE token_hash = ?').bind(tokenHash).run();
+  const headers = new Headers({
+    Location: authorizeQuery(consent),
+    'Cache-Control': 'no-store',
+    'Referrer-Policy': 'no-referrer',
+  });
+  setOwnerCookie(headers, owner, url);
+  clearOauthCsrf(headers, url);
+  return new Response(null, { status: 303, headers });
+}
+
+async function oauthToken(request, env, url) {
+  if (request.method === 'OPTIONS') return oauthEmpty(204);
+  if (request.method !== 'POST') {
+    return oauthError(405, 'invalid_request', 'Send the token request as a POST.', { Allow: 'POST' });
+  }
+  try {
+    const parsed = await readOauthForm(request);
+    if (parsed.error) return oauthError(400, 'invalid_request', parsed.error);
+    const body = parsed.body;
+    if (body.client_secret) return oauthError(401, 'invalid_client', 'Linki apps do not use a client secret.');
+    if (body.grant_type === 'authorization_code') return exchangeCode(env, url, body);
+    if (body.grant_type === 'refresh_token') return exchangeRefresh(env, body);
+    if (!body.grant_type) return oauthError(400, 'invalid_request', 'grant_type is required.');
+    return oauthError(400, 'unsupported_grant_type', 'Linki supports authorization_code and refresh_token.');
+  } catch (err) {
+    console.error(err);
+    return oauthError(500, 'server_error', 'Linki could not issue a token. Please try again in a moment.');
+  }
+}
+
+async function readOauthForm(request) {
+  const declared = Number(request.headers.get('Content-Length') || 0);
+  if (declared > 16384) return { error: 'That request is too large.' };
+  const raw = await request.text();
+  if (raw.length > 16384) return { error: 'That request is too large.' };
+  const type = (request.headers.get('Content-Type') || '').toLowerCase();
+  if (type.includes('application/json')) {
+    try {
+      const json = JSON.parse(raw);
+      if (!json || typeof json !== 'object' || Array.isArray(json)) return { error: 'The token request must be a JSON object.' };
+      return { body: json };
+    } catch {
+      return { error: 'The token request is not valid JSON.' };
+    }
+  }
+  const params = new URLSearchParams(raw);
+  const body = {};
+  for (const [key, value] of params) body[key] = value;
+  return { body };
+}
+
+async function exchangeCode(env, url, body) {
+  const code = typeof body.code === 'string' ? body.code : '';
+  const clientId = typeof body.client_id === 'string' ? body.client_id : '';
+  const verifier = typeof body.code_verifier === 'string' ? body.code_verifier : '';
+  const redirectUri = typeof body.redirect_uri === 'string' ? body.redirect_uri : '';
+  if (!/^[A-Za-z0-9_-]{20,200}$/.test(code)) {
+    return oauthError(400, 'invalid_grant', 'That authorization code is not valid.');
+  }
+  const row = await env.DB.prepare(
+    `DELETE FROM oauth_codes WHERE code_hash = ?
+     RETURNING client_id, owner_id, redirect_uri, code_challenge, resource, scope, expires_at`
+  )
+    .bind(await sha256(code))
+    .first();
+  if (!row) return oauthError(400, 'invalid_grant', 'That authorization code is not valid or was already used.');
+  const now = Math.floor(Date.now() / 1000);
+  if (row.expires_at <= now) return oauthError(400, 'invalid_grant', 'That authorization code has expired. Start the connection again.');
+  if (!clientId || clientId !== row.client_id) {
+    return oauthError(400, 'invalid_grant', 'client_id does not match the app that started this connection.');
+  }
+  if (!redirectUri || redirectUri !== row.redirect_uri) {
+    return oauthError(400, 'invalid_grant', 'redirect_uri must match the address used in the approval request.');
+  }
+  if (!/^[A-Za-z0-9._~-]{43,128}$/.test(verifier) || !timingSafeEqual(await pkceS256(verifier), row.code_challenge)) {
+    return oauthError(400, 'invalid_grant', 'The PKCE code verifier does not match the approval request.');
+  }
+  const resource = typeof body.resource === 'string' ? body.resource : '';
+  if (resource && resource !== row.resource) {
+    return oauthError(400, 'invalid_target', 'The resource does not match this connection.');
+  }
+  if (row.resource !== `${url.origin}/mcp`) {
+    return oauthError(400, 'invalid_target', 'This code was issued for a different Linki host.');
+  }
+  return oauthJson(await issueTokenPair(env, { ...row, grant_id: base64url(crypto.getRandomValues(new Uint8Array(16))) }, now), 200);
+}
+
+async function exchangeRefresh(env, body) {
+  const token = typeof body.refresh_token === 'string' ? body.refresh_token : '';
+  const clientId = typeof body.client_id === 'string' ? body.client_id : '';
+  if (!/^[A-Za-z0-9_-]{20,200}$/.test(token) || !clientId) {
+    return oauthError(400, 'invalid_grant', 'That refresh token is not valid.');
+  }
+  const hash = await sha256(token);
+  const now = Math.floor(Date.now() / 1000);
+  const row = await env.DB.prepare(
+    `SELECT client_id, owner_id, grant_id, resource, scope, expires_at, rotated_at
+     FROM oauth_tokens WHERE token_hash = ? AND kind = 'refresh'`
+  )
+    .bind(hash)
+    .first();
+  if (!row) return oauthError(400, 'invalid_grant', 'That refresh token is not valid.');
+  if (row.client_id !== clientId) {
+    return oauthError(400, 'invalid_grant', 'This refresh token was issued to a different app.');
+  }
+  if (row.rotated_at) {
+    await env.DB.prepare('DELETE FROM oauth_tokens WHERE grant_id = ?').bind(row.grant_id).run();
+    return oauthError(400, 'invalid_grant', 'That refresh token was already used. Connect the app again.');
+  }
+  if (row.expires_at <= now) return oauthError(400, 'invalid_grant', 'That refresh token has expired. Connect the app again.');
+  const resource = typeof body.resource === 'string' ? body.resource : '';
+  if (resource && resource !== row.resource) {
+    return oauthError(400, 'invalid_target', 'The resource does not match this token.');
+  }
+  const marked = await env.DB.prepare(
+    `UPDATE oauth_tokens SET rotated_at = ?
+     WHERE token_hash = ? AND kind = 'refresh' AND rotated_at IS NULL
+     RETURNING grant_id`
+  )
+    .bind(now, hash)
+    .first();
+  if (!marked) {
+    await env.DB.prepare('DELETE FROM oauth_tokens WHERE grant_id = ?').bind(row.grant_id).run();
+    return oauthError(400, 'invalid_grant', 'That refresh token was already used. Connect the app again.');
+  }
+  return oauthJson(await issueTokenPair(env, row, now), 200);
+}
+
+async function issueTokenPair(env, row, now) {
+  const access = base64url(crypto.getRandomValues(new Uint8Array(32)));
+  const refresh = base64url(crypto.getRandomValues(new Uint8Array(32)));
+  await env.DB.batch([
+    env.DB.prepare(
+      `INSERT INTO oauth_tokens
+         (token_hash, kind, client_id, owner_id, grant_id, resource, scope, expires_at, created_at, rotated_at)
+       VALUES (?, 'access', ?, ?, ?, ?, ?, ?, ?, NULL)`
+    ).bind(await sha256(access), row.client_id, row.owner_id, row.grant_id, row.resource, row.scope, now + OAUTH_ACCESS_TTL, now),
+    env.DB.prepare(
+      `INSERT INTO oauth_tokens
+         (token_hash, kind, client_id, owner_id, grant_id, resource, scope, expires_at, created_at, rotated_at)
+       VALUES (?, 'refresh', ?, ?, ?, ?, ?, ?, ?, NULL)`
+    ).bind(await sha256(refresh), row.client_id, row.owner_id, row.grant_id, row.resource, row.scope, now + OAUTH_REFRESH_TTL, now),
+  ]);
+  return {
+    access_token: access,
+    token_type: 'Bearer',
+    expires_in: OAUTH_ACCESS_TTL,
+    refresh_token: refresh,
+    scope: row.scope,
+  };
+}
+
+async function pkceS256(verifier) {
+  const digest = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(verifier));
+  return base64url(new Uint8Array(digest));
+}
+
+async function oauthRevoke(request, env, url) {
+  if (request.method !== 'POST') {
+    return new Response(null, { status: 405, headers: { Allow: 'POST', 'Cache-Control': 'no-store' } });
+  }
+  const owner = getOwner(request);
+  let form;
+  try {
+    form = await request.formData();
+  } catch {
+    return messagePage(request, env, 400, 'Request could not be read', 'Please try again.');
+  }
+  const clientId = String(form.get('client_id') || '');
+  if (!owner.isNew && clientId && clientId.length <= 512) {
+    await env.DB.batch([
+      env.DB.prepare('DELETE FROM oauth_tokens WHERE owner_id = ? AND client_id = ?').bind(owner.id, clientId),
+      env.DB.prepare('DELETE FROM oauth_codes WHERE owner_id = ? AND client_id = ?').bind(owner.id, clientId),
+    ]);
+  }
+  const headers = new Headers({
+    Location: owner.isNew ? '/links' : '/links?revoked=1',
+    'Cache-Control': 'no-store',
+  });
+  if (!owner.isNew) setOwnerCookie(headers, owner, url);
+  return new Response(null, { status: 303, headers });
+}
+
+async function connectedApps(env, owner) {
+  if (owner.isNew) return [];
+  const { results } = await env.DB.prepare(
+    `SELECT t.client_id AS client_id, MIN(t.created_at) AS connected_at,
+            (SELECT c.client_name FROM oauth_clients c WHERE c.client_id = t.client_id) AS client_name
+     FROM oauth_tokens t
+     WHERE t.owner_id = ? AND t.kind = 'refresh' AND t.rotated_at IS NULL AND t.expires_at > ?
+     GROUP BY t.client_id
+     ORDER BY connected_at DESC
+     LIMIT 20`
+  )
+    .bind(owner.id, Math.floor(Date.now() / 1000))
+    .all();
+  return results.map((row) => ({
+    client_id: row.client_id,
+    client_name: row.client_name || 'Connected app',
+    connected_at: Number(row.connected_at),
+  }));
+}
+
+async function pruneOauth(env) {
+  const now = Math.floor(Date.now() / 1000);
+  await env.DB.batch([
+    env.DB.prepare(
+      'DELETE FROM oauth_codes WHERE expires_at < ? AND code_hash IN (SELECT code_hash FROM oauth_codes WHERE expires_at < ? LIMIT ?)'
+    ).bind(now, now, PRUNE_BATCH),
+    env.DB.prepare(
+      'DELETE FROM oauth_tokens WHERE expires_at < ? AND token_hash IN (SELECT token_hash FROM oauth_tokens WHERE expires_at < ? LIMIT ?)'
+    ).bind(now, now, PRUNE_BATCH),
+    env.DB.prepare(
+      'DELETE FROM oauth_consents WHERE expires_at < ? AND token_hash IN (SELECT token_hash FROM oauth_consents WHERE expires_at < ? LIMIT ?)'
+    ).bind(now, now, PRUNE_BATCH),
+  ]);
+}
+
+async function privacyPage(request, env, url) {
+  const body = `<section class="doc">
+      <h1>Privacy</h1>
+      <p>Linki is a short-link service at this site. There is no account, no email address, and no password. This page describes what the public site stores.</p>
+      <h2>Links you create</h2>
+      <p>When you create a short link, Linki stores the destination URL, the short name, the time, and whether you made it on the website or through a connected app. A traffic label for that create (human, datacenter, or internal) is stored too. Older links may also have a label. If you rename a link, the previous name is kept so it can forward to the new one. After a delete, the name is kept so it is not given to someone else.</p>
+      <p>Each link also stores a hash used only to enforce how many new links one network, or one connector, can create. On the website that hash is of the network address. Through an app it is of the connector. The raw network address is not stored.</p>
+      <h2>This browser</h2>
+      <p>The first time you create a link, or the first time you approve an app, Linki sets an HttpOnly cookie named owner. The value is a random id. It is how this browser finds its links. Clearing the cookie, or using another browser, hides the list. There is no sign-in that can bring it back.</p>
+      <p>A second cookie, mcp, holds this browser's connector link so the page can show it again. The database stores only a SHA-256 hash of that token.</p>
+      <h2>Clicks</h2>
+      <p>When a person opens a short link, Linki stores the time, a traffic label (human, datacenter, or internal), and a hash that changes every day. The hash is built from a secret, the date, the link, the network address, and the browser. The raw network address is not stored, and the next day's hash is different. Bots and link previews are not stored. Referrers and countries are not stored.</p>
+      <p>Raw click rows are deleted after 400 days. The totals kept on the link stay.</p>
+      <h2>Connected apps</h2>
+      <p>If you approve an app such as Claude or ChatGPT, Linki stores the app's name, its client id, and the redirect addresses it registered. The one-time approval code, the access token, and the refresh token are stored only as SHA-256 hashes. An access token lasts about an hour. A refresh token lasts about 90 days and is replaced each time it is used. Approving an app lets it see and create the links saved in this browser. It does not see another browser's links. You can revoke an app on Your links, which removes its tokens.</p>
+      <p>The approval page keeps a short-lived form token so the Allow button cannot be submitted from another site. That token is stored as a hash and expires in about 10 minutes.</p>
+      <h2>Campaigns</h2>
+      <p>If an app saves a campaign, Linki stores the name, the tracking tags, an optional naming pattern, and an optional note. A saved campaign is not deleted by the app.</p>
+      <h2>Analytics</h2>
+      <p>Google Analytics 4 loads on Linki's own pages, including this one. It does not load when someone opens a short link. A request from a known data-center network does not load it either. A browser Linki marks as internal is tagged so it can be filtered out. Creating a link on the website can send one link_created event.</p>
+      <h2>Staging notes</h2>
+      <p>A private staging copy of this site can store review comments when its operator turns that on. The public site does not use that feature.</p>
+      <h2>Contact</h2>
+      <p>Questions and deletion requests go to <a href="${REPO_URL}/issues">GitHub issues</a>. See also <a href="/support">Support</a>.</p>
+    </section>`;
+  return page('Privacy', body, { url, request, env, owner: getOwner(request), review: await reviewOn(request, env) });
+}
+
+async function supportPage(request, env, url) {
+  const body = `<section class="doc">
+      <h1>Support</h1>
+      <p>Linki is a small short-link site. For help, open a GitHub issue. There is no email support and no account to recover.</p>
+      <p><a href="${REPO_URL}/issues">${esc(REPO_URL)}/issues</a></p>
+      <h2>What to include</h2>
+      <ul>
+        <li>What you were trying to do.</li>
+        <li>The page you were on, and the short name if there is one. Do not paste an MCP link, an access token, or a refresh token.</li>
+        <li>What you expected, and what happened.</li>
+      </ul>
+      <h2>Lost links</h2>
+      <p>Links are tied to a cookie in this browser. If that cookie is gone, Linki cannot tell that the links were yours. Creating a link starts a new list in that browser.</p>
+      <h2>Connecting an agent</h2>
+      <p><a href="/docs/mcp">How to connect Linki</a> in Claude or ChatGPT. To disconnect an app, open Your links and choose Revoke.</p>
+    </section>`;
+  return page('Support', body, { url, request, env, owner: getOwner(request), review: await reviewOn(request, env) });
+}
+
+async function mcpDocsPage(request, env, url) {
+  const endpoint = `${url.origin}/mcp`;
+  const body = `<section class="doc">
+      <h1>Connect an agent</h1>
+      <p>Linki can create short links and read click counts from Claude, ChatGPT, Cursor, and other MCP clients. The shared address is <code>${esc(endpoint)}</code>. There is no account. You approve the app in the browser that holds the links.</p>
+      <h2>Claude</h2>
+      <p>In Claude, open Settings, then Connectors, and add Linki from the directory, or add a custom connector with the address above. Claude opens this site. The page asks: let the app see and create the links saved in this browser? Choose Allow. If this browser has no links yet, the page explains that and can create one. Cancel sends the app away.</p>
+      <h2>ChatGPT</h2>
+      <p>In ChatGPT, add Linki from the apps directory, or add a custom app with the same address. Approve it in the browser that should own the links. The callback stays on ChatGPT. Linki only checks that the callback is an https address the app registered, or a localhost address for a local client.</p>
+      <h2>An MCP link</h2>
+      <p>Your links still shows an address of the form <code>${esc(url.origin)}/mcp/…</code>. Paste that into a client that cannot sign in with OAuth. Treat it like a password. Reset replaces it.</p>
+      <h2>What the tools do</h2>
+      <ul>
+        <li><code>list_links</code> lists this browser's links with people-only click totals.</li>
+        <li><code>link_report</code> is daily clicks for one link. The default is 30 days.</li>
+        <li><code>clicks_summary</code> is totals across your links. The default is 7 days.</li>
+        <li><code>create_link</code> makes a public short link. The agent should ask, in one question, whether you want click tracking before it adds tags. A connector can create ${CREATE_LIMITS.mcp.hour} links an hour and ${CREATE_LIMITS.mcp.day} a day.</li>
+        <li><code>save_campaign</code>, <code>list_campaigns</code>, and <code>get_campaign</code> store and read named tracking tags for this browser. Nothing is deleted.</li>
+      </ul>
+      <p>Reports count people: a human click, and an older click with no label. They do not include bot, data-center, or internal clicks, and they do not include referrers or countries. Disconnect an app under Connected apps on Your links.</p>
+    </section>`;
+  return page('Connect an agent', body, { url, request, env, owner: getOwner(request), review: await reviewOn(request, env) });
 }
 
 // ---------- review (staging only, REVIEW_KEY) ----------
@@ -2923,6 +4020,7 @@ function reviewMarkdown(comments, truncated) {
 const REVIEW_MCP_TOOLS = [
   {
     name: 'list_comments',
+    title: 'List comments',
     description:
       'List Linki review comments, newest first. Optional filters: status (open, in_progress, fixed), path (for example /links), mention (a name without @, for example Claude).',
     inputSchema: {
@@ -2933,20 +4031,22 @@ const REVIEW_MCP_TOOLS = [
         mention: { type: 'string', description: 'Mention name without the @.' },
       },
     },
-    annotations: { readOnlyHint: true, destructiveHint: false, openWorldHint: false },
+    annotations: { title: 'List comments', readOnlyHint: true, destructiveHint: false, openWorldHint: false },
   },
   {
     name: 'get_comment',
+    title: 'Get a comment',
     description: 'Get one review comment by id, including its replies.',
     inputSchema: {
       type: 'object',
       properties: { id: { type: 'integer', description: 'Comment id.' } },
       required: ['id'],
     },
-    annotations: { readOnlyHint: true, destructiveHint: false, openWorldHint: false },
+    annotations: { title: 'Get a comment', readOnlyHint: true, destructiveHint: false, openWorldHint: false },
   },
   {
     name: 'update_comment',
+    title: 'Update a comment',
     description:
       'Update a review comment. Set status to in_progress when you start, then fixed when the pull request is open, and set pr_url. Never push to main. Kiet approves merges.',
     inputSchema: {
@@ -2960,11 +4060,12 @@ const REVIEW_MCP_TOOLS = [
       },
       required: ['id', 'status'],
     },
-    annotations: { readOnlyHint: false, destructiveHint: false, openWorldHint: true },
+    annotations: { title: 'Update a comment', readOnlyHint: false, destructiveHint: false, openWorldHint: false },
   },
   {
     name: 'reply',
-    description: 'Add a reply to a review comment.',
+    title: 'Reply to a comment',
+    description: 'Add a reply to a review comment. This does not change the comment status.',
     inputSchema: {
       type: 'object',
       properties: {
@@ -2974,17 +4075,15 @@ const REVIEW_MCP_TOOLS = [
       },
       required: ['id', 'body', 'author'],
     },
-    annotations: { readOnlyHint: false, destructiveHint: false, openWorldHint: false },
+    annotations: { title: 'Reply to a comment', readOnlyHint: false, destructiveHint: false, openWorldHint: false },
   },
 ];
 
 function reviewInitialize(params) {
-  const requested = params && typeof params.protocolVersion === 'string' ? params.protocolVersion : '';
-  const protocolVersion = /^\d{4}-\d{2}-\d{2}$/.test(requested) ? requested : '2025-03-26';
   return {
-    protocolVersion,
+    protocolVersion: negotiateProtocol(params),
     capabilities: { tools: {} },
-    serverInfo: { name: 'Linki Review', version: '0.1.0' },
+    serverInfo: { name: 'Linki Review', title: 'Linki Review', version: '0.1.0' },
     instructions: `${REVIEW_ABOUT} Repository: ${REPO_URL}. ${REVIEW_WORKFLOW.join(' ')}`,
   };
 }
@@ -3008,7 +4107,7 @@ async function reviewMcpEndpoint(request, env, url) {
     return stampReviewMcp(await reviewMcpPost(request, env, url, cors));
   } catch (err) {
     console.error(err);
-    return stampReviewMcp(rpcError(null, -32603, 'Internal error', cors, 500));
+    return stampReviewMcp(rpcError(null, -32603, 'Linki could not complete that request. Please try again in a moment.', cors, 500));
   }
 }
 
@@ -3931,6 +5030,21 @@ header{display:flex;justify-content:space-between;align-items:center;gap:16px;wi
 .pill{display:inline-flex;align-items:center;height:38px;padding:0 16px;border:1px solid var(--line);border-radius:999px;background:var(--surface);font-weight:600;font-size:14px;text-decoration:none}
 .pill[aria-current]{background:var(--pressed)}
 .panel{flex:1 0 auto;width:calc(100% - 40px);max-width:1040px;margin:0 auto 28px;padding:34px 36px;background:var(--surface);border-radius:26px}
+.sitefoot{display:flex;flex-wrap:wrap;gap:8px 18px;width:100%;max-width:1080px;margin:0 auto;padding:0 20px 28px;color:var(--muted);font-size:13px}
+.sitefoot a{color:var(--muted)}
+.doc{max-width:68ch}
+.doc h1{font-size:36px}
+.doc h2{margin-top:28px;font-size:22px}
+.doc p,.doc li{margin-top:10px}
+.doc ul{margin:0;padding-left:1.2em}
+.doc code{font-family:var(--mono);font-size:.92em}
+.consentf{display:flex;flex-wrap:wrap;gap:10px;margin-top:22px}
+.apps{margin-top:18px}
+.apps h3{font:600 13px/1.3 var(--ui);letter-spacing:0}
+.apps ul{list-style:none;margin:8px 0 0;padding:0}
+.apps li{display:flex;justify-content:space-between;align-items:center;gap:12px;padding:8px 0;border-top:1px dashed var(--line);font-size:14px}
+.apps form{margin:0}
+.apps .date{margin-left:8px;color:var(--muted);font-size:12px}
 
 /* hero + form */
 .hero{display:grid;grid-template-columns:minmax(0,1.15fr) minmax(0,1fr);gap:28px}

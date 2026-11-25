@@ -11,7 +11,10 @@ import { Miniflare } from 'miniflare';
 const ROOT = fileURLToPath(new URL('..', import.meta.url));
 const ORIGIN = 'https://linki.test';
 // Same rule as wrangler.toml: PNG imports are binary Data modules.
-const MODULE_RULES = [{ type: 'Data', include: ['**/*.png'], fallthrough: true }];
+const MODULE_RULES = [
+  { type: 'Data', include: ['**/*.png'], fallthrough: true },
+  { type: 'Text', include: ['**/*.svg'], fallthrough: true },
+];
 const BROWSER_UA = 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 Chrome/130.0 Safari/537.36';
 // Miniflare stamps every request with a cached cloud network (Amazon, in this
 // environment) unless the test passes its own cf. A home ISP keeps the suite
@@ -448,6 +451,14 @@ test('robots.txt lets preview crawlers read short links and a homepage query', a
       'Allow: /icon-512.png',
       'Allow: /favicon.svg',
       'Allow: /favicon.ico',
+      'Allow: /icon.svg',
+      'Allow: /icon.png',
+      'Allow: /privacy$',
+      'Allow: /privacy?',
+      'Allow: /support$',
+      'Allow: /support?',
+      'Allow: /docs/mcp$',
+      'Allow: /docs/mcp?',
       'Disallow: /',
       '',
       'User-agent: facebookexternalhit',
@@ -549,7 +560,8 @@ test('preview rules close a reserved route and leave a longer short link open', 
   // routes; robots.txt does not mention them.
   const reserved = [
     'links', 'create', 'api', 'admin', 'static', 'mcp', 'mcp-review', 'review', 'new', 'app',
-    'www', 'about', 'help', 'login', 'signup', 'account', 'settings', 'terms', 'privacy', 'linki',
+    'www', 'about', 'help', 'login', 'signup', 'account', 'settings', 'terms', 'privacy', 'support',
+    'docs', 'oauth', 'icon', 'linki',
   ];
   const routed = new Set(['links', 'create', 'mcp', 'mcp-review', 'review']);
   // What fetch() actually serves. /create has no subpath. The others do.
@@ -707,7 +719,11 @@ test('the homepage shows the headline, the four selling points and no footer sta
     assert.ok(html.includes(`<h3>${title}</h3>`), title);
   }
   assert.doesNotMatch(html, /See every click|Agent-ready/);
-  assert.doesNotMatch(html, /<footer|tied to this browser/);
+  assert.doesNotMatch(html, /tied to this browser/);
+  assert.match(html, /<footer class="sitefoot"/);
+  assert.match(html, /href="\/privacy"/);
+  assert.match(html, /href="\/support"/);
+  assert.match(html, /href="\/docs\/mcp"/);
   assert.doesNotMatch(await (await request('/links')).text(), /class="usp"/);
 });
 
@@ -1683,6 +1699,8 @@ test('initialize tells every client to ask once, and elicitation uses the same w
   const plain = await rpc(token, 'initialize', { protocolVersion: '2025-06-18', capabilities: {} });
   assert.equal(plain.status, 200);
   assert.equal(plain.json.result.protocolVersion, '2025-06-18');
+  assert.equal(plain.json.result.serverInfo.name, 'Linki');
+  assert.equal(plain.json.result.serverInfo.title, 'Linki');
   assert.deepEqual(plain.json.result.capabilities, { tools: {} });
   const instructions = plain.json.result.instructions;
   assert.match(instructions, new RegExp(TRACK_QUESTION.replace(/[?]/g, '\\?')));
@@ -2586,4 +2604,419 @@ test('agents can update a comment over MCP and over plain POST without an Origin
   assert.equal(link.text, `${link.url}\nRead this, fix open comments in the Linki repo, open a PR, mark them fixed.`);
   const linkDenied = await reviewRequest('/review/link');
   assert.equal(linkDenied.status, 401);
+});
+
+// ---------- oauth directory ----------
+
+function pkcePair() {
+  const verifier = randomBytes(32).toString('base64url');
+  const challenge = createHash('sha256').update(verifier).digest('base64url');
+  return { verifier, challenge };
+}
+
+async function registerClient(redirectUris, name = 'Claude') {
+  const res = await request('/oauth/register', {
+    method: 'POST',
+    body: JSON.stringify({
+      client_name: name,
+      redirect_uris: redirectUris,
+      grant_types: ['authorization_code', 'refresh_token'],
+      response_types: ['code'],
+      token_endpoint_auth_method: 'none',
+    }),
+    headers: { 'Content-Type': 'application/json', Origin: 'https://claude.ai' },
+  });
+  assert.equal(res.status, 201);
+  return res.json();
+}
+
+async function approveApp(client, redirectUri, { cookie, challenge, state = 'state-1', resource = `${ORIGIN}/mcp` } = {}) {
+  const params = new URLSearchParams({
+    response_type: 'code',
+    client_id: client.client_id,
+    redirect_uri: redirectUri,
+    code_challenge: challenge,
+    code_challenge_method: 'S256',
+    state,
+    resource,
+  });
+  const page = await request(`/oauth/authorize?${params}`, { cookie });
+  assert.equal(page.status, 200);
+  const html = await page.text();
+  const csrf = setCookies(page).oauth_csrf.value;
+  assert.match(html, new RegExp(`name="csrf" value="${csrf}"`));
+  const allow = await post(
+    '/oauth/authorize',
+    { csrf, decision: 'allow' },
+    { cookie: `${cookie ? `${cookie}; ` : ''}oauth_csrf=${csrf}` }
+  );
+  assert.equal(allow.status, 302);
+  const location = new URL(allow.headers.get('Location'));
+  assert.equal(location.origin + location.pathname, redirectUri);
+  assert.equal(location.searchParams.get('state'), state);
+  assert.equal(location.searchParams.get('error'), null);
+  const code = location.searchParams.get('code');
+  assert.ok(code);
+  assert.equal(location.href.includes('owner='), false);
+  return { code, allow, html };
+}
+
+test('the icon is a square svg and a 512 png at stable urls', async () => {
+  const svg = await request('/icon.svg');
+  assert.equal(svg.status, 200);
+  assert.equal(svg.headers.get('Content-Type'), 'image/svg+xml');
+  assert.equal(await svg.text(), readFileSync(`${ROOT}assets/icon.svg`, 'utf8'));
+  const png = await request('/icon.png');
+  assert.equal(png.status, 200);
+  assert.deepEqual(pngSize(await png.arrayBuffer()), { width: 512, height: 512 });
+});
+
+test('privacy, support, and the connector docs are public pages', async () => {
+  for (const [path, heading] of [
+    ['/privacy', 'Privacy'],
+    ['/support', 'Support'],
+    ['/docs/mcp', 'Connect an agent'],
+  ]) {
+    const res = await request(path);
+    assert.equal(res.status, 200, path);
+    const html = await res.text();
+    assert.match(html, new RegExp(`<h1>${heading}</h1>`), path);
+    assert.match(html, /<footer class="sitefoot"/, path);
+    if (path !== '/docs/mcp') assert.match(html, /github.com\/kiethuynhvn333\/linki\/issues/, path);
+    assert.deepEqual(res.headers.getSetCookie(), [], path);
+  }
+  const privacy = await (await request('/privacy')).text();
+  assert.match(privacy, /400 days/);
+  assert.match(privacy, /SHA-256/);
+  assert.match(privacy, /Google Analytics 4/);
+  assert.match(privacy, /no account/i);
+  const docs = await (await request('/docs/mcp')).text();
+  assert.match(docs, /https:\/\/linki\.test\/mcp/);
+  assert.match(docs, /list_links/);
+  assert.match(docs, /create_link/);
+});
+
+test('an unauthenticated /mcp answers 401 with protected-resource metadata', async () => {
+  const res = await request('/mcp', {
+    method: 'POST',
+    body: JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'initialize' }),
+    headers: { 'Content-Type': 'application/json', Origin: 'https://claude.ai' },
+  });
+  assert.equal(res.status, 401);
+  const challenge = res.headers.get('WWW-Authenticate');
+  assert.equal(
+    challenge,
+    'Bearer resource_metadata="https://linki.test/.well-known/oauth-protected-resource/mcp", scope="links"'
+  );
+  const body = await res.json();
+  assert.equal(body.error, 'unauthorized');
+  assert.match(body.error_description, /bearer access token/i);
+  assert.equal((await request('/mcp/not-a-real-token', { method: 'POST', body: '{}', headers: { 'Content-Type': 'application/json' } })).status, 401);
+
+  const resource = await (await request('/.well-known/oauth-protected-resource/mcp')).json();
+  const root = await (await request('/.well-known/oauth-protected-resource')).json();
+  assert.deepEqual(resource, root);
+  assert.equal(resource.resource, `${ORIGIN}/mcp`);
+  assert.deepEqual(resource.authorization_servers, [ORIGIN]);
+
+  const metadata = await (await request('/.well-known/oauth-authorization-server')).json();
+  assert.equal(metadata.issuer, ORIGIN);
+  assert.equal(metadata.authorization_endpoint, `${ORIGIN}/oauth/authorize`);
+  assert.equal(metadata.token_endpoint, `${ORIGIN}/oauth/token`);
+  assert.equal(metadata.registration_endpoint, `${ORIGIN}/oauth/register`);
+  assert.deepEqual(metadata.code_challenge_methods_supported, ['S256']);
+  assert.deepEqual(metadata.grant_types_supported, ['authorization_code', 'refresh_token']);
+  assert.deepEqual(metadata.response_types_supported, ['code']);
+  assert.deepEqual(metadata.token_endpoint_auth_methods_supported, ['none']);
+  assert.equal(metadata.client_id_metadata_document_supported, true);
+});
+
+test('oauth registration rejects a non-https redirect and accepts the directory callbacks', async () => {
+  const bad = await request('/oauth/register', {
+    method: 'POST',
+    body: JSON.stringify({ client_name: 'Nope', redirect_uris: ['http://evil.example/callback'] }),
+    headers: { 'Content-Type': 'application/json' },
+  });
+  assert.equal(bad.status, 400);
+  assert.equal((await bad.json()).error, 'invalid_redirect_uri');
+
+  for (const uri of [
+    'https://claude.ai/api/mcp/auth_callback',
+    'https://claude.com/api/mcp/auth_callback',
+    'https://chatgpt.com/connector_platform_oauth_redirect',
+    'http://localhost:8787/callback',
+    'http://127.0.0.1:3000/callback',
+  ]) {
+    const client = await registerClient([uri], 'Directory');
+    assert.equal(client.token_endpoint_auth_method, 'none');
+    assert.deepEqual(client.redirect_uris, [uri]);
+    assert.equal(client.client_secret, undefined);
+  }
+});
+
+test('a browser can approve an app, then the bearer token uses the same tools', async () => {
+  const made = await createLink({ name: 'oauth-home' });
+  const redirectUri = 'https://claude.ai/api/mcp/auth_callback';
+  const client = await registerClient([redirectUri]);
+  const { verifier, challenge } = pkcePair();
+  const { code, html } = await approveApp(client, redirectUri, { cookie: made.cookie, challenge });
+  assert.match(html, /Let Claude see and create the links saved in this browser\?/);
+
+  const forged = await post('/oauth/authorize', { csrf: 'forged', decision: 'allow' }, { cookie: made.cookie });
+  assert.equal(forged.status, 403);
+
+  const tokenRes = await request('/oauth/token', {
+    method: 'POST',
+    body: new URLSearchParams({
+      grant_type: 'authorization_code',
+      code,
+      redirect_uri: redirectUri,
+      client_id: client.client_id,
+      code_verifier: verifier,
+      resource: `${ORIGIN}/mcp`,
+    }).toString(),
+    headers: { 'Content-Type': 'application/x-www-form-urlencoded', Origin: 'https://claude.ai' },
+  });
+  assert.equal(tokenRes.status, 200);
+  const issued = await tokenRes.json();
+  assert.equal(issued.token_type, 'Bearer');
+  assert.equal(issued.expires_in, 3600);
+  assert.equal(issued.scope, 'links');
+  assert.ok(issued.access_token);
+  assert.ok(issued.refresh_token);
+  const again = await request('/oauth/token', {
+    method: 'POST',
+    body: new URLSearchParams({
+      grant_type: 'authorization_code',
+      code,
+      redirect_uri: redirectUri,
+      client_id: client.client_id,
+      code_verifier: verifier,
+    }).toString(),
+    headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+  });
+  assert.equal(again.status, 400);
+  assert.equal((await again.json()).error, 'invalid_grant');
+
+  async function bearer(method, params, token = issued.access_token) {
+    const res = await request('/mcp', {
+      method: 'POST',
+      body: JSON.stringify({ jsonrpc: '2.0', id: 1, method, params }),
+      headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` },
+    });
+    return { status: res.status, json: await res.json() };
+  }
+  const init = await bearer('initialize', { protocolVersion: '2026-07-28', capabilities: {} });
+  assert.equal(init.status, 200);
+  assert.equal(init.json.result.protocolVersion, '2026-07-28');
+  assert.equal(init.json.result.serverInfo.name, 'Linki');
+  assert.equal(init.json.result.serverInfo.title, 'Linki');
+  const tools = (await bearer('tools/list')).json.result.tools;
+  assert.deepEqual(
+    tools.map((tool) => tool.name),
+    ['list_links', 'link_report', 'clicks_summary', 'create_link', 'save_campaign', 'list_campaigns', 'get_campaign']
+  );
+  for (const tool of tools) {
+    assert.equal(typeof tool.title, 'string', tool.name);
+    assert.equal(tool.annotations.title, tool.title, tool.name);
+    assert.equal(typeof tool.annotations.readOnlyHint, 'boolean', tool.name);
+    assert.equal(typeof tool.annotations.destructiveHint, 'boolean', tool.name);
+    assert.equal(typeof tool.annotations.openWorldHint, 'boolean', tool.name);
+    assert.ok(tool.outputSchema, tool.name);
+  }
+  const create = tools.find((tool) => tool.name === 'create_link');
+  assert.equal(create.annotations.readOnlyHint, false);
+  assert.equal(create.annotations.destructiveHint, false);
+  assert.equal(create.annotations.openWorldHint, true);
+  const list = tools.find((tool) => tool.name === 'list_links');
+  assert.equal(list.annotations.readOnlyHint, true);
+  assert.equal(list.annotations.destructiveHint, false);
+  assert.equal(list.annotations.openWorldHint, false);
+  const listed = JSON.parse((await bearer('tools/call', { name: 'list_links', arguments: {} })).json.result.content[0].text);
+  assert.deepEqual(listed.links.map((link) => link.slug), ['oauth-home']);
+  const created = JSON.parse(
+    (await bearer('tools/call', { name: 'create_link', arguments: { url: 'https://example.com/from-oauth', name: 'from-oauth' } })).json.result.content[0].text
+  );
+  assert.equal(created.slug, 'from-oauth');
+  const row = await db.prepare('SELECT created_via FROM links WHERE code = ?').bind('from-oauth').first();
+  assert.equal(row.created_via, 'mcp');
+
+  const stale = await bearer('tools/list', {}, 'not-a-token');
+  assert.equal(stale.status, 401);
+  assert.match(stale.json.error, /invalid_token|unauthorized/);
+
+  const refreshed = await request('/oauth/token', {
+    method: 'POST',
+    body: JSON.stringify({
+      grant_type: 'refresh_token',
+      refresh_token: issued.refresh_token,
+      client_id: client.client_id,
+    }),
+    headers: { 'Content-Type': 'application/json' },
+  });
+  assert.equal(refreshed.status, 200);
+  const next = await refreshed.json();
+  assert.notEqual(next.refresh_token, issued.refresh_token);
+  assert.equal((await bearer('tools/list', {}, next.access_token)).status, 200);
+  const linksHtml = await (await request('/links', { cookie: made.cookie })).text();
+  assert.match(linksHtml, /Connected apps/);
+  assert.match(linksHtml, />Claude</);
+  const reused = await request('/oauth/token', {
+    method: 'POST',
+    body: new URLSearchParams({
+      grant_type: 'refresh_token',
+      refresh_token: issued.refresh_token,
+      client_id: client.client_id,
+    }).toString(),
+    headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+  });
+  assert.equal(reused.status, 400);
+  assert.match((await reused.json()).error_description, /already used/);
+  assert.equal((await bearer('tools/list', {}, next.access_token)).status, 401);
+  assert.doesNotMatch(await (await request('/links', { cookie: made.cookie })).text(), /Connected apps/);
+
+  const another = pkcePair();
+  const second = await approveApp(client, redirectUri, { cookie: made.cookie, challenge: another.challenge, state: 'revoke-me' });
+  const secondToken = await request('/oauth/token', {
+    method: 'POST',
+    body: new URLSearchParams({
+      grant_type: 'authorization_code',
+      code: second.code,
+      redirect_uri: redirectUri,
+      client_id: client.client_id,
+      code_verifier: another.verifier,
+    }).toString(),
+    headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+  });
+  assert.equal(secondToken.status, 200);
+  const secondAccess = (await secondToken.json()).access_token;
+  assert.match(await (await request('/links', { cookie: made.cookie })).text(), /Connected apps/);
+  const revoke = await post('/oauth/revoke', { client_id: client.client_id }, { cookie: made.cookie });
+  assert.equal(revoke.status, 303);
+  assert.equal(revoke.headers.get('Location'), '/links?revoked=1');
+  assert.match(await (await request('/links?revoked=1', { cookie: made.cookie })).text(), /App disconnected/);
+  assert.doesNotMatch(await (await request('/links', { cookie: made.cookie })).text(), /Connected apps/);
+  assert.equal((await bearer('tools/list', {}, secondAccess)).status, 401);
+});
+
+test('approving with no owner cookie creates one instead of failing', async () => {
+  const redirectUri = 'https://chatgpt.com/connector_platform_oauth_redirect';
+  const client = await registerClient([redirectUri], 'ChatGPT');
+  const { verifier, challenge } = pkcePair();
+  const params = new URLSearchParams({
+    response_type: 'code',
+    client_id: client.client_id,
+    redirect_uri: redirectUri,
+    code_challenge: challenge,
+    code_challenge_method: 'S256',
+    resource: `${ORIGIN}/mcp`,
+  });
+  const page = await request(`/oauth/authorize?${params}`);
+  assert.equal(page.status, 200);
+  const html = await page.text();
+  assert.match(html, /This browser has no links yet/);
+  assert.match(html, /Create a link/);
+  assert.equal(setCookies(page).owner, undefined);
+  const csrf = setCookies(page).oauth_csrf.value;
+  const created = await post(
+    '/oauth/authorize',
+    { csrf, decision: 'create', url: 'https://example.com/first', name: 'first-oauth' },
+    { cookie: `oauth_csrf=${csrf}` }
+  );
+  assert.equal(created.status, 303);
+  const owner = setCookies(created).owner;
+  assert.match(owner.value, /^[a-f0-9]{32}$/);
+  assert.equal(created.headers.get('Location').includes(owner.value), false);
+  const back = await request(created.headers.get('Location'), { cookie: `owner=${owner.value}` });
+  assert.match(await back.text(), /Let ChatGPT see and create/);
+  const row = await db.prepare('SELECT owner_id, created_via FROM links WHERE code = ?').bind('first-oauth').first();
+  assert.equal(row.owner_id, owner.value);
+  assert.equal(row.created_via, 'web');
+
+  const fresh = pkcePair();
+  const bare = await approveApp(client, redirectUri, { challenge: fresh.challenge, state: 'bare' });
+  assert.ok(bare.code);
+  const tokenRes = await request('/oauth/token', {
+    method: 'POST',
+    body: new URLSearchParams({
+      grant_type: 'authorization_code',
+      code: bare.code,
+      redirect_uri: redirectUri,
+      client_id: client.client_id,
+      code_verifier: fresh.verifier,
+    }).toString(),
+    headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+  });
+  assert.equal(tokenRes.status, 200);
+  const ownerCookie = setCookies(bare.allow).owner.value;
+  const access = (await tokenRes.json()).access_token;
+  const call = await request('/mcp', {
+    method: 'POST',
+    body: JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'tools/call', params: { name: 'list_links', arguments: {} } }),
+    headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${access}` },
+  });
+  assert.equal(call.status, 200);
+  const links = JSON.parse((await call.json()).result.content[0].text);
+  assert.equal(links.links.length, 0);
+  const stored = await db.prepare('SELECT owner_id FROM oauth_tokens WHERE token_hash = ?').bind(createHash('sha256').update(access).digest('hex')).first();
+  assert.equal(stored.owner_id, ownerCookie);
+});
+
+test('a mismatched redirect or resource is refused, and the legacy connector still works', async () => {
+  const made = await createLink();
+  const legacy = setCookies(await request('/links', { cookie: made.cookie })).mcp.value;
+  assert.equal((await rpc(legacy, 'tools/list')).status, 200);
+  assert.equal((await rpc('bad-token-value', 'tools/list')).status, 401);
+
+  const client = await registerClient(['https://claude.ai/api/mcp/auth_callback']);
+  const { challenge } = pkcePair();
+  const wrong = await request(
+    `/oauth/authorize?${new URLSearchParams({
+      response_type: 'code',
+      client_id: client.client_id,
+      redirect_uri: 'https://evil.example/callback',
+      code_challenge: challenge,
+      code_challenge_method: 'S256',
+    })}`
+  );
+  assert.equal(wrong.status, 400);
+  assert.match(await wrong.text(), /Redirect not allowed/);
+  assert.equal(wrong.headers.get('Location'), null);
+
+  const resource = await request(
+    `/oauth/authorize?${new URLSearchParams({
+      response_type: 'code',
+      client_id: client.client_id,
+      redirect_uri: 'https://claude.ai/api/mcp/auth_callback',
+      code_challenge: challenge,
+      code_challenge_method: 'S256',
+      resource: `${ORIGIN}/somewhere-else`,
+    })}`,
+    { cookie: made.cookie }
+  );
+  assert.equal(resource.status, 302);
+  assert.equal(new URL(resource.headers.get('Location')).searchParams.get('error'), 'invalid_target');
+});
+
+test('the oauth migration only adds tables and matches schema.sql', async () => {
+  const migration = readFileSync(`${ROOT}migrations/0007_oauth.sql`, 'utf8');
+  const schema = readFileSync(`${ROOT}schema.sql`, 'utf8');
+  const create = migration.slice(migration.indexOf('CREATE TABLE IF NOT EXISTS oauth_clients')).trim();
+  assert.ok(schema.includes(create));
+  assert.doesNotMatch(migration, /\b(DROP|ALTER|DELETE)\b/i);
+  const statements = (sql) => sql.replace(/^--.*$/gm, '').split(';').map((part) => part.trim()).filter(Boolean);
+  for (const statement of statements(migration)) {
+    await db.prepare(statement).run();
+  }
+  const now = Math.floor(Date.now() / 1000);
+  await db.prepare(
+    'INSERT INTO oauth_codes (code_hash, client_id, owner_id, redirect_uri, code_challenge, resource, scope, expires_at, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)'
+  ).bind('expired-code', 'client', 'owner', 'https://claude.ai/cb', 'challenge', `${ORIGIN}/mcp`, 'links', now - 10, now - 20).run();
+  await db.prepare(
+    'INSERT INTO oauth_tokens (token_hash, kind, client_id, owner_id, grant_id, resource, scope, expires_at, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)'
+  ).bind('expired-token', 'access', 'client', 'owner', 'grant', `${ORIGIN}/mcp`, 'links', now - 5, now - 10).run();
+  const worker = await mf.getWorker();
+  await worker.scheduled({ cron: '17 3 * * *' });
+  await waitFor(async () => (await count('SELECT COUNT(*) AS n FROM oauth_codes WHERE code_hash = ?', 'expired-code')) === 0, 'expired code pruned');
+  assert.equal(await count('SELECT COUNT(*) AS n FROM oauth_tokens WHERE token_hash = ?', 'expired-token'), 0);
 });

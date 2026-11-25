@@ -88,3 +88,51 @@ CREATE TABLE IF NOT EXISTS campaigns (
   PRIMARY KEY (owner_id, name)
 );
 CREATE INDEX IF NOT EXISTS idx_campaigns_owner ON campaigns (owner_id, updated_at);
+
+-- OAuth 2.1 for the shared /mcp endpoint. Matches migrations/0007_oauth.sql.
+
+CREATE TABLE IF NOT EXISTS oauth_clients (
+  client_id     TEXT PRIMARY KEY,
+  client_name   TEXT NOT NULL,
+  redirect_uris TEXT NOT NULL,
+  created_at    INTEGER NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS oauth_consents (
+  token_hash     TEXT PRIMARY KEY,
+  client_id      TEXT NOT NULL,
+  redirect_uri   TEXT NOT NULL,
+  code_challenge TEXT NOT NULL,
+  state          TEXT,
+  resource       TEXT NOT NULL,
+  scope          TEXT NOT NULL,
+  expires_at     INTEGER NOT NULL,
+  created_at     INTEGER NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS oauth_codes (
+  code_hash      TEXT PRIMARY KEY,
+  client_id      TEXT NOT NULL,
+  owner_id       TEXT NOT NULL,
+  redirect_uri   TEXT NOT NULL,
+  code_challenge TEXT NOT NULL,
+  resource       TEXT NOT NULL,
+  scope          TEXT NOT NULL,
+  expires_at     INTEGER NOT NULL,
+  created_at     INTEGER NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS oauth_tokens (
+  token_hash TEXT PRIMARY KEY,
+  kind       TEXT NOT NULL,
+  client_id  TEXT NOT NULL,
+  owner_id   TEXT NOT NULL,
+  grant_id   TEXT NOT NULL,
+  resource   TEXT NOT NULL,
+  scope      TEXT NOT NULL,
+  expires_at INTEGER NOT NULL,
+  created_at INTEGER NOT NULL,
+  rotated_at INTEGER
+);
+CREATE INDEX IF NOT EXISTS idx_oauth_tokens_owner ON oauth_tokens (owner_id, created_at);
+CREATE INDEX IF NOT EXISTS idx_oauth_tokens_grant ON oauth_tokens (grant_id);
