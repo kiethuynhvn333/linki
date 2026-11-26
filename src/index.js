@@ -1176,7 +1176,11 @@ function seoHead(title, url, { home = false, index = false } = {}) {
 <meta name="twitter:image" content="${esc(image)}">`;
 }
 
-function contentSecurityPolicy(nonce) {
+function contentSecurityPolicy(nonce, formAction = '') {
+  // Chrome and Safari apply form-action to the redirect after a form POST.
+  // Only the consent page adds the app's redirect origin. Every other
+  // response stays form-action 'self'.
+  const forms = formAction ? `'self' ${formAction}` : "'self'";
   return [
     "default-src 'none'",
     `script-src 'nonce-${nonce}' https://*.googletagmanager.com`,
@@ -1184,16 +1188,17 @@ function contentSecurityPolicy(nonce) {
     'font-src https://fonts.gstatic.com',
     "img-src 'self' data: https://*.google-analytics.com https://*.googletagmanager.com",
     "connect-src 'self' https://*.google-analytics.com https://*.analytics.google.com https://*.googletagmanager.com",
-    "form-action 'self'",
+    `form-action ${forms}`,
     "base-uri 'none'",
     "frame-ancestors 'none'",
   ].join('; ');
 }
 
-function page(title, body, { owner, url, status = 200, linkCreated = false, mcpToken, index = false, review = false, request, env } = {}) {
+function page(title, body, { owner, url, status = 200, linkCreated = false, mcpToken, index = false, review = false, request, env, formAction = '', mainClass = 'panel', bodyClass = '', extraScript = '' } = {}) {
   const nonce = base64url(crypto.getRandomValues(new Uint8Array(16)));
   const traffic = request ? classifyTraffic(request, env || {}) : 'human';
   const fullTitle = title.startsWith('Linki —') ? title : `${title} — Linki`;
+  const bodyClasses = [review ? 'review-on' : '', bodyClass].filter(Boolean).join(' ');
   const html = `<!doctype html>
 <html lang="en">
 <head>
@@ -1209,11 +1214,11 @@ ${gaHead(linkCreated, nonce, traffic)}<link rel="preconnect" href="https://fonts
 <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Bricolage+Grotesque:opsz,wght@12..96,700;12..96,800&family=Inter:wght@400;500;600;700&family=Space+Mono:wght@400;700&display=swap">
 <style>${CSS}${review ? REVIEW_CSS : ''}</style>
 </head>
-<body${review ? ' class="review-on"' : ''}>
+<body${bodyClasses ? ` class="${bodyClasses}"` : ''}>
 <header><a class="brand" href="/">${LOGO_SVG.replace('<svg ', '<svg aria-hidden="true" ')}Linki</a><nav><a class="pill" href="/links"${url && url.pathname.startsWith('/links') ? ' aria-current="page"' : ''}>Your links</a></nav></header>
-<main class="panel">${body}</main>
+<main class="${esc(mainClass)}">${body}</main>
 <footer class="sitefoot"><a href="/docs/mcp">Connect an agent</a><a href="/privacy">Privacy</a><a href="/support">Support</a></footer>
-<script nonce="${nonce}">${JS}</script>
+${extraScript ? `<script nonce="${nonce}">${extraScript}</script>\n` : ''}<script nonce="${nonce}">${JS}</script>
 ${review ? `<script nonce="${nonce}">${REVIEW_JS}</script>\n` : ''}</body>
 </html>`;
   const headers = new Headers({
@@ -1222,7 +1227,7 @@ ${review ? `<script nonce="${nonce}">${REVIEW_JS}</script>\n` : ''}</body>
     'X-Content-Type-Options': 'nosniff',
     'X-Frame-Options': 'DENY',
     'Referrer-Policy': 'same-origin',
-    'Content-Security-Policy': contentSecurityPolicy(nonce),
+    'Content-Security-Policy': contentSecurityPolicy(nonce, formAction),
   });
   if (url && url.protocol === 'https:') {
     headers.set('Strict-Transport-Security', 'max-age=31536000');
@@ -2702,7 +2707,7 @@ async function fetchClientMetadata(env, clientId) {
   )
     .bind(clientId, name, JSON.stringify(redirectUris), now)
     .run();
-  return { client_id: clientId, client_name: name, redirect_uris: redirectUris };
+  return { client_id: clientId, client_name: name, redirect_uris: redirectUris, logo_uri: publicLogo(doc.logo_uri) };
 }
 
 async function resolveClient(env, clientId) {
@@ -2774,17 +2779,6 @@ async function startConsent(env, fields) {
   return token;
 }
 
-async function loadConsent(env, tokenHash) {
-  const row = await env.DB.prepare(
-    `SELECT client_id, redirect_uri, code_challenge, state, resource, scope, expires_at
-     FROM oauth_consents WHERE token_hash = ?`
-  )
-    .bind(tokenHash)
-    .first();
-  if (!row || row.expires_at <= Math.floor(Date.now() / 1000)) return null;
-  return row;
-}
-
 async function consumeConsent(env, tokenHash) {
   return env.DB.prepare(
     `DELETE FROM oauth_consents WHERE token_hash = ? AND expires_at > ?
@@ -2794,49 +2788,88 @@ async function consumeConsent(env, tokenHash) {
     .first();
 }
 
-function authorizeQuery(row) {
-  const params = new URLSearchParams();
-  params.set('response_type', 'code');
-  params.set('client_id', row.client_id);
-  params.set('redirect_uri', row.redirect_uri);
-  params.set('code_challenge', row.code_challenge);
-  params.set('code_challenge_method', 'S256');
-  if (row.state) params.set('state', row.state);
-  params.set('resource', row.resource);
-  params.set('scope', row.scope);
-  return `/oauth/authorize?${params.toString()}`;
+// A CSP host-source can name a DNS name or an IPv4 address, including a port.
+// It cannot name an IPv6 address. Those redirects use a normal page instead
+// of a 302, so form-action never has to allow them.
+function cspFormSource(redirectUri) {
+  let parsed;
+  try {
+    parsed = new URL(redirectUri);
+  } catch {
+    return '';
+  }
+  if (parsed.protocol !== 'https:' && parsed.protocol !== 'http:') return '';
+  if (!/^[A-Za-z0-9](?:[A-Za-z0-9.-]*[A-Za-z0-9])?$/.test(parsed.hostname)) return '';
+  if (parsed.hostname.includes('..')) return '';
+  const origin = parsed.origin;
+  if (!/^https?:\/\/[A-Za-z0-9.-]+(?::[0-9]+)?$/.test(origin)) return '';
+  return origin;
 }
 
-async function renderConsent(request, env, url, client, token, owner, linkCount, state = {}) {
+function publicLogo(raw) {
+  if (typeof raw !== 'string') return '';
+  const trimmed = raw.trim();
+  if (!trimmed || trimmed.length > 2048 || /[\u0000-\u001f\u007f\s]/.test(trimmed)) return '';
+  let parsed;
+  try {
+    parsed = new URL(trimmed);
+  } catch {
+    return '';
+  }
+  if (parsed.username || parsed.password || parsed.hash) return '';
+  if (parsed.protocol !== 'https:' && parsed.protocol !== 'http:') return '';
+  return parsed.href;
+}
+
+// Same hosts as img-src in contentSecurityPolicy. A client logo on any other
+// host is left out, so the page does not need a wider img-src.
+function imgSrcAllows(raw, pageUrl) {
+  let parsed;
+  try {
+    parsed = new URL(raw);
+  } catch {
+    return false;
+  }
+  if (parsed.username || parsed.password) return false;
+  if (parsed.origin === pageUrl.origin) return parsed.protocol === 'https:' || parsed.protocol === 'http:';
+  if (parsed.protocol !== 'https:' || parsed.port) return false;
+  const host = parsed.hostname.toLowerCase();
+  return host.endsWith('.google-analytics.com') || host.endsWith('.googletagmanager.com');
+}
+
+function consentMark(name, logoUrl) {
+  if (logoUrl) return `<img src="${esc(logoUrl)}" alt="" width="56" height="56">`;
+  const initial = Array.from(name)[0] || 'A';
+  return `<span class="badge">${esc(initial.toUpperCase())}</span>`;
+}
+
+function linkiMark(id) {
+  return LOGO_SVG.replace('id="lt"', `id="${id}"`).replace('url(#lt)', `url(#${id})`).replace('<svg ', '<svg aria-hidden="true" ');
+}
+
+async function renderConsent(request, env, url, client, token, owner, linkCount, redirectUri) {
   const name = client.client_name;
-  const error = state.error ? `<p class="error" role="alert">${esc(state.error)}</p>` : '';
-  const emptyNote =
-    linkCount === 0
-      ? `<p>This browser has no links yet. Allow still connects it, and ${esc(name)} can create links for you. Or create one here. That uses the same saved-in-this-browser identity as the homepage.</p>`
-      : `<p>This only covers the links saved in this browser. You can revoke ${esc(name)} later on Your links.</p>`;
-  const createForm =
-    linkCount === 0
-      ? `<form method="post" action="/oauth/authorize" class="create">
-          <input type="hidden" name="csrf" value="${esc(token)}">
-          <input type="hidden" name="decision" value="create">
-          <label class="sr" for="oauth-url">Destination URL</label>
-          <input id="oauth-url" name="url" type="text" inputmode="url" autocomplete="off" required placeholder="Paste a long URL" maxlength="${MAX_URL_LENGTH}" value="${esc(state.rawUrl || '')}">
-          <label class="sr" for="oauth-name">Custom name (optional)</label>
-          <input id="oauth-name" name="name" type="text" autocomplete="off" autocapitalize="none" spellcheck="false" maxlength="60" placeholder="your-name (optional)" value="${esc(state.rawName || '')}">
-          <button class="secondary" type="submit">Create a link</button>
-        </form>`
-      : '';
-  const body = `<section class="doc">
-      <h1>Connect ${esc(name)}</h1>
-      <p class="lede">Let ${esc(name)} see and create the links saved in this browser?</p>
-      ${emptyNote}
-      ${error}
-      <form method="post" action="/oauth/authorize" class="consentf">
+  const logo = client.logo_uri && imgSrcAllows(client.logo_uri, url) ? client.logo_uri : '';
+  const empty = linkCount === 0 ? '<p class="none">No links in this browser yet. You can still connect.</p>' : '';
+  const source = cspFormSource(redirectUri);
+  const body = `<section class="approve">
+      <div class="pair" aria-hidden="true">
+        <span class="mark">${linkiMark('cm')}</span>
+        <span class="join"></span>
+        <span class="mark other">${consentMark(name, logo)}</span>
+      </div>
+      <h1>Connect ${esc(name)} to Linki</h1>
+      <ul class="can">
+        <li>See your links and their click counts</li>
+        <li>Create new short links</li>
+      </ul>
+      <p class="scope">Only the links saved in this browser. Revoke anytime under <a href="/links">Your links</a>.</p>
+      ${empty}
+      <form method="post" action="/oauth/authorize">
         <input type="hidden" name="csrf" value="${esc(token)}">
-        <button class="primary" type="submit" name="decision" value="allow">Allow</button>
-        <button class="secondary" type="submit" name="decision" value="deny">Cancel</button>
+        <button class="allow" type="submit" name="decision" value="allow">Allow</button>
+        <button class="quiet" type="submit" name="decision" value="deny">Cancel</button>
       </form>
-      ${createForm}
     </section>`;
   const response = page(`Connect ${name}`, body, {
     owner,
@@ -2844,9 +2877,63 @@ async function renderConsent(request, env, url, client, token, owner, linkCount,
     request,
     env,
     review: await reviewOn(request, env),
+    formAction: source && source !== url.origin ? source : '',
+    mainClass: 'panel approve-wrap',
+    bodyClass: 'consent',
   });
   setOauthCsrf(response.headers, token, url);
   return response;
+}
+
+async function approvalUsedPage(request, env, url) {
+  const body = `<section class="approve">
+      <h1>This approval link expired</h1>
+      <p class="scope">It expired or was already used. Start the connection again from your app.</p>
+      <a class="button allow" href="/">Back to Linki</a>
+    </section>`;
+  return page('Approval link expired', body, {
+    url,
+    request,
+    env,
+    review: await reviewOn(request, env),
+    mainClass: 'panel approve-wrap',
+    bodyClass: 'consent',
+  });
+}
+
+async function consentHandoff(request, env, url, location) {
+  const next = JSON.stringify(location).replace(/</g, '\\u003c').replace(/\u2028/g, '\\u2028').replace(/\u2029/g, '\\u2029');
+  const body = `<section class="approve">
+      <h1>Sending you back</h1>
+      <p class="scope">Linki saved your choice. Continue to finish connecting.</p>
+      <a class="button allow" href="${esc(location)}">Continue</a>
+    </section>`;
+  return page('Sending you back', body, {
+    url,
+    request,
+    env,
+    review: await reviewOn(request, env),
+    mainClass: 'panel approve-wrap',
+    bodyClass: 'consent',
+    extraScript: `location.replace(${next});`,
+  });
+}
+
+async function consentRedirect(request, env, url, location, owner, setOwner) {
+  const headers = new Headers({
+    'Cache-Control': 'no-store',
+    'Referrer-Policy': 'no-referrer',
+  });
+  if (setOwner || (owner && !owner.isNew)) setOwnerCookie(headers, owner, url);
+  clearOauthCsrf(headers, url);
+  if (!cspFormSource(location)) {
+    const response = await consentHandoff(request, env, url, location);
+    for (const cookie of headers.getSetCookie()) response.headers.append('Set-Cookie', cookie);
+    response.headers.set('Referrer-Policy', 'no-referrer');
+    return response;
+  }
+  headers.set('Location', location);
+  return new Response(null, { status: 302, headers });
 }
 
 async function oauthAuthorize(request, env, url) {
@@ -2902,7 +2989,7 @@ async function oauthAuthorizeGet(request, env, url) {
   });
   const owner = getOwner(request);
   const linkCount = owner.isNew ? 0 : await countOwnerLinks(env, owner.id);
-  return renderConsent(request, env, url, client, token, owner, linkCount);
+  return renderConsent(request, env, url, client, token, owner, linkCount, redirectUri);
 }
 
 async function countOwnerLinks(env, ownerId) {
@@ -2920,32 +3007,29 @@ async function oauthAuthorizePost(request, env, url) {
   const field = String(form.get('csrf') || '');
   const cookie = cookieValue(request, 'oauth_csrf');
   if (!field || !cookie || field.length > 200 || !timingSafeEqual(field, cookie)) {
-    return messagePage(request, env, 403, 'Approval not confirmed', 'Start the connection again from your app.');
+    return approvalUsedPage(request, env, url);
   }
   const tokenHash = await sha256(field);
   const decision = String(form.get('decision') || '');
-  if (decision === 'create') return oauthConsentCreate(request, env, url, form, tokenHash, field);
   if (decision !== 'allow' && decision !== 'deny') {
     return messagePage(request, env, 400, 'Approval not confirmed', 'Start the connection again from your app.');
   }
   const consent = await consumeConsent(env, tokenHash);
-  if (!consent) {
-    return messagePage(request, env, 400, 'Approval expired', 'This approval page has expired. Start the connection again from your app.');
-  }
+  if (!consent) return approvalUsedPage(request, env, url);
   const owner = getOwner(request);
   if (decision === 'deny') {
-    const headers = new Headers({
-      Location: redirectWithParams(consent.redirect_uri, {
+    return consentRedirect(
+      request,
+      env,
+      url,
+      redirectWithParams(consent.redirect_uri, {
         error: 'access_denied',
         error_description: 'The approval was cancelled.',
         state: consent.state || undefined,
       }),
-      'Cache-Control': 'no-store',
-      'Referrer-Policy': 'no-referrer',
-    });
-    clearOauthCsrf(headers, url);
-    if (!owner.isNew) setOwnerCookie(headers, owner, url);
-    return new Response(null, { status: 302, headers });
+      owner,
+      false
+    );
   }
   const client = await readStoredClient(env, consent.client_id);
   if (!client || !client.redirect_uris.includes(consent.redirect_uri)) {
@@ -2971,52 +3055,14 @@ async function oauthAuthorizePost(request, env, url) {
     )
     .run();
   // The owner id stays in the cookie and the database. It is never put on the URL.
-  const headers = new Headers({
-    Location: redirectWithParams(consent.redirect_uri, { code, state: consent.state || undefined }),
-    'Cache-Control': 'no-store',
-    'Referrer-Policy': 'no-referrer',
-  });
-  setOwnerCookie(headers, owner, url);
-  clearOauthCsrf(headers, url);
-  return new Response(null, { status: 302, headers });
-}
-
-async function oauthConsentCreate(request, env, url, form, tokenHash, csrf) {
-  const consent = await loadConsent(env, tokenHash);
-  if (!consent) {
-    return messagePage(request, env, 400, 'Approval expired', 'This approval page has expired. Start the connection again from your app.');
-  }
-  const client = await readStoredClient(env, consent.client_id);
-  if (!client) {
-    return messagePage(request, env, 400, 'Unknown app', 'This app is no longer registered. Start the connection again.');
-  }
-  const owner = getOwner(request);
-  const rawUrl = String(form.get('url') || '').trim();
-  const rawName = String(form.get('name') || '').trim();
-  const ip = request.headers.get('CF-Connecting-IP') || 'unknown';
-  const made = await makeLink(env, {
-    ownerId: owner.id,
-    rawUrl,
-    rawName,
-    ownHost: url.hostname,
-    creatorHash: (await sha256(`${secret(env)}|creator|${ip}`)).slice(0, 32),
-    limit: CREATE_LIMITS.web,
-    via: 'web',
-    traffic: classifyTraffic(request, env),
-  });
-  if (made.error) {
-    const linkCount = owner.isNew ? 0 : await countOwnerLinks(env, owner.id);
-    return renderConsent(request, env, url, client, csrf, owner, linkCount, { error: made.error, rawUrl, rawName });
-  }
-  await env.DB.prepare('DELETE FROM oauth_consents WHERE token_hash = ?').bind(tokenHash).run();
-  const headers = new Headers({
-    Location: authorizeQuery(consent),
-    'Cache-Control': 'no-store',
-    'Referrer-Policy': 'no-referrer',
-  });
-  setOwnerCookie(headers, owner, url);
-  clearOauthCsrf(headers, url);
-  return new Response(null, { status: 303, headers });
+  return consentRedirect(
+    request,
+    env,
+    url,
+    redirectWithParams(consent.redirect_uri, { code, state: consent.state || undefined }),
+    owner,
+    true
+  );
 }
 
 async function oauthToken(request, env, url) {
@@ -3280,7 +3326,7 @@ async function mcpDocsPage(request, env, url) {
       <h1>Connect an agent</h1>
       <p>Linki can create short links and read click counts from Claude, ChatGPT, Cursor, and other MCP clients. The shared address is <code>${esc(endpoint)}</code>. There is no account. You approve the app in the browser that holds the links.</p>
       <h2>Claude</h2>
-      <p>In Claude, open Settings, then Connectors, and add Linki from the directory, or add a custom connector with the address above. Claude opens this site. The page asks: let the app see and create the links saved in this browser? Choose Allow. If this browser has no links yet, the page explains that and can create one. Cancel sends the app away.</p>
+      <p>In Claude, open Settings, then Connectors, and add Linki from the directory, or add a custom connector with the address above. Claude opens this site. The page asks to connect the app to the links saved in this browser. Choose Allow. If this browser has no links yet, the page says so. Cancel sends the app away.</p>
       <h2>ChatGPT</h2>
       <p>In ChatGPT, add Linki from the apps directory, or add a custom app with the same address. Approve it in the browser that should own the links. The callback stays on ChatGPT. Linki only checks that the callback is an https address the app registered, or a localhost address for a local client.</p>
       <h2>An MCP link</h2>
@@ -5038,7 +5084,33 @@ header{display:flex;justify-content:space-between;align-items:center;gap:16px;wi
 .doc p,.doc li{margin-top:10px}
 .doc ul{margin:0;padding-left:1.2em}
 .doc code{font-family:var(--mono);font-size:.92em}
-.consentf{display:flex;flex-wrap:wrap;gap:10px;margin-top:22px}
+body.consent main.approve-wrap{flex:1 0 auto;display:flex;align-items:center;align-items:safe center;justify-content:center;width:100%;max-width:none;margin:0;padding:24px 16px;background:transparent;border-radius:0}
+.approve{width:min(440px,100%);padding:28px 24px 18px;background:var(--surface);border-radius:26px;text-align:center}
+.approve .pair{display:flex;align-items:center;justify-content:center;margin:0 0 18px}
+.approve .mark{display:grid;place-items:center;width:56px;height:56px}
+.approve .mark svg{width:56px;height:56px}
+.approve .mark img{width:56px;height:56px;object-fit:cover;border-radius:16px}
+.approve .badge{display:grid;place-items:center;width:56px;height:56px;border-radius:16px;background:var(--ink);color:var(--on-ink);font:800 26px/1 var(--display)}
+.approve .join{position:relative;width:44px;height:4px;margin:0 10px;border-radius:999px;background:var(--mustard)}
+.approve .join::after{content:"";position:absolute;left:50%;top:50%;width:12px;height:12px;border-radius:3px;background:var(--pink);transform:translate(-50%,-50%) rotate(18deg)}
+.approve h1{font-size:34px;letter-spacing:-.03em;overflow-wrap:break-word}
+.approve .can{list-style:none;margin:16px 0 0;padding:0;text-align:left}
+.approve .can li{position:relative;margin-top:8px;padding-left:22px;font-size:15px;font-weight:600}
+.approve .can li::before{content:"";position:absolute;left:0;top:.42em;width:10px;height:10px;border-radius:3px;background:var(--accent)}
+.approve .can li:nth-child(2)::before{background:var(--maroon);transform:rotate(8deg)}
+.approve .scope{margin-top:12px;text-align:left;font-size:13px;line-height:1.45;color:var(--muted)}
+.approve .scope a{color:var(--ink);font-weight:600}
+.approve .none{margin-top:12px;text-align:left;font-size:14px;font-weight:700}
+.approve form{display:flex;flex-direction:column;gap:4px;margin-top:18px}
+.approve .allow{width:100%;height:52px;border:0;background:var(--accent);color:#fff;font:700 16px/1 var(--ui)}
+.approve a.allow{margin-top:18px}
+.approve .quiet{width:100%;height:44px;border:0;background:transparent;color:var(--muted);font:600 15px/1 var(--ui)}
+.approve .quiet:hover{color:var(--ink)}
+@media (max-width:520px){
+  body.consent main.approve-wrap{padding:12px 10px 16px}
+  .approve{padding:22px 16px 12px;border-radius:22px}
+  .approve h1{font-size:28px}
+}
 .apps{margin-top:18px}
 .apps h3{font:600 13px/1.3 var(--ui);letter-spacing:0}
 .apps ul{list-style:none;margin:8px 0 0;padding:0}
