@@ -31,7 +31,7 @@ Google Analytics loads on Linki's own pages from `GA_ID` at the top of `src/inde
 
 ## Use Linki from an AI agent (MCP)
 
-Claude and ChatGPT connect to one address, `https://linki.ing/mcp` (on another host it is that host's `/mcp`). The first request without a token answers 401 and points at the OAuth metadata. The app registers, sends you to an approval page on this site, and you choose Allow. That approves the links saved in this browser. There is no account and no password. If the browser has no links yet, the approval page says so and can create one. Connected apps are listed under **Your links**, and Revoke removes their tokens.
+Claude and ChatGPT connect to one address, `https://linki.ing/mcp` (on another host it is that host's `/mcp`). The first request without a token answers 401 and points at the OAuth metadata. The app registers, sends you to an approval page on this site, and you choose Allow. That approves the links saved in this browser. There is no account and no password. If the browser has no links yet, the approval page says so. Connected apps are listed under **Your links**, and Revoke removes their tokens.
 
 The older per-browser address still works. Once you have a link, the home page shows one line under **Recent links** with a **Copy MCP link** button. **Your links** shows the same link below the list. On the public site it is `https://linki.ing/mcp/<token>`. In Claude: Settings → Connectors → Add custom connector → paste the link. Cursor and other MCP clients take the same link.
 

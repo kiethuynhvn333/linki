@@ -1,3 +1,13 @@
+# Consent page (26 Nov 2026)
+
+Allow on the approval page was dying in Chrome. The page sent `form-action 'self'`, and Chrome (and Safari) apply that rule to the redirect after the form POST, so the jump to ChatGPT or Claude never happened. A second click then found the one-time approval already used and showed a 403.
+
+- The approval response now adds that one redirect origin to `form-action`. Other pages stay `'self'`. An IPv6 loopback address cannot be written as a CSP host, so that case returns a page with a link instead of a 302.
+- A missing approval cookie, or an approval that was already used or has expired, shows a plain page with a way back to Linki. The check itself is unchanged.
+- The page is a compact card: both marks, two short points, Allow in blue, Cancel underneath. It no longer includes a create-link form.
+
+No database change.
+
 # OAuth for the connector directory (25 Nov 2026)
 
 Claude and ChatGPT can connect to one address, `/mcp`, instead of a per-browser `/mcp/<token>` link. The old link still works.

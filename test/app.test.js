@@ -6,7 +6,7 @@ import assert from 'node:assert/strict';
 import { createHash, randomBytes } from 'node:crypto';
 import { readFileSync, readdirSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
-import { Miniflare } from 'miniflare';
+import { Miniflare, createFetchMock } from 'miniflare';
 
 const ROOT = fileURLToPath(new URL('..', import.meta.url));
 const ORIGIN = 'https://linki.test';
@@ -2760,10 +2760,17 @@ test('a browser can approve an app, then the bearer token uses the same tools', 
   const client = await registerClient([redirectUri]);
   const { verifier, challenge } = pkcePair();
   const { code, html } = await approveApp(client, redirectUri, { cookie: made.cookie, challenge });
-  assert.match(html, /Let Claude see and create the links saved in this browser\?/);
+  assert.match(html, /Connect Claude to Linki/);
+  assert.match(html, /See your links and their click counts/);
+  assert.match(html, /Create new short links/);
+  assert.match(html, /Only the links saved in this browser/);
+  assert.doesNotMatch(html, /No links in this browser yet/);
+  assert.doesNotMatch(html, /Create a link/);
 
   const forged = await post('/oauth/authorize', { csrf: 'forged', decision: 'allow' }, { cookie: made.cookie });
-  assert.equal(forged.status, 403);
+  assert.equal(forged.status, 200);
+  assert.match(await forged.text(), /expired or was already used/);
+  assert.equal(forged.headers.get('Location'), null);
 
   const tokenRes = await request('/oauth/token', {
     method: 'POST',
@@ -2914,24 +2921,11 @@ test('approving with no owner cookie creates one instead of failing', async () =
   const page = await request(`/oauth/authorize?${params}`);
   assert.equal(page.status, 200);
   const html = await page.text();
-  assert.match(html, /This browser has no links yet/);
-  assert.match(html, /Create a link/);
+  assert.match(html, /Connect ChatGPT to Linki/);
+  assert.match(html, /No links in this browser yet\. You can still connect\./);
+  assert.doesNotMatch(html, /Create a link/);
+  assert.doesNotMatch(html, /name="url"/);
   assert.equal(setCookies(page).owner, undefined);
-  const csrf = setCookies(page).oauth_csrf.value;
-  const created = await post(
-    '/oauth/authorize',
-    { csrf, decision: 'create', url: 'https://example.com/first', name: 'first-oauth' },
-    { cookie: `oauth_csrf=${csrf}` }
-  );
-  assert.equal(created.status, 303);
-  const owner = setCookies(created).owner;
-  assert.match(owner.value, /^[a-f0-9]{32}$/);
-  assert.equal(created.headers.get('Location').includes(owner.value), false);
-  const back = await request(created.headers.get('Location'), { cookie: `owner=${owner.value}` });
-  assert.match(await back.text(), /Let ChatGPT see and create/);
-  const row = await db.prepare('SELECT owner_id, created_via FROM links WHERE code = ?').bind('first-oauth').first();
-  assert.equal(row.owner_id, owner.value);
-  assert.equal(row.created_via, 'web');
 
   const fresh = pkcePair();
   const bare = await approveApp(client, redirectUri, { challenge: fresh.challenge, state: 'bare' });
@@ -2960,6 +2954,272 @@ test('approving with no owner cookie creates one instead of failing', async () =
   assert.equal(links.links.length, 0);
   const stored = await db.prepare('SELECT owner_id FROM oauth_tokens WHERE token_hash = ?').bind(createHash('sha256').update(access).digest('hex')).first();
   assert.equal(stored.owner_id, ownerCookie);
+});
+
+function formActionDirective(res) {
+  const csp = res.headers.get('Content-Security-Policy');
+  return csp.split(';').map((part) => part.trim()).find((part) => part.startsWith('form-action'));
+}
+
+test('the consent page names the redirect origin in form-action, and a retry is not a 403', async () => {
+  assert.equal(formActionDirective(await request('/')), "form-action 'self'");
+  assert.equal(formActionDirective(await request('/links')), "form-action 'self'");
+  assert.equal(formActionDirective(await request('/privacy')), "form-action 'self'");
+
+  const cases = [
+    ['https://claude.ai/api/mcp/auth_callback', 'https://claude.ai'],
+    ['https://chatgpt.com/connector/oauth/XVt5DTYfMBUe', 'https://chatgpt.com'],
+    ['http://localhost:8787/callback', 'http://localhost:8787'],
+    ['http://127.0.0.1:3000/callback', 'http://127.0.0.1:3000'],
+  ];
+  for (const [redirectUri, origin] of cases) {
+    const client = await registerClient([redirectUri], 'ChatGPT');
+    const { challenge } = pkcePair();
+    const params = new URLSearchParams({
+      response_type: 'code',
+      client_id: client.client_id,
+      redirect_uri: redirectUri,
+      code_challenge: challenge,
+      code_challenge_method: 'S256',
+      state: 'csp',
+      resource: `${ORIGIN}/mcp`,
+    });
+    const page = await request(`/oauth/authorize?${params}`);
+    assert.equal(page.status, 200, redirectUri);
+    assert.equal(formActionDirective(page), `form-action 'self' ${origin}`, redirectUri);
+    const html = await page.text();
+    assert.match(html, /Connect ChatGPT to Linki/, redirectUri);
+    const nonce = page.headers.get('Content-Security-Policy').match(/'nonce-([A-Za-z0-9_-]+)'/)[1];
+    assert.match(html, new RegExp(`<script nonce="${nonce}">`), redirectUri);
+    assert.doesNotMatch(html, /<img /, redirectUri);
+    assert.match(html, /class="badge">C</, redirectUri);
+  }
+
+  const redirectUri = 'https://chatgpt.com/connector/oauth/XVt5DTYfMBUe';
+  const client = await registerClient([redirectUri], 'Tom & Jerry');
+  const { verifier, challenge } = pkcePair();
+  const params = new URLSearchParams({
+    response_type: 'code',
+    client_id: client.client_id,
+    redirect_uri: redirectUri,
+    code_challenge: challenge,
+    code_challenge_method: 'S256',
+    state: 'retry',
+    resource: `${ORIGIN}/mcp`,
+  });
+  const page = await request(`/oauth/authorize?${params}`);
+  const html = await page.text();
+  assert.match(html, /Connect Tom &amp; Jerry to Linki/);
+  assert.doesNotMatch(html, /Connect Tom & Jerry/);
+  const csrf = setCookies(page).oauth_csrf.value;
+
+  const missing = await post('/oauth/authorize', { csrf, decision: 'allow' });
+  assert.equal(missing.status, 200);
+  const missingHtml = await missing.text();
+  assert.match(missingHtml, /This approval link expired/);
+  assert.match(missingHtml, /expired or was already used/);
+  assert.match(missingHtml, /href="\/">Back to Linki/);
+  assert.doesNotMatch(missingHtml, />403</);
+  assert.equal(missing.headers.get('Location'), null);
+
+  const mismatched = await post(
+    '/oauth/authorize',
+    { csrf: 'forged-token', decision: 'allow' },
+    { cookie: `oauth_csrf=${csrf}` }
+  );
+  assert.equal(mismatched.status, 200);
+  assert.match(await mismatched.text(), /expired or was already used/);
+
+  const allow = await post(
+    '/oauth/authorize',
+    { csrf, decision: 'allow' },
+    { cookie: `oauth_csrf=${csrf}` }
+  );
+  assert.equal(allow.status, 302);
+  const location = new URL(allow.headers.get('Location'));
+  assert.equal(location.origin, 'https://chatgpt.com');
+  assert.equal(location.pathname, '/connector/oauth/XVt5DTYfMBUe');
+  assert.equal(location.searchParams.get('state'), 'retry');
+  assert.ok(location.searchParams.get('code'));
+
+  const again = await post(
+    '/oauth/authorize',
+    { csrf, decision: 'allow' },
+    { cookie: `oauth_csrf=${csrf}` }
+  );
+  assert.equal(again.status, 200);
+  assert.match(await again.text(), /expired or was already used/);
+  assert.equal(again.headers.get('Location'), null);
+  const tokenRes = await request('/oauth/token', {
+    method: 'POST',
+    body: new URLSearchParams({
+      grant_type: 'authorization_code',
+      code: location.searchParams.get('code'),
+      redirect_uri: redirectUri,
+      client_id: client.client_id,
+      code_verifier: verifier,
+    }).toString(),
+    headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+  });
+  assert.equal(tokenRes.status, 200);
+
+  const expired = pkcePair();
+  const expiredParams = new URLSearchParams({
+    response_type: 'code',
+    client_id: client.client_id,
+    redirect_uri: redirectUri,
+    code_challenge: expired.challenge,
+    code_challenge_method: 'S256',
+    resource: `${ORIGIN}/mcp`,
+  });
+  const expiredPage = await request(`/oauth/authorize?${expiredParams}`);
+  const expiredCsrf = setCookies(expiredPage).oauth_csrf.value;
+  const tokenHash = createHash('sha256').update(expiredCsrf).digest('hex');
+  await db.prepare('UPDATE oauth_consents SET expires_at = ? WHERE token_hash = ?').bind(1, tokenHash).run();
+  const stale = await post(
+    '/oauth/authorize',
+    { csrf: expiredCsrf, decision: 'allow' },
+    { cookie: `oauth_csrf=${expiredCsrf}` }
+  );
+  assert.equal(stale.status, 200);
+  assert.match(await stale.text(), /expired or was already used/);
+  assert.equal(stale.headers.get('Location'), null);
+
+  const denyClient = await registerClient(['https://claude.ai/api/mcp/auth_callback'], 'Claude');
+  const deny = pkcePair();
+  const denyParams = new URLSearchParams({
+    response_type: 'code',
+    client_id: denyClient.client_id,
+    redirect_uri: 'https://claude.ai/api/mcp/auth_callback',
+    code_challenge: deny.challenge,
+    code_challenge_method: 'S256',
+    state: 'cancel',
+    resource: `${ORIGIN}/mcp`,
+  });
+  const denyPage = await request(`/oauth/authorize?${denyParams}`);
+  assert.equal(formActionDirective(denyPage), "form-action 'self' https://claude.ai");
+  const denyCsrf = setCookies(denyPage).oauth_csrf.value;
+  const cancelled = await post(
+    '/oauth/authorize',
+    { csrf: denyCsrf, decision: 'deny' },
+    { cookie: `oauth_csrf=${denyCsrf}` }
+  );
+  assert.equal(cancelled.status, 302);
+  const back = new URL(cancelled.headers.get('Location'));
+  assert.equal(back.origin + back.pathname, 'https://claude.ai/api/mcp/auth_callback');
+  assert.equal(back.searchParams.get('error'), 'access_denied');
+  assert.equal(back.searchParams.get('state'), 'cancel');
+});
+
+test('an IPv6 loopback redirect finishes on a page, because CSP cannot name it', async () => {
+  const redirectUri = 'http://[::1]:9898/callback';
+  const client = await registerClient([redirectUri], 'Loop');
+  const { verifier, challenge } = pkcePair();
+  const params = new URLSearchParams({
+    response_type: 'code',
+    client_id: client.client_id,
+    redirect_uri: redirectUri,
+    code_challenge: challenge,
+    code_challenge_method: 'S256',
+    state: 'v6',
+    resource: `${ORIGIN}/mcp`,
+  });
+  const page = await request(`/oauth/authorize?${params}`);
+  assert.equal(page.status, 200);
+  assert.equal(formActionDirective(page), "form-action 'self'");
+  const csrf = setCookies(page).oauth_csrf.value;
+  const allow = await post('/oauth/authorize', { csrf, decision: 'allow' }, { cookie: `oauth_csrf=${csrf}` });
+  assert.equal(allow.status, 200);
+  assert.equal(allow.headers.get('Location'), null);
+  const html = await allow.text();
+  const nonce = allow.headers.get('Content-Security-Policy').match(/'nonce-([A-Za-z0-9_-]+)'/)[1];
+  assert.match(html, new RegExp(`<script nonce="${nonce}">location\\.replace\\(`));
+  const href = html.match(/class="button allow" href="([^"]+)"/)[1].replace(/&amp;/g, '&');
+  const location = new URL(href);
+  assert.equal(location.origin, 'http://[::1]:9898');
+  assert.equal(location.pathname, '/callback');
+  assert.equal(location.searchParams.get('state'), 'v6');
+  const code = location.searchParams.get('code');
+  assert.ok(code);
+  const tokenRes = await request('/oauth/token', {
+    method: 'POST',
+    body: new URLSearchParams({
+      grant_type: 'authorization_code',
+      code,
+      redirect_uri: redirectUri,
+      client_id: client.client_id,
+      code_verifier: verifier,
+    }).toString(),
+    headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+  });
+  assert.equal(tokenRes.status, 200);
+});
+
+test('a client logo is shown only when the existing img-src allows it', async () => {
+  const fetchMock = createFetchMock();
+  fetchMock.disableNetConnect();
+  const externalId = 'https://cimd.example/oauth/chatgpt.json';
+  const selfId = 'https://assets.example/oauth/self.json';
+  fetchMock.get('https://cimd.example').intercept({ path: '/oauth/chatgpt.json' }).reply(
+    200,
+    JSON.stringify({
+      client_id: externalId,
+      client_name: 'ChatGPT',
+      redirect_uris: ['https://chatgpt.com/connector/oauth/abc'],
+      logo_uri: 'https://chatgpt.com/logo.png',
+    }),
+    { headers: { 'content-type': 'application/json' } }
+  );
+  fetchMock.get('https://assets.example').intercept({ path: '/oauth/self.json' }).reply(
+    200,
+    JSON.stringify({
+      client_id: selfId,
+      client_name: 'Desk',
+      redirect_uris: ['https://claude.ai/api/mcp/auth_callback'],
+      logo_uri: 'https://linki.test/icon-512.png',
+    }),
+    { headers: { 'content-type': 'application/json' } }
+  );
+  const logoMf = new Miniflare({
+    modules: true,
+    scriptPath: `${ROOT}src/index.js`,
+    modulesRules: MODULE_RULES,
+    compatibilityDate: '2025-01-01',
+    d1Databases: { DB: 'linki-logo-test' },
+    bindings: { HASH_SECRET: 'test-secret' },
+    fetchMock,
+  });
+  try {
+    await applyMigrations(await logoMf.getD1Database('DB'));
+    async function consent(clientId, redirect) {
+      const params = new URLSearchParams({
+        response_type: 'code',
+        client_id: clientId,
+        redirect_uri: redirect,
+        code_challenge: pkcePair().challenge,
+        code_challenge_method: 'S256',
+        resource: `${ORIGIN}/mcp`,
+      });
+      const res = await logoMf.dispatchFetch(`${ORIGIN}/oauth/authorize?${params}`, {
+        headers: { 'User-Agent': BROWSER_UA },
+        cf: HOME_CF,
+      });
+      assert.equal(res.status, 200, clientId);
+      return { html: await res.text(), csp: res.headers.get('Content-Security-Policy') };
+    }
+    const blocked = await consent(externalId, 'https://chatgpt.com/connector/oauth/abc');
+    assert.match(blocked.html, /class="badge">C</);
+    assert.doesNotMatch(blocked.html, /chatgpt\.com\/logo\.png/);
+    assert.doesNotMatch(blocked.html, /<img /);
+    const imgSrc = blocked.csp.split(';').map((part) => part.trim()).find((part) => part.startsWith('img-src'));
+    assert.equal(imgSrc, "img-src 'self' data: https://*.google-analytics.com https://*.googletagmanager.com");
+    assert.match(blocked.csp, /form-action 'self' https:\/\/chatgpt\.com(?:;|$)/);
+    const allowed = await consent(selfId, 'https://claude.ai/api/mcp/auth_callback');
+    assert.match(allowed.html, /<img src="https:\/\/linki\.test\/icon-512\.png"/);
+    assert.doesNotMatch(allowed.html, /class="badge"/);
+  } finally {
+    await logoMf.dispose();
+  }
 });
 
 test('a mismatched redirect or resource is refused, and the legacy connector still works', async () => {
